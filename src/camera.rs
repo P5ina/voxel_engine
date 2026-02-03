@@ -1,0 +1,108 @@
+use glam::{Mat4, Vec3};
+
+pub struct Camera {
+    pub position: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub aspect: f32,
+    pub fov: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Camera {
+    pub fn new(position: Vec3, aspect: f32) -> Self {
+        Self {
+            position,
+            yaw: -90.0_f32.to_radians(),
+            pitch: 0.0,
+            aspect,
+            fov: 70.0_f32.to_radians(),
+            near: 0.1,
+            far: 1000.0,
+        }
+    }
+
+    pub fn forward(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        )
+        .normalize()
+    }
+
+    pub fn right(&self) -> Vec3 {
+        self.forward().cross(Vec3::Y).normalize()
+    }
+
+    pub fn view_matrix(&self) -> Mat4 {
+        let forward = self.forward();
+        let target = self.position + forward;
+        Mat4::look_at_rh(self.position, target, Vec3::Y)
+    }
+
+    pub fn projection_matrix(&self) -> Mat4 {
+        Mat4::perspective_rh(self.fov, self.aspect, self.near, self.far)
+    }
+
+    pub fn view_projection_matrix(&self) -> Mat4 {
+        self.projection_matrix() * self.view_matrix()
+    }
+
+    pub fn process_keyboard(&mut self, forward: bool, backward: bool, left: bool, right: bool, up: bool, down: bool, speed: f32) {
+        let front = self.forward();
+        let right_dir = self.right();
+
+        if forward {
+            self.position += front * speed;
+        }
+        if backward {
+            self.position -= front * speed;
+        }
+        if left {
+            self.position -= right_dir * speed;
+        }
+        if right {
+            self.position += right_dir * speed;
+        }
+        if up {
+            self.position.y += speed;
+        }
+        if down {
+            self.position.y -= speed;
+        }
+    }
+
+    pub fn process_mouse(&mut self, delta_x: f32, delta_y: f32, sensitivity: f32) {
+        self.yaw += delta_x * sensitivity;
+        self.pitch -= delta_y * sensitivity;
+
+        let max_pitch = 89.0_f32.to_radians();
+        self.pitch = self.pitch.clamp(-max_pitch, max_pitch);
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if height > 0 {
+            self.aspect = width as f32 / height as f32;
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
+
+impl CameraUniform {
+    pub fn new() -> Self {
+        Self {
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        }
+    }
+
+    pub fn update(&mut self, camera: &Camera) {
+        self.view_proj = camera.view_projection_matrix().to_cols_array_2d();
+    }
+}
