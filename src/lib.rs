@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::Vec3;
@@ -15,6 +16,7 @@ mod player;
 mod renderer;
 mod ui;
 mod voxel;
+mod world;
 
 use camera::Camera;
 use pathtracer::PathTracer;
@@ -22,8 +24,9 @@ use player::Player;
 use renderer::{
     CameraResources, DepthBuffer, LightingParams, MeshResources, RenderContext, TextureResources,
 };
-use ui::{EguiRenderer, GameSettings, UiMessage, UiScreen};
-use voxel::{generate_mesh, raycast, BlockType, Chunk};
+use ui::{EditorState, EguiRenderer, GameSettings, UiMessage, UiScreen};
+use voxel::{generate_chunk_mesh, raycast, BlockType, Chunk};
+use world::{ChunkManager, ChunkPosition, SaveFormat};
 
 #[derive(Default)]
 struct InputState {
@@ -32,6 +35,9 @@ struct InputState {
     left: bool,
     right: bool,
     jump: bool,
+    up: bool,
+    down: bool,
+    ctrl: bool,
 }
 
 pub struct AppState {
@@ -42,15 +48,14 @@ pub struct AppState {
     depth_buffer: DepthBuffer,
     camera_resources: CameraResources,
     texture_resources: TextureResources,
-    mesh_resources: MeshResources,
+    chunk_meshes: HashMap<ChunkPosition, MeshResources>,
     lighting: LightingParams,
     path_tracer: PathTracer,
 
     // Game state
     camera: Camera,
     player: Player,
-    chunk: Chunk,
-    mesh_dirty: bool,
+    world: ChunkManager,
 
     // Input
     input: InputState,
@@ -61,6 +66,10 @@ pub struct AppState {
     ui_screen: UiScreen,
     game_settings: GameSettings,
     prev_screen: UiScreen,
+
+    // Editor
+    editor_state: EditorState,
+    available_levels: Vec<String>,
 
     // Timing
     last_frame: std::time::Instant,
@@ -86,11 +95,22 @@ impl AppState {
         let texture_resources = TextureResources::new(&render_ctx.device, &render_ctx.queue);
         let depth_buffer = DepthBuffer::new(&render_ctx.device, size.width, size.height);
 
-        // Generate chunk mesh
+        // Create world with initial chunk
+        let mut world = ChunkManager::with_metadata("Default World", [16.0, 20.0, 16.0]);
         let mut chunk = Chunk::new();
         chunk.fill_ground(8);
-        let vertices = generate_mesh(&chunk);
-        let mesh_resources = MeshResources::new(&render_ctx.device, &vertices);
+        let default_pos = ChunkPosition::new(0, 0, 0);
+        world.insert_chunk(default_pos, chunk);
+
+        // Generate meshes for all chunks
+        let mut chunk_meshes = HashMap::new();
+        for chunk_pos in world.chunk_positions().cloned().collect::<Vec<_>>() {
+            let vertices = generate_chunk_mesh(&world, chunk_pos);
+            if !vertices.is_empty() {
+                chunk_meshes.insert(chunk_pos, MeshResources::new(&render_ctx.device, &vertices));
+            }
+        }
+        world.take_dirty_chunks(); // Clear dirty flags after initial mesh build
 
         // Lighting
         let mut lighting = LightingParams::new();
@@ -100,7 +120,7 @@ impl AppState {
         let egui = EguiRenderer::new(&render_ctx.device, render_ctx.format(), &window);
 
         // Path Tracer
-        let path_tracer = PathTracer::new(
+        let mut path_tracer = PathTracer::new(
             &render_ctx.device,
             &render_ctx.queue,
             size.width,
@@ -109,7 +129,10 @@ impl AppState {
             &camera_resources.bind_group_layout,
             &texture_resources.bind_group_layout,
         );
-        path_tracer.update_voxels(&render_ctx.queue, &chunk);
+        path_tracer.update_world_voxels(&render_ctx.device, &render_ctx.queue, &world);
+
+        // Scan for available levels
+        let available_levels = Self::scan_levels();
 
         Ok(Self {
             window,
@@ -117,24 +140,43 @@ impl AppState {
             depth_buffer,
             camera_resources,
             texture_resources,
-            mesh_resources,
+            chunk_meshes,
             lighting,
             path_tracer,
             camera,
             player,
-            chunk,
-            mesh_dirty: false,
+            world,
             input: InputState::default(),
             mouse_grabbed: false,
             egui,
             ui_screen: UiScreen::default(),
             game_settings: GameSettings::default(),
             prev_screen: UiScreen::MainMenu,
+            editor_state: EditorState::default(),
+            available_levels,
             last_frame: std::time::Instant::now(),
             fps: 0.0,
             frame_time_accum: 0.0,
             frame_count: 0,
         })
+    }
+
+    fn scan_levels() -> Vec<String> {
+        let maps_dir = std::path::Path::new("maps");
+        if !maps_dir.exists() {
+            return Vec::new();
+        }
+
+        std::fs::read_dir(maps_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -147,16 +189,33 @@ impl AppState {
         }
     }
 
-    fn rebuild_mesh(&mut self) {
-        let vertices = generate_mesh(&self.chunk);
-        self.mesh_resources
-            .update(&self.render_ctx.device, &vertices);
+    fn rebuild_dirty_meshes(&mut self) {
+        let dirty = self.world.take_dirty_chunks();
 
-        self.path_tracer
-            .update_voxels(&self.render_ctx.queue, &self.chunk);
+        for chunk_pos in dirty {
+            if self.world.get_chunk(chunk_pos).is_some() {
+                let vertices = generate_chunk_mesh(&self.world, chunk_pos);
+                if vertices.is_empty() {
+                    self.chunk_meshes.remove(&chunk_pos);
+                } else if let Some(mesh) = self.chunk_meshes.get_mut(&chunk_pos) {
+                    mesh.update(&self.render_ctx.device, &vertices);
+                } else {
+                    self.chunk_meshes.insert(
+                        chunk_pos,
+                        MeshResources::new(&self.render_ctx.device, &vertices),
+                    );
+                }
+            } else {
+                self.chunk_meshes.remove(&chunk_pos);
+            }
+        }
+
+        self.path_tracer.update_world_voxels(
+            &self.render_ctx.device,
+            &self.render_ctx.queue,
+            &self.world,
+        );
         self.path_tracer.reset_accumulation();
-
-        self.mesh_dirty = false;
     }
 
     fn update(&mut self) {
@@ -190,7 +249,7 @@ impl AppState {
             self.player.jump();
         }
 
-        self.player.update(&self.chunk, dt);
+        self.player.update(&self.world, dt);
         self.camera.position = self.player.eye_position();
         self.camera.fov = self.game_settings.fov.to_radians();
 
@@ -203,16 +262,18 @@ impl AppState {
             .update(&self.render_ctx.queue, &self.camera);
         self.lighting.update_time(0.1);
 
-        if self.mesh_dirty {
-            self.rebuild_mesh();
+        if !self.world.dirty_chunks().is_empty() {
+            self.rebuild_dirty_meshes();
         }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        if self.ui_screen == UiScreen::InGame {
-            self.update();
-        } else {
-            self.last_frame = std::time::Instant::now();
+        match self.ui_screen {
+            UiScreen::InGame => self.update(),
+            UiScreen::Editor => self.update_editor(),
+            _ => {
+                self.last_frame = std::time::Instant::now();
+            }
         }
         self.window.request_redraw();
 
@@ -231,6 +292,12 @@ impl AppState {
             UiScreen::InGame => {
                 ui::hud(&self.egui.ctx, self.fps);
                 None
+            }
+            UiScreen::LevelSelect => ui::level_select(&self.egui.ctx, &self.available_levels),
+            UiScreen::Editor => ui::editor_hud(&self.egui.ctx, &mut self.editor_state, self.fps),
+            UiScreen::EditorPause => ui::editor_pause(&self.egui.ctx),
+            UiScreen::SaveDialog => {
+                ui::save_dialog(&self.egui.ctx, &mut self.editor_state.level_name)
             }
         };
 
@@ -251,7 +318,16 @@ impl AppState {
                 });
 
         // Render 3D scene
-        if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::PauseMenu {
+        let should_render_3d = matches!(
+            self.ui_screen,
+            UiScreen::InGame
+                | UiScreen::PauseMenu
+                | UiScreen::Editor
+                | UiScreen::EditorPause
+                | UiScreen::SaveDialog
+        );
+
+        if should_render_3d {
             self.camera.fov = self.game_settings.fov.to_radians();
             self.camera_resources
                 .update(&self.render_ctx.queue, &self.camera);
@@ -264,14 +340,18 @@ impl AppState {
                 self.lighting.sun_color,
             );
 
+            let meshes = self
+                .chunk_meshes
+                .values()
+                .map(|m| (&m.vertex_buffer, m.num_vertices));
+
             self.path_tracer.render(
                 &mut encoder,
                 &view,
                 &self.depth_buffer.view,
                 &self.camera_resources.bind_group,
                 &self.texture_resources.bind_group,
-                &self.mesh_resources.vertex_buffer,
-                self.mesh_resources.num_vertices,
+                meshes,
                 self.game_settings.lighting_mode,
             );
         } else {
@@ -337,23 +417,168 @@ impl AppState {
                 self.ui_screen = self.prev_screen;
             }
             UiMessage::Resume => {
-                self.ui_screen = UiScreen::InGame;
+                // Resume to appropriate mode
+                if self.prev_screen == UiScreen::Editor
+                    || self.ui_screen == UiScreen::EditorPause
+                    || self.ui_screen == UiScreen::SaveDialog
+                {
+                    self.ui_screen = UiScreen::Editor;
+                } else {
+                    self.ui_screen = UiScreen::InGame;
+                }
                 self.grab_mouse(true);
             }
             UiMessage::QuitToMenu => {
                 self.ui_screen = UiScreen::MainMenu;
                 self.grab_mouse(false);
             }
+            // Level select
+            UiMessage::OpenLevelSelect => {
+                self.available_levels = Self::scan_levels();
+                self.prev_screen = UiScreen::MainMenu;
+                self.ui_screen = UiScreen::LevelSelect;
+            }
+            UiMessage::LoadLevel(name) => {
+                if self.load_level(&name) {
+                    self.ui_screen = UiScreen::InGame;
+                    self.grab_mouse(true);
+                }
+            }
+            UiMessage::NewLevel => {
+                self.create_new_level();
+                self.ui_screen = UiScreen::InGame;
+                self.grab_mouse(true);
+            }
+            // Editor
+            UiMessage::OpenEditor => {
+                self.create_new_level();
+                self.ui_screen = UiScreen::Editor;
+                self.grab_mouse(true);
+            }
+            UiMessage::SaveLevel(name) => {
+                if name.is_empty() {
+                    // Open save dialog
+                    self.prev_screen = UiScreen::EditorPause;
+                    self.ui_screen = UiScreen::SaveDialog;
+                } else {
+                    // Actually save
+                    self.save_level(&name);
+                    self.ui_screen = UiScreen::Editor;
+                    self.grab_mouse(true);
+                }
+            }
+            UiMessage::EditorQuitToMenu => {
+                self.ui_screen = UiScreen::MainMenu;
+                self.grab_mouse(false);
+            }
+        }
+    }
+
+    fn create_new_level(&mut self) {
+        // Create empty world with single empty chunk
+        self.world = ChunkManager::with_metadata("New Level", [16.0, 20.0, 16.0]);
+        let mut chunk = Chunk::new();
+        chunk.fill_ground(1); // Just a floor
+        self.world.insert_chunk(ChunkPosition::new(0, 0, 0), chunk);
+
+        // Reset player position
+        self.player.position = Vec3::new(16.0, 5.0, 16.0);
+        self.player.velocity = Vec3::ZERO;
+        self.camera.position = self.player.eye_position();
+
+        // Rebuild meshes
+        self.chunk_meshes.clear();
+        for chunk_pos in self.world.chunk_positions().cloned().collect::<Vec<_>>() {
+            let vertices = generate_chunk_mesh(&self.world, chunk_pos);
+            if !vertices.is_empty() {
+                self.chunk_meshes
+                    .insert(chunk_pos, MeshResources::new(&self.render_ctx.device, &vertices));
+            }
+        }
+        self.world.take_dirty_chunks();
+
+        // Update path tracer
+        self.path_tracer.update_world_voxels(
+            &self.render_ctx.device,
+            &self.render_ctx.queue,
+            &self.world,
+        );
+        self.path_tracer.reset_accumulation();
+
+        self.editor_state.level_name = "untitled".to_string();
+    }
+
+    fn load_level(&mut self, name: &str) -> bool {
+        let path = format!("maps/{}/world.bin", name);
+        match ChunkManager::load(&path) {
+            Ok(world) => {
+                let spawn = world.spawn_position();
+                self.world = world;
+
+                // Reset player position
+                self.player.position = Vec3::from_array(spawn);
+                self.player.velocity = Vec3::ZERO;
+                self.camera.position = self.player.eye_position();
+
+                // Rebuild meshes
+                self.chunk_meshes.clear();
+                for chunk_pos in self.world.chunk_positions().cloned().collect::<Vec<_>>() {
+                    let vertices = generate_chunk_mesh(&self.world, chunk_pos);
+                    if !vertices.is_empty() {
+                        self.chunk_meshes.insert(
+                            chunk_pos,
+                            MeshResources::new(&self.render_ctx.device, &vertices),
+                        );
+                    }
+                }
+                self.world.take_dirty_chunks();
+
+                // Update path tracer
+                self.path_tracer.update_world_voxels(
+                    &self.render_ctx.device,
+                    &self.render_ctx.queue,
+                    &self.world,
+                );
+                self.path_tracer.reset_accumulation();
+
+                self.editor_state.level_name = name.to_string();
+                true
+            }
+            Err(e) => {
+                log::error!("Failed to load level '{}': {}", name, e);
+                false
+            }
+        }
+    }
+
+    fn save_level(&mut self, name: &str) {
+        let dir = format!("maps/{}", name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::error!("Failed to create directory '{}': {}", dir, e);
+            return;
+        }
+
+        // Save spawn position
+        self.world.set_spawn(self.player.position.to_array());
+
+        let path = format!("{}/world.bin", dir);
+        if let Err(e) = self.world.save(&path, SaveFormat::Binary) {
+            log::error!("Failed to save level '{}': {}", name, e);
+        } else {
+            log::info!("Level '{}' saved successfully", name);
+            self.editor_state.level_name = name.to_string();
+            self.available_levels = Self::scan_levels();
         }
     }
 
     fn grab_mouse(&mut self, grab: bool) {
         self.mouse_grabbed = grab;
         if grab {
+            // Try Locked first (locks cursor in place), fall back to Confined
             let _ = self
                 .window
-                .set_cursor_grab(CursorGrabMode::Confined)
-                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Locked));
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Confined));
             self.window.set_cursor_visible(false);
         } else {
             let _ = self.window.set_cursor_grab(CursorGrabMode::None);
@@ -362,22 +587,26 @@ impl AppState {
     }
 
     fn handle_key(&mut self, _event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
+        // Handle key releases
         if !is_pressed {
-            if self.ui_screen == UiScreen::InGame {
-                match code {
-                    KeyCode::KeyW => self.input.forward = false,
-                    KeyCode::KeyS => self.input.backward = false,
-                    KeyCode::KeyA => self.input.left = false,
-                    KeyCode::KeyD => self.input.right = false,
-                    KeyCode::Space => self.input.jump = false,
-                    _ => {}
-                }
+            match code {
+                KeyCode::KeyW => self.input.forward = false,
+                KeyCode::KeyS => self.input.backward = false,
+                KeyCode::KeyA => self.input.left = false,
+                KeyCode::KeyD => self.input.right = false,
+                KeyCode::Space => self.input.jump = false,
+                KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.down = false,
+                KeyCode::KeyQ => self.input.up = false,
+                KeyCode::KeyE => self.input.down = false,
+                KeyCode::ControlLeft | KeyCode::ControlRight => self.input.ctrl = false,
+                _ => {}
             }
             return;
         }
 
-        match code {
-            KeyCode::Escape => match self.ui_screen {
+        // Handle Escape for all screens
+        if code == KeyCode::Escape {
+            match self.ui_screen {
                 UiScreen::InGame => {
                     self.ui_screen = UiScreen::PauseMenu;
                     self.grab_mouse(false);
@@ -386,25 +615,63 @@ impl AppState {
                     self.ui_screen = UiScreen::InGame;
                     self.grab_mouse(true);
                 }
+                UiScreen::Editor => {
+                    self.prev_screen = UiScreen::Editor;
+                    self.ui_screen = UiScreen::EditorPause;
+                    self.grab_mouse(false);
+                }
+                UiScreen::EditorPause => {
+                    self.ui_screen = UiScreen::Editor;
+                    self.grab_mouse(true);
+                }
+                UiScreen::SaveDialog => {
+                    self.ui_screen = UiScreen::EditorPause;
+                }
                 UiScreen::Settings => {
                     self.ui_screen = self.prev_screen;
                 }
+                UiScreen::LevelSelect => {
+                    self.ui_screen = UiScreen::MainMenu;
+                }
                 UiScreen::MainMenu => {}
-            },
-            _ if self.ui_screen == UiScreen::InGame => match code {
+            }
+            return;
+        }
+
+        // Handle Ctrl modifier
+        if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
+            self.input.ctrl = true;
+            return;
+        }
+
+        // Handle Ctrl+S for save in editor
+        if self.ui_screen == UiScreen::Editor && self.input.ctrl && code == KeyCode::KeyS {
+            self.prev_screen = UiScreen::Editor;
+            self.ui_screen = UiScreen::SaveDialog;
+            self.grab_mouse(false);
+            return;
+        }
+
+        // Movement keys for InGame and Editor
+        if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::Editor {
+            match code {
                 KeyCode::KeyW => self.input.forward = true,
                 KeyCode::KeyS => self.input.backward = true,
                 KeyCode::KeyA => self.input.left = true,
                 KeyCode::KeyD => self.input.right = true,
                 KeyCode::Space => self.input.jump = true,
+                KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.down = true,
+                KeyCode::KeyQ => self.input.up = true,
+                KeyCode::KeyE => self.input.down = true,
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 
     fn handle_mouse_motion(&mut self, delta: (f64, f64)) {
-        if self.mouse_grabbed && self.ui_screen == UiScreen::InGame {
+        if self.mouse_grabbed
+            && (self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::Editor)
+        {
             let sensitivity = self.game_settings.sensitivity;
             self.camera
                 .process_mouse(delta.0 as f32, delta.1 as f32, sensitivity);
@@ -423,23 +690,31 @@ impl AppState {
             return;
         }
 
+        // Only handle block interaction in game or editor mode
+        if self.ui_screen != UiScreen::InGame && self.ui_screen != UiScreen::Editor {
+            return;
+        }
+
         const MAX_REACH: f32 = 8.0;
         let origin = self.camera.position;
         let direction = self.camera.forward();
 
         let hit = raycast(origin, direction, MAX_REACH, |x, y, z| {
-            self.chunk.get_signed(x, y, z).is_solid()
+            self.world.is_solid(x, y, z)
         });
+
+        let is_editor = self.ui_screen == UiScreen::Editor;
+        let block_to_place = if is_editor {
+            self.editor_state.selected_block
+        } else {
+            BlockType::Stone
+        };
 
         match button {
             MouseButton::Left => {
                 if let Some(hit) = hit {
                     let [x, y, z] = hit.block_pos;
-                    if x >= 0 && y >= 0 && z >= 0 {
-                        self.chunk
-                            .set(x as usize, y as usize, z as usize, BlockType::Air);
-                        self.mesh_dirty = true;
-                    }
+                    self.world.set_block(x, y, z, BlockType::Air);
                 }
             }
             MouseButton::Right => {
@@ -450,22 +725,74 @@ impl AppState {
                     let place_y = y + ny;
                     let place_z = z + nz;
 
-                    if place_x >= 0
-                        && place_y >= 0
-                        && place_z >= 0
-                        && !self.player.intersects_block(place_x, place_y, place_z)
-                    {
-                        self.chunk.set(
-                            place_x as usize,
-                            place_y as usize,
-                            place_z as usize,
-                            BlockType::Stone,
-                        );
-                        self.mesh_dirty = true;
+                    // In editor mode, no collision check needed (free cam)
+                    let can_place =
+                        is_editor || !self.player.intersects_block(place_x, place_y, place_z);
+
+                    if can_place {
+                        self.world.set_block(place_x, place_y, place_z, block_to_place);
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn update_editor(&mut self) {
+        let now = std::time::Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+
+        // FPS calculation
+        self.frame_time_accum += dt;
+        self.frame_count += 1;
+        if self.frame_time_accum >= 0.5 {
+            self.fps = self.frame_count as f32 / self.frame_time_accum;
+            self.frame_time_accum = 0.0;
+            self.frame_count = 0;
+        }
+
+        // Free camera movement
+        let speed = self.editor_state.fly_speed * dt;
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+        let up = Vec3::Y;
+
+        let mut move_dir = Vec3::ZERO;
+
+        if self.input.forward {
+            move_dir += forward;
+        }
+        if self.input.backward {
+            move_dir -= forward;
+        }
+        if self.input.right {
+            move_dir += right;
+        }
+        if self.input.left {
+            move_dir -= right;
+        }
+        if self.input.jump || self.input.up {
+            move_dir += up;
+        }
+        if self.input.down {
+            move_dir -= up;
+        }
+
+        if move_dir.length_squared() > 0.0 {
+            move_dir = move_dir.normalize() * speed;
+            self.camera.position += move_dir;
+            // Keep player position synced for spawn point
+            self.player.position = self.camera.position - Vec3::new(0.0, self.player.height - 0.2, 0.0);
+        }
+
+        self.camera.fov = self.game_settings.fov.to_radians();
+        self.camera_resources
+            .update(&self.render_ctx.queue, &self.camera);
+        self.lighting.update_time(0.1);
+
+        if !self.world.dirty_chunks().is_empty() {
+            self.rebuild_dirty_meshes();
         }
     }
 }
@@ -534,6 +861,23 @@ impl ApplicationHandler<AppState> for App {
                 return;
             }
             _ => {}
+        }
+
+        // Handle Tab for editor mouse toggle BEFORE egui consumes it
+        if let WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(KeyCode::Tab),
+                    state: key_state,
+                    ..
+                },
+            ..
+        } = &event
+        {
+            if key_state.is_pressed() && state.ui_screen == UiScreen::Editor {
+                state.grab_mouse(!state.mouse_grabbed);
+                return;
+            }
         }
 
         if egui_response.consumed {

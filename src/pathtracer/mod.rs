@@ -8,6 +8,7 @@ use wgpu::util::DeviceExt;
 use crate::camera::Camera;
 use crate::ui::LightingMode;
 use crate::voxel::{Chunk, CHUNK_SIZE};
+use crate::world::ChunkManager;
 
 pub use gbuffer::GBuffer;
 pub use materials::{Material, BLOCK_MATERIALS};
@@ -153,6 +154,10 @@ pub struct PathTracer {
     pub materials_buffer: wgpu::Buffer,
     pub voxel_texture: wgpu::Texture,
     pub voxel_view: wgpu::TextureView,
+
+    // World bounds for multi-chunk support
+    pub world_size: (usize, usize, usize),
+    pub world_origin: (i32, i32, i32),
 
     // G-buffer pass
     pub gbuffer_pipeline: wgpu::RenderPipeline,
@@ -382,6 +387,8 @@ impl PathTracer {
             prev_camera_forward: Vec3::NEG_Z,
             width,
             height,
+            world_size: (CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE),
+            world_origin: (0, 0, 0),
         }
     }
 
@@ -1145,6 +1152,119 @@ impl PathTracer {
         );
     }
 
+    /// Update voxels from a multi-chunk world
+    pub fn update_world_voxels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, world: &ChunkManager) {
+        // Get world bounds
+        let Some((min, max)) = world.bounds() else {
+            return;
+        };
+
+        // Calculate world size in blocks
+        let chunks_x = (max.x - min.x + 1) as usize;
+        let chunks_y = (max.y - min.y + 1) as usize;
+        let chunks_z = (max.z - min.z + 1) as usize;
+
+        let size_x = chunks_x * CHUNK_SIZE;
+        let size_y = chunks_y * CHUNK_SIZE;
+        let size_z = chunks_z * CHUNK_SIZE;
+
+        // Check if we need to resize the voxel texture
+        let needs_resize = size_x != self.world_size.0
+            || size_y != self.world_size.1
+            || size_z != self.world_size.2;
+
+        if needs_resize {
+            // Create new voxel texture with appropriate size
+            self.voxel_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Voxel Texture"),
+                size: wgpu::Extent3d {
+                    width: size_x as u32,
+                    height: size_y as u32,
+                    depth_or_array_layers: size_z as u32,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R8Uint,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            self.voxel_view = self.voxel_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.world_size = (size_x, size_y, size_z);
+            self.world_origin = (
+                min.x * CHUNK_SIZE as i32,
+                min.y * CHUNK_SIZE as i32,
+                min.z * CHUNK_SIZE as i32,
+            );
+
+            // Recreate bind groups with new voxel view
+            self.pathtrace_bind_group = Self::create_pathtrace_bind_group(
+                device,
+                &self.pathtrace_bind_group_layout,
+                &self.gbuffer,
+                &self.params_buffer,
+                &self.materials_buffer,
+                &self.voxel_view,
+                &self.accumulation.current_view,
+            );
+
+            self.direct_bind_group = Self::create_pathtrace_bind_group(
+                device,
+                &self.pathtrace_bind_group_layout,
+                &self.gbuffer,
+                &self.params_buffer,
+                &self.materials_buffer,
+                &self.voxel_view,
+                &self.accumulation.current_view,
+            );
+        }
+
+        // Create voxel data from all chunks
+        let mut data = vec![0u8; size_x * size_y * size_z];
+
+        for (chunk_pos, chunk) in world.chunks() {
+            // Calculate chunk offset in the combined voxel array
+            let chunk_offset_x = ((chunk_pos.x - min.x) as usize) * CHUNK_SIZE;
+            let chunk_offset_y = ((chunk_pos.y - min.y) as usize) * CHUNK_SIZE;
+            let chunk_offset_z = ((chunk_pos.z - min.z) as usize) * CHUNK_SIZE;
+
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    for z in 0..CHUNK_SIZE {
+                        let block = chunk.get(x, y, z);
+                        let world_x = chunk_offset_x + x;
+                        let world_y = chunk_offset_y + y;
+                        let world_z = chunk_offset_z + z;
+
+                        let idx = world_x + world_y * size_x + world_z * size_x * size_y;
+                        data[idx] = block as u8;
+                    }
+                }
+            }
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.voxel_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size_x as u32),
+                rows_per_image: Some(size_y as u32),
+            },
+            wgpu::Extent3d {
+                width: size_x as u32,
+                height: size_y as u32,
+                depth_or_array_layers: size_z as u32,
+            },
+        );
+    }
+
     pub fn update_params(
         &mut self,
         queue: &wgpu::Queue,
@@ -1185,9 +1305,17 @@ impl PathTracer {
             max_bounces: 4,
             camera_forward: camera_forward.to_array(),
             voxel_size: 1.0,
-            volume_min: [0.0; 3],
+            volume_min: [
+                self.world_origin.0 as f32,
+                self.world_origin.1 as f32,
+                self.world_origin.2 as f32,
+            ],
             screen_width: self.width,
-            volume_max: [CHUNK_SIZE as f32; 3],
+            volume_max: [
+                (self.world_origin.0 + self.world_size.0 as i32) as f32,
+                (self.world_origin.1 + self.world_size.1 as i32) as f32,
+                (self.world_origin.2 + self.world_size.2 as i32) as f32,
+            ],
             screen_height: self.height,
             sun_direction,
             sun_intensity,
@@ -1205,15 +1333,14 @@ impl PathTracer {
         self.accumulated_frames += 1;
     }
 
-    pub fn render(
+    pub fn render<'a>(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         output_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         camera_bind_group: &wgpu::BindGroup,
         texture_bind_group: &wgpu::BindGroup,
-        vertex_buffer: &wgpu::Buffer,
-        num_vertices: u32,
+        meshes: impl Iterator<Item = (&'a wgpu::Buffer, u32)>,
         lighting_mode: LightingMode,
     ) {
         // Pass 1: G-buffer
@@ -1278,8 +1405,11 @@ impl PathTracer {
             render_pass.set_pipeline(&self.gbuffer_pipeline);
             render_pass.set_bind_group(0, camera_bind_group, &[]);
             render_pass.set_bind_group(1, texture_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            render_pass.draw(0..num_vertices, 0..1);
+
+            for (vertex_buffer, num_vertices) in meshes {
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.draw(0..num_vertices, 0..1);
+            }
         }
 
         // Pass 2: Lighting (compute) - either path tracing or direct

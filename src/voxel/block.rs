@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum BlockType {
     #[default]
     Air = 0,

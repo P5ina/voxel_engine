@@ -1,6 +1,7 @@
 use super::block::BlockType;
 use super::chunk::{Chunk, CHUNK_SIZE};
 use crate::renderer::Vertex;
+use crate::world::{ChunkManager, ChunkPosition};
 
 const TILE_SIZE: f32 = 1.0 / 16.0;
 
@@ -158,6 +159,13 @@ fn get_vertex_ao(chunk: &Chunk, bx: i32, by: i32, bz: i32, neighbors: &[[i32; 3]
     calc_ao(side1, side2, corner)
 }
 
+fn get_vertex_ao_world(world: &ChunkManager, wx: i32, wy: i32, wz: i32, neighbors: &[[i32; 3]; 3]) -> f32 {
+    let side1 = world.is_solid(wx + neighbors[0][0], wy + neighbors[0][1], wz + neighbors[0][2]);
+    let side2 = world.is_solid(wx + neighbors[1][0], wy + neighbors[1][1], wz + neighbors[1][2]);
+    let corner = world.is_solid(wx + neighbors[2][0], wy + neighbors[2][1], wz + neighbors[2][2]);
+    calc_ao(side1, side2, corner)
+}
+
 fn add_face(
     vertices: &mut Vec<Vertex>,
     face: &Face,
@@ -239,6 +247,105 @@ pub fn generate_mesh(chunk: &Chunk) -> Vec<Vertex> {
                 if !chunk.get_signed(bx - 1, by, bz).is_solid() {
                     let tile = get_tile(block, FaceDir::Side);
                     add_face(&mut vertices, &FACE_LEFT, chunk, bx, by, bz, tile);
+                }
+            }
+        }
+    }
+
+    vertices
+}
+
+fn add_face_world(
+    vertices: &mut Vec<Vertex>,
+    face: &Face,
+    world: &ChunkManager,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    tile: (u32, u32),
+) {
+    let u_base = tile.0 as f32 * TILE_SIZE;
+    let v_base = tile.1 as f32 * TILE_SIZE;
+
+    let x = wx as f32;
+    let y = wy as f32;
+    let z = wz as f32;
+
+    // Calculate AO for each vertex
+    let ao = [
+        get_vertex_ao_world(world, wx, wy, wz, &face.ao_neighbors[0]),
+        get_vertex_ao_world(world, wx, wy, wz, &face.ao_neighbors[1]),
+        get_vertex_ao_world(world, wx, wy, wz, &face.ao_neighbors[2]),
+        get_vertex_ao_world(world, wx, wy, wz, &face.ao_neighbors[3]),
+    ];
+
+    // Fix anisotropy: flip quad diagonal if needed for smoother AO interpolation
+    let indices = if ao[0] + ao[2] > ao[1] + ao[3] {
+        [0, 2, 1, 0, 3, 2] // Normal diagonal
+    } else {
+        [0, 3, 1, 1, 3, 2] // Flipped diagonal (maintains CCW)
+    };
+
+    for &i in &indices {
+        let v = face.vertices[i];
+        let uv = face.uvs[i];
+        vertices.push(Vertex::new(
+            [v[0] + x, v[1] + y, v[2] + z],
+            face.normal,
+            [u_base + uv[0] * TILE_SIZE, v_base + uv[1] * TILE_SIZE],
+            ao[i],
+        ));
+    }
+}
+
+/// Generate mesh for a single chunk using world coordinates for cross-boundary neighbor checks
+pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Vec<Vertex> {
+    let mut vertices = Vec::new();
+
+    let chunk = match world.get_chunk(chunk_pos) {
+        Some(c) => c,
+        None => return vertices,
+    };
+
+    let (origin_x, origin_y, origin_z) = chunk_pos.world_origin();
+
+    for x in 0..CHUNK_SIZE {
+        for y in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                let block = chunk.get(x, y, z);
+                if !block.is_solid() {
+                    continue;
+                }
+
+                // World coordinates
+                let wx = origin_x + x as i32;
+                let wy = origin_y + y as i32;
+                let wz = origin_z + z as i32;
+
+                // Check neighbors using world coordinates (crosses chunk boundaries)
+                if !world.is_solid(wx, wy + 1, wz) {
+                    let tile = get_tile(block, FaceDir::Top);
+                    add_face_world(&mut vertices, &FACE_TOP, world, wx, wy, wz, tile);
+                }
+                if !world.is_solid(wx, wy - 1, wz) {
+                    let tile = get_tile(block, FaceDir::Bottom);
+                    add_face_world(&mut vertices, &FACE_BOTTOM, world, wx, wy, wz, tile);
+                }
+                if !world.is_solid(wx, wy, wz + 1) {
+                    let tile = get_tile(block, FaceDir::Side);
+                    add_face_world(&mut vertices, &FACE_FRONT, world, wx, wy, wz, tile);
+                }
+                if !world.is_solid(wx, wy, wz - 1) {
+                    let tile = get_tile(block, FaceDir::Side);
+                    add_face_world(&mut vertices, &FACE_BACK, world, wx, wy, wz, tile);
+                }
+                if !world.is_solid(wx + 1, wy, wz) {
+                    let tile = get_tile(block, FaceDir::Side);
+                    add_face_world(&mut vertices, &FACE_RIGHT, world, wx, wy, wz, tile);
+                }
+                if !world.is_solid(wx - 1, wy, wz) {
+                    let tile = get_tile(block, FaceDir::Side);
+                    add_face_world(&mut vertices, &FACE_LEFT, world, wx, wy, wz, tile);
                 }
             }
         }

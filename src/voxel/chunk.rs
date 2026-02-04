@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 use super::block::BlockType;
 
 pub const CHUNK_SIZE: usize = 32;
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Chunk {
     blocks: [[[BlockType; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
 }

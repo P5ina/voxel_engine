@@ -1,6 +1,6 @@
 use glam::Vec3;
 
-use crate::voxel::Chunk;
+use crate::world::ChunkManager;
 
 pub struct Player {
     pub position: Vec3,
@@ -27,7 +27,7 @@ impl Player {
         self.position + Vec3::new(0.0, self.height - 0.2, 0.0)
     }
 
-    pub fn update(&mut self, chunk: &Chunk, dt: f32) {
+    pub fn update(&mut self, world: &ChunkManager, dt: f32) {
         const GRAVITY: f32 = 28.0;
         const TERMINAL_VELOCITY: f32 = 50.0;
 
@@ -39,9 +39,9 @@ impl Player {
         self.on_ground = false;
 
         // Move and collide each axis separately
-        self.move_axis(chunk, Vec3::X, self.velocity.x * dt);
-        self.move_axis(chunk, Vec3::Y, self.velocity.y * dt);
-        self.move_axis(chunk, Vec3::Z, self.velocity.z * dt);
+        self.move_axis(world, Vec3::X, self.velocity.x * dt);
+        self.move_axis(world, Vec3::Y, self.velocity.y * dt);
+        self.move_axis(world, Vec3::Z, self.velocity.z * dt);
 
         // Friction - frame-rate independent
         // Use exponential decay: friction^(dt * target_fps) keeps behavior consistent
@@ -52,21 +52,21 @@ impl Player {
         self.velocity.z *= friction;
     }
 
-    fn move_axis(&mut self, chunk: &Chunk, axis: Vec3, delta: f32) {
+    fn move_axis(&mut self, world: &ChunkManager, axis: Vec3, delta: f32) {
         if delta.abs() < 0.0001 {
             return;
         }
 
         let new_pos = self.position + axis * delta;
 
-        if self.check_collision(chunk, new_pos) {
+        if self.check_collision(world, new_pos) {
             // Collision detected - sweep to find contact point
             let steps = (delta.abs().ceil() as i32).max(1) * 4;
             let step_delta = delta / steps as f32;
 
             for _ in 0..steps {
                 let test_pos = self.position + axis * step_delta;
-                if self.check_collision(chunk, test_pos) {
+                if self.check_collision(world, test_pos) {
                     break;
                 }
                 self.position = test_pos;
@@ -83,7 +83,7 @@ impl Player {
         }
     }
 
-    fn check_collision(&self, chunk: &Chunk, pos: Vec3) -> bool {
+    fn check_collision(&self, world: &ChunkManager, pos: Vec3) -> bool {
         // Check all blocks that the player AABB might intersect
         let min_x = (pos.x - self.width).floor() as i32;
         let max_x = (pos.x + self.width).floor() as i32;
@@ -95,7 +95,7 @@ impl Player {
         for bx in min_x..=max_x {
             for by in min_y..=max_y {
                 for bz in min_z..=max_z {
-                    if chunk.get_signed(bx, by, bz).is_solid() {
+                    if world.is_solid(bx, by, bz) {
                         // AABB vs block AABB test
                         if self.aabb_intersects_block(pos, bx, by, bz) {
                             return true;
