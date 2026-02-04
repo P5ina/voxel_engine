@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use wgpu::{util::DeviceExt, Backends};
+use wgpu::{Backends, util::DeviceExt};
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -18,7 +18,7 @@ mod voxel;
 use camera::{Camera, CameraUniform};
 use player::Player;
 use renderer::Vertex;
-use voxel::{generate_mesh, raycast, BlockType, Chunk};
+use voxel::{BlockType, Chunk, generate_mesh, raycast};
 
 #[derive(Default)]
 struct InputState {
@@ -393,7 +393,7 @@ impl AppState {
         self.last_frame = now;
 
         // Player movement input
-        const MOVE_SPEED: f32 = 50.0;
+        const MOVE_SPEED: f32 = 100.0;
         let input = Vec3::new(
             (self.input.right as i32 - self.input.left as i32) as f32,
             0.0,
@@ -402,7 +402,8 @@ impl AppState {
 
         let forward = self.camera.forward().with_y(0.0).normalize_or_zero();
         let right = self.camera.right();
-        self.player.apply_movement(forward, right, input, MOVE_SPEED * dt);
+        self.player
+            .apply_movement(forward, right, input, MOVE_SPEED * dt);
 
         // Jump
         if self.input.jump {
@@ -558,7 +559,8 @@ impl AppState {
                 if let Some(hit) = hit {
                     let [x, y, z] = hit.block_pos;
                     if x >= 0 && y >= 0 && z >= 0 {
-                        self.chunk.set(x as usize, y as usize, z as usize, BlockType::Air);
+                        self.chunk
+                            .set(x as usize, y as usize, z as usize, BlockType::Air);
                         self.mesh_dirty = true;
                     }
                 }
@@ -572,7 +574,11 @@ impl AppState {
                     let place_y = y + ny;
                     let place_z = z + nz;
 
-                    if place_x >= 0 && place_y >= 0 && place_z >= 0 {
+                    if place_x >= 0
+                        && place_y >= 0
+                        && place_z >= 0
+                        && !self.player.intersects_block(place_x, place_y, place_z)
+                    {
                         self.chunk.set(
                             place_x as usize,
                             place_y as usize,
