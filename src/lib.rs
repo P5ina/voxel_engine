@@ -13,11 +13,13 @@ use winit::{
 mod camera;
 mod player;
 mod renderer;
+mod ui;
 mod voxel;
 
 use camera::{Camera, CameraUniform};
 use player::Player;
 use renderer::Vertex;
+use ui::{EguiRenderer, GameSettings, UiMessage, UiScreen};
 use voxel::{BlockType, Chunk, generate_mesh, raycast};
 
 #[derive(Default)]
@@ -59,6 +61,12 @@ pub struct AppState {
 
     player: Player,
     last_frame: std::time::Instant,
+
+    // UI
+    egui: EguiRenderer,
+    ui_screen: UiScreen,
+    game_settings: GameSettings,
+    prev_screen: UiScreen,
 }
 
 impl AppState {
@@ -107,10 +115,10 @@ impl AppState {
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
-                trace: wgpu::Trace::Off,
+                experimental_features: Default::default(),
+                trace: Default::default(),
             })
             .await?;
 
@@ -232,7 +240,7 @@ impl AppState {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -280,7 +288,7 @@ impl AppState {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[&camera_bind_group_layout, &texture_bind_group_layout],
-                immediate_size: 0,
+                push_constant_ranges: &[],
             });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -323,9 +331,12 @@ impl AppState {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
+
+        // UI
+        let egui = EguiRenderer::new(&device, config.format, &window);
 
         Ok(Self {
             surface,
@@ -350,6 +361,10 @@ impl AppState {
             mouse_grabbed: false,
             player,
             last_frame: std::time::Instant::now(),
+            egui,
+            ui_screen: UiScreen::default(),
+            game_settings: GameSettings::default(),
+            prev_screen: UiScreen::MainMenu,
         })
     }
 
@@ -416,6 +431,9 @@ impl AppState {
         // Sync camera with player
         self.camera.position = self.player.eye_position();
 
+        // Sync FOV from settings (degrees to radians)
+        self.camera.fov = self.game_settings.fov.to_radians();
+
         self.camera_uniform.update(&self.camera);
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -429,11 +447,35 @@ impl AppState {
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.update();
+        // Only update game logic when in game
+        if self.ui_screen == UiScreen::InGame {
+            self.update();
+        } else {
+            // Still update time for UI
+            self.last_frame = std::time::Instant::now();
+        }
         self.window.request_redraw();
 
         if !self.is_surface_configured {
             return Ok(());
+        }
+
+        // Begin egui frame
+        self.egui.begin_frame(&self.window);
+
+        // Build UI and handle messages
+        let msg = match self.ui_screen {
+            UiScreen::MainMenu => ui::main_menu(&self.egui.ctx),
+            UiScreen::Settings => ui::settings(&self.egui.ctx, &mut self.game_settings),
+            UiScreen::PauseMenu => ui::pause_menu(&self.egui.ctx),
+            UiScreen::InGame => {
+                ui::hud(&self.egui.ctx);
+                None
+            }
+        };
+
+        if let Some(msg) = msg {
+            self.handle_ui_message(msg);
         }
 
         let output = self.surface.get_current_texture()?;
@@ -447,6 +489,24 @@ impl AppState {
                 label: Some("Render Encoder"),
             });
 
+        // Render 3D scene (only in game or pause menu for background)
+        let clear_color = if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::PauseMenu {
+            wgpu::Color {
+                r: 0.5,
+                g: 0.7,
+                b: 1.0,
+                a: 1.0,
+            }
+        } else {
+            // Dark background for menus
+            wgpu::Color {
+                r: 0.1,
+                g: 0.1,
+                b: 0.15,
+                a: 1.0,
+            }
+        };
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
@@ -455,12 +515,7 @@ impl AppState {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.5,
-                            g: 0.7,
-                            b: 1.0,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -472,22 +527,74 @@ impl AppState {
                     }),
                     stencil_ops: None,
                 }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
+                ..Default::default()
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..self.num_vertices, 0..1);
+            // Only render 3D scene in game or pause
+            if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::PauseMenu {
+                // Sync FOV before rendering
+                self.camera.fov = self.game_settings.fov.to_radians();
+                self.camera_uniform.update(&self.camera);
+                self.queue.write_buffer(
+                    &self.camera_buffer,
+                    0,
+                    bytemuck::cast_slice(&[self.camera_uniform]),
+                );
+
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                render_pass.draw(0..self.num_vertices, 0..1);
+            }
         }
+
+        // Render egui
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: self.window.scale_factor() as f32,
+        };
+
+        self.egui.end_frame(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &self.window,
+            &view,
+            screen_descriptor,
+        );
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
+    }
+
+    fn handle_ui_message(&mut self, msg: UiMessage) {
+        match msg {
+            UiMessage::Play => {
+                self.ui_screen = UiScreen::InGame;
+                self.grab_mouse(true);
+            }
+            UiMessage::Settings => {
+                self.prev_screen = self.ui_screen;
+                self.ui_screen = UiScreen::Settings;
+            }
+            UiMessage::Exit => {
+                std::process::exit(0);
+            }
+            UiMessage::Back => {
+                self.ui_screen = self.prev_screen;
+            }
+            UiMessage::Resume => {
+                self.ui_screen = UiScreen::InGame;
+                self.grab_mouse(true);
+            }
+            UiMessage::QuitToMenu => {
+                self.ui_screen = UiScreen::MainMenu;
+                self.grab_mouse(false);
+            }
+        }
     }
 
     fn grab_mouse(&mut self, grab: bool) {
@@ -504,31 +611,57 @@ impl AppState {
         }
     }
 
-    fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
-        match code {
-            KeyCode::Escape => {
-                if is_pressed {
-                    if self.mouse_grabbed {
-                        self.grab_mouse(false);
-                    } else {
-                        event_loop.exit();
-                    }
+    fn handle_key(&mut self, _event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
+        if !is_pressed {
+            // Handle key release for movement
+            if self.ui_screen == UiScreen::InGame {
+                match code {
+                    KeyCode::KeyW => self.input.forward = false,
+                    KeyCode::KeyS => self.input.backward = false,
+                    KeyCode::KeyA => self.input.left = false,
+                    KeyCode::KeyD => self.input.right = false,
+                    KeyCode::Space => self.input.jump = false,
+                    _ => {}
                 }
             }
-            KeyCode::KeyW => self.input.forward = is_pressed,
-            KeyCode::KeyS => self.input.backward = is_pressed,
-            KeyCode::KeyA => self.input.left = is_pressed,
-            KeyCode::KeyD => self.input.right = is_pressed,
-            KeyCode::Space => self.input.jump = is_pressed,
+            return;
+        }
+
+        match code {
+            KeyCode::Escape => match self.ui_screen {
+                UiScreen::InGame => {
+                    self.ui_screen = UiScreen::PauseMenu;
+                    self.grab_mouse(false);
+                }
+                UiScreen::PauseMenu => {
+                    self.ui_screen = UiScreen::InGame;
+                    self.grab_mouse(true);
+                }
+                UiScreen::Settings => {
+                    self.ui_screen = self.prev_screen;
+                }
+                UiScreen::MainMenu => {
+                    // Do nothing, use Exit button
+                }
+            },
+            // Movement keys only in game
+            _ if self.ui_screen == UiScreen::InGame => match code {
+                KeyCode::KeyW => self.input.forward = true,
+                KeyCode::KeyS => self.input.backward = true,
+                KeyCode::KeyA => self.input.left = true,
+                KeyCode::KeyD => self.input.right = true,
+                KeyCode::Space => self.input.jump = true,
+                _ => {}
+            },
             _ => {}
         }
     }
 
     fn handle_mouse_motion(&mut self, delta: (f64, f64)) {
-        if self.mouse_grabbed {
-            const SENSITIVITY: f32 = 0.003;
+        if self.mouse_grabbed && self.ui_screen == UiScreen::InGame {
+            let sensitivity = self.game_settings.sensitivity;
             self.camera
-                .process_mouse(delta.0 as f32, delta.1 as f32, SENSITIVITY);
+                .process_mouse(delta.0 as f32, delta.1 as f32, sensitivity);
         }
     }
 
@@ -633,19 +766,42 @@ impl ApplicationHandler<AppState> for App {
             None => return,
         };
 
+        // Let egui handle the event first
+        let egui_response = state.egui.handle_window_event(&state.window, &event);
+
+        // Handle resize and close regardless of egui
+        match &event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+                return;
+            }
+            WindowEvent::Resized(size) => {
+                state.resize(size.width, size.height);
+                return;
+            }
+            WindowEvent::RedrawRequested => {
+                match state.render() {
+                    Ok(_) => {}
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        let size = state.window.inner_size();
+                        state.resize(size.width, size.height);
+                    }
+                    Err(e) => {
+                        log::error!("Unable to render {}", e);
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // If egui consumed the event, don't process it
+        if egui_response.consumed {
+            return;
+        }
+
+        // Handle remaining events
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
-            WindowEvent::RedrawRequested => match state.render() {
-                Ok(_) => {}
-                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                    let size = state.window.inner_size();
-                    state.resize(size.width, size.height);
-                }
-                Err(e) => {
-                    log::error!("Unable to render {}", e);
-                }
-            },
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
