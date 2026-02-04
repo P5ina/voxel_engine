@@ -56,7 +56,18 @@ impl Player {
         let new_pos = self.position + axis * delta;
 
         if self.check_collision(chunk, new_pos) {
-            // Collision detected
+            // Collision detected - sweep to find contact point
+            let steps = (delta.abs().ceil() as i32).max(1) * 4;
+            let step_delta = delta / steps as f32;
+
+            for _ in 0..steps {
+                let test_pos = self.position + axis * step_delta;
+                if self.check_collision(chunk, test_pos) {
+                    break;
+                }
+                self.position = test_pos;
+            }
+
             if axis == Vec3::Y {
                 if delta < 0.0 {
                     self.on_ground = true;
