@@ -11,10 +11,12 @@ use winit::{
 };
 
 mod camera;
+mod player;
 mod renderer;
 mod voxel;
 
 use camera::{Camera, CameraUniform};
+use player::Player;
 use renderer::Vertex;
 use voxel::{generate_mesh, raycast, BlockType, Chunk};
 
@@ -24,8 +26,7 @@ struct InputState {
     backward: bool,
     left: bool,
     right: bool,
-    up: bool,
-    down: bool,
+    jump: bool,
 }
 
 pub struct AppState {
@@ -51,8 +52,13 @@ pub struct AppState {
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
 
+    texture_bind_group: wgpu::BindGroup,
+
     input: InputState,
     mouse_grabbed: bool,
+
+    player: Player,
+    last_frame: std::time::Instant,
 }
 
 impl AppState {
@@ -126,9 +132,10 @@ impl AppState {
             desired_maximum_frame_latency: 2,
         };
 
-        // Camera setup
+        // Player and camera setup
+        let player = Player::new(Vec3::new(16.0, 12.0, 16.0));
         let aspect = size.width as f32 / size.height.max(1) as f32;
-        let camera = Camera::new(Vec3::new(16.0, 20.0, 50.0), aspect);
+        let camera = Camera::new(player.eye_position(), aspect);
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update(&camera);
 
@@ -178,12 +185,101 @@ impl AppState {
         // Depth texture
         let (depth_texture, depth_view) = Self::create_depth_texture(&device, &config);
 
+        // Load texture atlas
+        let atlas_bytes = include_bytes!("../assets/textures/blocks/atlas_0.png");
+        let atlas_image = image::load_from_memory(atlas_bytes).unwrap().to_rgba8();
+        let (atlas_width, atlas_height) = atlas_image.dimensions();
+
+        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Atlas Texture"),
+            size: wgpu::Extent3d {
+                width: atlas_width,
+                height: atlas_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas_image,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * atlas_width),
+                rows_per_image: Some(atlas_height),
+            },
+            wgpu::Extent3d {
+                width: atlas_width,
+                height: atlas_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Texture Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Texture Bind Group"),
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                },
+            ],
+        });
+
         // Shader and pipeline
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout],
+                bind_group_layouts: &[&camera_bind_group_layout, &texture_bind_group_layout],
                 immediate_size: 0,
             });
 
@@ -249,8 +345,11 @@ impl AppState {
             mesh_dirty,
             depth_texture,
             depth_view,
+            texture_bind_group,
             input: InputState::default(),
             mouse_grabbed: false,
+            player,
+            last_frame: std::time::Instant::now(),
         })
     }
 
@@ -288,17 +387,33 @@ impl AppState {
     }
 
     fn update(&mut self) {
-        const MOVE_SPEED: f32 = 0.3;
+        // Delta time
+        let now = std::time::Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
 
-        self.camera.process_keyboard(
-            self.input.forward,
-            self.input.backward,
-            self.input.left,
-            self.input.right,
-            self.input.up,
-            self.input.down,
-            MOVE_SPEED,
+        // Player movement input
+        const MOVE_SPEED: f32 = 50.0;
+        let input = Vec3::new(
+            (self.input.right as i32 - self.input.left as i32) as f32,
+            0.0,
+            (self.input.forward as i32 - self.input.backward as i32) as f32,
         );
+
+        let forward = self.camera.forward().with_y(0.0).normalize_or_zero();
+        let right = self.camera.right();
+        self.player.apply_movement(forward, right, input, MOVE_SPEED * dt);
+
+        // Jump
+        if self.input.jump {
+            self.player.jump();
+        }
+
+        // Physics update
+        self.player.update(&self.chunk, dt);
+
+        // Sync camera with player
+        self.camera.position = self.player.eye_position();
 
         self.camera_uniform.update(&self.camera);
         self.queue.write_buffer(
@@ -363,6 +478,7 @@ impl AppState {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.draw(0..self.num_vertices, 0..1);
         }
@@ -402,8 +518,7 @@ impl AppState {
             KeyCode::KeyS => self.input.backward = is_pressed,
             KeyCode::KeyA => self.input.left = is_pressed,
             KeyCode::KeyD => self.input.right = is_pressed,
-            KeyCode::Space => self.input.up = is_pressed,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.down = is_pressed,
+            KeyCode::Space => self.input.jump = is_pressed,
             _ => {}
         }
     }

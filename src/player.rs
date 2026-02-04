@@ -1,0 +1,122 @@
+use glam::Vec3;
+
+use crate::voxel::Chunk;
+
+pub struct Player {
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub on_ground: bool,
+
+    // AABB size (half-extents)
+    pub width: f32,  // X and Z half-size
+    pub height: f32, // Y full height
+}
+
+impl Player {
+    pub fn new(position: Vec3) -> Self {
+        Self {
+            position,
+            velocity: Vec3::ZERO,
+            on_ground: false,
+            width: 0.3,   // 0.6 total width
+            height: 1.8,  // 1.8 blocks tall
+        }
+    }
+
+    pub fn eye_position(&self) -> Vec3 {
+        self.position + Vec3::new(0.0, self.height - 0.2, 0.0)
+    }
+
+    pub fn update(&mut self, chunk: &Chunk, dt: f32) {
+        const GRAVITY: f32 = 28.0;
+        const TERMINAL_VELOCITY: f32 = 50.0;
+
+        // Always apply gravity
+        self.velocity.y -= GRAVITY * dt;
+        self.velocity.y = self.velocity.y.max(-TERMINAL_VELOCITY);
+
+        // Reset on_ground, will be set true if we hit ground
+        self.on_ground = false;
+
+        // Move and collide each axis separately
+        self.move_axis(chunk, Vec3::X, self.velocity.x * dt);
+        self.move_axis(chunk, Vec3::Y, self.velocity.y * dt);
+        self.move_axis(chunk, Vec3::Z, self.velocity.z * dt);
+
+        // Friction
+        self.velocity.x *= 0.8;
+        self.velocity.z *= 0.8;
+    }
+
+    fn move_axis(&mut self, chunk: &Chunk, axis: Vec3, delta: f32) {
+        if delta.abs() < 0.0001 {
+            return;
+        }
+
+        let new_pos = self.position + axis * delta;
+
+        if self.check_collision(chunk, new_pos) {
+            // Collision detected
+            if axis == Vec3::Y {
+                if delta < 0.0 {
+                    self.on_ground = true;
+                }
+                self.velocity.y = 0.0;
+            }
+        } else {
+            self.position = new_pos;
+        }
+    }
+
+    fn check_collision(&self, chunk: &Chunk, pos: Vec3) -> bool {
+        // Check all blocks that the player AABB might intersect
+        let min_x = (pos.x - self.width).floor() as i32;
+        let max_x = (pos.x + self.width).floor() as i32;
+        let min_y = pos.y.floor() as i32;
+        let max_y = (pos.y + self.height).floor() as i32;
+        let min_z = (pos.z - self.width).floor() as i32;
+        let max_z = (pos.z + self.width).floor() as i32;
+
+        for bx in min_x..=max_x {
+            for by in min_y..=max_y {
+                for bz in min_z..=max_z {
+                    if chunk.get_signed(bx, by, bz).is_solid() {
+                        // AABB vs block AABB test
+                        if self.aabb_intersects_block(pos, bx, by, bz) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn aabb_intersects_block(&self, pos: Vec3, bx: i32, by: i32, bz: i32) -> bool {
+        let player_min = Vec3::new(pos.x - self.width, pos.y, pos.z - self.width);
+        let player_max = Vec3::new(pos.x + self.width, pos.y + self.height, pos.z + self.width);
+
+        let block_min = Vec3::new(bx as f32, by as f32, bz as f32);
+        let block_max = block_min + Vec3::ONE;
+
+        player_min.x < block_max.x
+            && player_max.x > block_min.x
+            && player_min.y < block_max.y
+            && player_max.y > block_min.y
+            && player_min.z < block_max.z
+            && player_max.z > block_min.z
+    }
+
+    pub fn jump(&mut self) {
+        if self.on_ground {
+            self.velocity.y = 9.0;
+            self.on_ground = false;
+        }
+    }
+
+    pub fn apply_movement(&mut self, forward: Vec3, right: Vec3, input: Vec3, speed: f32) {
+        let move_dir = (forward * input.z + right * input.x).normalize_or_zero();
+        self.velocity.x += move_dir.x * speed;
+        self.velocity.z += move_dir.z * speed;
+    }
+}

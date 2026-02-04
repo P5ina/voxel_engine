@@ -50,30 +50,6 @@ impl Camera {
         self.projection_matrix() * self.view_matrix()
     }
 
-    pub fn process_keyboard(&mut self, forward: bool, backward: bool, left: bool, right: bool, up: bool, down: bool, speed: f32) {
-        let front = self.forward();
-        let right_dir = self.right();
-
-        if forward {
-            self.position += front * speed;
-        }
-        if backward {
-            self.position -= front * speed;
-        }
-        if left {
-            self.position -= right_dir * speed;
-        }
-        if right {
-            self.position += right_dir * speed;
-        }
-        if up {
-            self.position.y += speed;
-        }
-        if down {
-            self.position.y -= speed;
-        }
-    }
-
     pub fn process_mouse(&mut self, delta_x: f32, delta_y: f32, sensitivity: f32) {
         self.yaw += delta_x * sensitivity;
         self.pitch -= delta_y * sensitivity;
