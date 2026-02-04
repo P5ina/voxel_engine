@@ -43,9 +43,13 @@ impl Player {
         self.move_axis(chunk, Vec3::Y, self.velocity.y * dt);
         self.move_axis(chunk, Vec3::Z, self.velocity.z * dt);
 
-        // Friction
-        self.velocity.x *= 0.8;
-        self.velocity.z *= 0.8;
+        // Friction - frame-rate independent
+        // Use exponential decay: friction^(dt * target_fps) keeps behavior consistent
+        const FRICTION: f32 = 0.8;
+        const TARGET_FPS: f32 = 60.0;
+        let friction = FRICTION.powf(dt * TARGET_FPS);
+        self.velocity.x *= friction;
+        self.velocity.z *= friction;
     }
 
     fn move_axis(&mut self, chunk: &Chunk, axis: Vec3, delta: f32) {

@@ -1,6 +1,6 @@
 use egui::{Align, Align2, Area, Color32, FontId, RichText, Vec2};
 
-use super::{GameSettings, UiMessage};
+use super::{GameSettings, LightingMode, UiMessage};
 
 pub fn main_menu(ctx: &egui::Context) -> Option<UiMessage> {
     let mut msg = None;
@@ -127,6 +127,28 @@ pub fn settings(ctx: &egui::Context, settings: &mut GameSettings) -> Option<UiMe
                                     egui::Slider::new(&mut settings.sensitivity, 0.001..=0.01)
                                         .show_value(true),
                                 );
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Lighting").color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                egui::ComboBox::from_id_salt("lighting_mode")
+                                    .selected_text(settings.lighting_mode.name())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut settings.lighting_mode,
+                                            LightingMode::Simple,
+                                            "Simple",
+                                        );
+                                        ui.selectable_value(
+                                            &mut settings.lighting_mode,
+                                            LightingMode::PathTracing,
+                                            "Path Tracing",
+                                        );
+                                    });
                             });
                         });
                     });

@@ -11,6 +11,18 @@ pub struct Camera {
 }
 
 impl Camera {
+    pub fn up(&self) -> Vec3 {
+        let forward = self.forward();
+        let right = self.right();
+        forward.cross(right).normalize()
+    }
+
+    pub fn inverse_view_projection_matrix(&self) -> Mat4 {
+        self.view_projection_matrix().inverse()
+    }
+}
+
+impl Camera {
     pub fn new(position: Vec3, aspect: f32) -> Self {
         Self {
             position,
@@ -69,16 +81,21 @@ impl Camera {
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    world_position: [f32; 3],
+    _padding: f32,
 }
 
 impl CameraUniform {
     pub fn new() -> Self {
         Self {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            world_position: [0.0; 3],
+            _padding: 0.0,
         }
     }
 
     pub fn update(&mut self, camera: &Camera) {
         self.view_proj = camera.view_projection_matrix().to_cols_array_2d();
+        self.world_position = camera.position.to_array();
     }
 }

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use glam::Vec3;
-use wgpu::{Backends, util::DeviceExt};
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -11,16 +10,20 @@ use winit::{
 };
 
 mod camera;
+mod pathtracer;
 mod player;
 mod renderer;
 mod ui;
 mod voxel;
 
-use camera::{Camera, CameraUniform};
+use camera::Camera;
+use pathtracer::PathTracer;
 use player::Player;
-use renderer::Vertex;
+use renderer::{
+    CameraResources, DepthBuffer, LightingParams, MeshResources, RenderContext, TextureResources,
+};
 use ui::{EguiRenderer, GameSettings, UiMessage, UiScreen};
-use voxel::{BlockType, Chunk, generate_mesh, raycast};
+use voxel::{generate_mesh, raycast, BlockType, Chunk};
 
 #[derive(Default)]
 struct InputState {
@@ -32,377 +35,125 @@ struct InputState {
 }
 
 pub struct AppState {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    is_surface_configured: bool,
-    render_pipeline: wgpu::RenderPipeline,
     window: Arc<Window>,
 
+    // Rendering
+    render_ctx: RenderContext,
+    depth_buffer: DepthBuffer,
+    camera_resources: CameraResources,
+    texture_resources: TextureResources,
+    mesh_resources: MeshResources,
+    lighting: LightingParams,
+    path_tracer: PathTracer,
+
+    // Game state
     camera: Camera,
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-
-    vertex_buffer: wgpu::Buffer,
-    num_vertices: u32,
-
+    player: Player,
     chunk: Chunk,
     mesh_dirty: bool,
 
-    depth_texture: wgpu::Texture,
-    depth_view: wgpu::TextureView,
-
-    texture_bind_group: wgpu::BindGroup,
-
+    // Input
     input: InputState,
     mouse_grabbed: bool,
-
-    player: Player,
-    last_frame: std::time::Instant,
 
     // UI
     egui: EguiRenderer,
     ui_screen: UiScreen,
     game_settings: GameSettings,
     prev_screen: UiScreen,
+
+    // Timing
+    last_frame: std::time::Instant,
 }
 
 impl AppState {
-    fn create_depth_texture(
-        device: &wgpu::Device,
-        config: &wgpu::SurfaceConfiguration,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
-        let size = wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
-            depth_or_array_layers: 1,
-        };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Depth Texture"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
-    }
-
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: Backends::PRIMARY,
-            ..Default::default()
-        });
-
-        let surface = instance.create_surface(window.clone()).unwrap();
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await?;
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-                experimental_features: Default::default(),
-                trace: Default::default(),
-            })
-            .await?;
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
+        // Initialize render context
+        let render_ctx = RenderContext::new(window.clone()).await?;
 
         // Player and camera setup
         let player = Player::new(Vec3::new(16.0, 12.0, 16.0));
         let aspect = size.width as f32 / size.height.max(1) as f32;
         let camera = Camera::new(player.eye_position(), aspect);
-        let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update(&camera);
 
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let camera_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Camera Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Camera Bind Group"),
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
+        // Create resources
+        let camera_resources = CameraResources::new(&render_ctx.device, &camera);
+        let texture_resources = TextureResources::new(&render_ctx.device, &render_ctx.queue);
+        let depth_buffer = DepthBuffer::new(&render_ctx.device, size.width, size.height);
 
         // Generate chunk mesh
         let mut chunk = Chunk::new();
         chunk.fill_ground(8);
         let vertices = generate_mesh(&chunk);
-        let num_vertices = vertices.len() as u32;
+        let mesh_resources = MeshResources::new(&render_ctx.device, &vertices);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let mesh_dirty = false;
-
-        // Depth texture
-        let (depth_texture, depth_view) = Self::create_depth_texture(&device, &config);
-
-        // Load texture atlas
-        let atlas_bytes = include_bytes!("../assets/textures/blocks/atlas_0.png");
-        let atlas_image = image::load_from_memory(atlas_bytes).unwrap().to_rgba8();
-        let (atlas_width, atlas_height) = atlas_image.dimensions();
-
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Atlas Texture"),
-            size: wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &atlas_image,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * atlas_width),
-                rows_per_image: Some(atlas_height),
-            },
-            wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Texture Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Texture Bind Group"),
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
-                },
-            ],
-        });
-
-        // Shader and pipeline
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &texture_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        // Lighting
+        let mut lighting = LightingParams::new();
+        lighting.update_time(0.1);
 
         // UI
-        let egui = EguiRenderer::new(&device, config.format, &window);
+        let egui = EguiRenderer::new(&render_ctx.device, render_ctx.format(), &window);
+
+        // Path Tracer
+        let path_tracer = PathTracer::new(
+            &render_ctx.device,
+            &render_ctx.queue,
+            size.width,
+            size.height,
+            render_ctx.format(),
+            &camera_resources.bind_group_layout,
+            &texture_resources.bind_group_layout,
+        );
+        path_tracer.update_voxels(&render_ctx.queue, &chunk);
 
         Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
-            is_surface_configured: false,
-            render_pipeline,
             window,
+            render_ctx,
+            depth_buffer,
+            camera_resources,
+            texture_resources,
+            mesh_resources,
+            lighting,
+            path_tracer,
             camera,
-            camera_uniform,
-            camera_buffer,
-            camera_bind_group,
-            vertex_buffer,
-            num_vertices,
+            player,
             chunk,
-            mesh_dirty,
-            depth_texture,
-            depth_view,
-            texture_bind_group,
+            mesh_dirty: false,
             input: InputState::default(),
             mouse_grabbed: false,
-            player,
-            last_frame: std::time::Instant::now(),
             egui,
             ui_screen: UiScreen::default(),
             game_settings: GameSettings::default(),
             prev_screen: UiScreen::MainMenu,
+            last_frame: std::time::Instant::now(),
         })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-            self.is_surface_configured = true;
-
-            // Recreate depth texture
-            let (depth_texture, depth_view) =
-                Self::create_depth_texture(&self.device, &self.config);
-            self.depth_texture = depth_texture;
-            self.depth_view = depth_view;
-
-            // Update camera aspect
+            self.render_ctx.resize(width, height);
+            self.depth_buffer
+                .resize(&self.render_ctx.device, width, height);
             self.camera.resize(width, height);
+            self.path_tracer.resize(&self.render_ctx.device, width, height);
         }
     }
 
     fn rebuild_mesh(&mut self) {
         let vertices = generate_mesh(&self.chunk);
-        self.num_vertices = vertices.len() as u32;
+        self.mesh_resources
+            .update(&self.render_ctx.device, &vertices);
 
-        self.vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
+        self.path_tracer
+            .update_voxels(&self.render_ctx.queue, &self.chunk);
+        self.path_tracer.reset_accumulation();
 
         self.mesh_dirty = false;
     }
 
     fn update(&mut self) {
-        // Delta time
         let now = std::time::Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -420,26 +171,17 @@ impl AppState {
         self.player
             .apply_movement(forward, right, input, MOVE_SPEED * dt);
 
-        // Jump
         if self.input.jump {
             self.player.jump();
         }
 
-        // Physics update
         self.player.update(&self.chunk, dt);
-
-        // Sync camera with player
         self.camera.position = self.player.eye_position();
-
-        // Sync FOV from settings (degrees to radians)
         self.camera.fov = self.game_settings.fov.to_radians();
 
-        self.camera_uniform.update(&self.camera);
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[self.camera_uniform]),
-        );
+        self.camera_resources
+            .update(&self.render_ctx.queue, &self.camera);
+        self.lighting.update_time(0.1);
 
         if self.mesh_dirty {
             self.rebuild_mesh();
@@ -447,23 +189,21 @@ impl AppState {
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // Only update game logic when in game
         if self.ui_screen == UiScreen::InGame {
             self.update();
         } else {
-            // Still update time for UI
             self.last_frame = std::time::Instant::now();
         }
         self.window.request_redraw();
 
-        if !self.is_surface_configured {
+        if !self.render_ctx.is_configured {
             return Ok(());
         }
 
         // Begin egui frame
         self.egui.begin_frame(&self.window);
 
-        // Build UI and handle messages
+        // Build UI
         let msg = match self.ui_screen {
             UiScreen::MainMenu => ui::main_menu(&self.egui.ctx),
             UiScreen::Settings => ui::settings(&self.egui.ctx, &mut self.game_settings),
@@ -478,93 +218,83 @@ impl AppState {
             self.handle_ui_message(msg);
         }
 
-        let output = self.surface.get_current_texture()?;
+        let output = self.render_ctx.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
+        let mut encoder =
+            self.render_ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Render Encoder"),
+                });
 
-        // Render 3D scene (only in game or pause menu for background)
-        let clear_color = if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::PauseMenu {
-            wgpu::Color {
-                r: 0.5,
-                g: 0.7,
-                b: 1.0,
-                a: 1.0,
-            }
+        // Render 3D scene
+        if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::PauseMenu {
+            self.camera.fov = self.game_settings.fov.to_radians();
+            self.camera_resources
+                .update(&self.render_ctx.queue, &self.camera);
+
+            self.path_tracer.update_params(
+                &self.render_ctx.queue,
+                &self.camera,
+                self.lighting.sun_direction,
+                self.lighting.sun_intensity,
+                self.lighting.sun_color,
+            );
+
+            self.path_tracer.render(
+                &mut encoder,
+                &view,
+                &self.depth_buffer.view,
+                &self.camera_resources.bind_group,
+                &self.texture_resources.bind_group,
+                &self.mesh_resources.vertex_buffer,
+                self.mesh_resources.num_vertices,
+                self.game_settings.lighting_mode,
+            );
         } else {
-            // Dark background for menus
-            wgpu::Color {
-                r: 0.1,
-                g: 0.1,
-                b: 0.15,
-                a: 1.0,
-            }
-        };
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+            // Menu background
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Menu Background Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.1,
+                            b: 0.15,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None,
                 ..Default::default()
             });
-
-            // Only render 3D scene in game or pause
-            if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::PauseMenu {
-                // Sync FOV before rendering
-                self.camera.fov = self.game_settings.fov.to_radians();
-                self.camera_uniform.update(&self.camera);
-                self.queue.write_buffer(
-                    &self.camera_buffer,
-                    0,
-                    bytemuck::cast_slice(&[self.camera_uniform]),
-                );
-
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.texture_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                render_pass.draw(0..self.num_vertices, 0..1);
-            }
         }
 
         // Render egui
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.config.width, self.config.height],
+            size_in_pixels: [self.render_ctx.config.width, self.render_ctx.config.height],
             pixels_per_point: self.window.scale_factor() as f32,
         };
 
         self.egui.end_frame(
-            &self.device,
-            &self.queue,
+            &self.render_ctx.device,
+            &self.render_ctx.queue,
             &mut encoder,
             &self.window,
             &view,
             screen_descriptor,
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        self.render_ctx
+            .queue
+            .submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
@@ -613,7 +343,6 @@ impl AppState {
 
     fn handle_key(&mut self, _event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
         if !is_pressed {
-            // Handle key release for movement
             if self.ui_screen == UiScreen::InGame {
                 match code {
                     KeyCode::KeyW => self.input.forward = false,
@@ -640,11 +369,8 @@ impl AppState {
                 UiScreen::Settings => {
                     self.ui_screen = self.prev_screen;
                 }
-                UiScreen::MainMenu => {
-                    // Do nothing, use Exit button
-                }
+                UiScreen::MainMenu => {}
             },
-            // Movement keys only in game
             _ if self.ui_screen == UiScreen::InGame => match code {
                 KeyCode::KeyW => self.input.forward = true,
                 KeyCode::KeyS => self.input.backward = true,
@@ -677,7 +403,6 @@ impl AppState {
             return;
         }
 
-        // Raycasting for block interaction
         const MAX_REACH: f32 = 8.0;
         let origin = self.camera.position;
         let direction = self.camera.forward();
@@ -688,7 +413,6 @@ impl AppState {
 
         match button {
             MouseButton::Left => {
-                // Break block
                 if let Some(hit) = hit {
                     let [x, y, z] = hit.block_pos;
                     if x >= 0 && y >= 0 && z >= 0 {
@@ -699,7 +423,6 @@ impl AppState {
                 }
             }
             MouseButton::Right => {
-                // Place block
                 if let Some(hit) = hit {
                     let [x, y, z] = hit.block_pos;
                     let [nx, ny, nz] = hit.normal;
@@ -766,10 +489,8 @@ impl ApplicationHandler<AppState> for App {
             None => return,
         };
 
-        // Let egui handle the event first
         let egui_response = state.egui.handle_window_event(&state.window, &event);
 
-        // Handle resize and close regardless of egui
         match &event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -795,12 +516,10 @@ impl ApplicationHandler<AppState> for App {
             _ => {}
         }
 
-        // If egui consumed the event, don't process it
         if egui_response.consumed {
             return;
         }
 
-        // Handle remaining events
         match event {
             WindowEvent::KeyboardInput {
                 event:

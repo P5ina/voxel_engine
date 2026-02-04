@@ -17,9 +17,26 @@ pub enum UiMessage {
     QuitToMenu,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum LightingMode {
+    #[default]
+    Simple,
+    PathTracing,
+}
+
+impl LightingMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LightingMode::Simple => "Simple",
+            LightingMode::PathTracing => "Path Tracing",
+        }
+    }
+}
+
 pub struct GameSettings {
     pub fov: f32,
     pub sensitivity: f32,
+    pub lighting_mode: LightingMode,
 }
 
 impl Default for GameSettings {
@@ -27,6 +44,7 @@ impl Default for GameSettings {
         Self {
             fov: 70.0,
             sensitivity: 0.003,
+            lighting_mode: LightingMode::Simple,
         }
     }
 }
