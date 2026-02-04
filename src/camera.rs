@@ -8,6 +8,10 @@ pub struct Camera {
     pub fov: f32,
     pub near: f32,
     pub far: f32,
+
+    // Head bob
+    bob_time: f32,
+    bob_intensity: f32,
 }
 
 impl Camera {
@@ -32,7 +36,43 @@ impl Camera {
             fov: 70.0_f32.to_radians(),
             near: 0.1,
             far: 1000.0,
+            bob_time: 0.0,
+            bob_intensity: 0.0,
         }
+    }
+
+    /// Update head bob state
+    pub fn update_bob(&mut self, is_walking: bool, is_grounded: bool, dt: f32) {
+        let should_bob = is_walking && is_grounded;
+
+        if should_bob {
+            // Bob frequency
+            const BOB_SPEED: f32 = 8.0;
+            self.bob_time += dt * BOB_SPEED;
+            // Ramp up intensity
+            self.bob_intensity = (self.bob_intensity + dt * 5.0).min(1.0);
+        } else {
+            // Fade out intensity smoothly
+            self.bob_intensity = (self.bob_intensity - dt * 3.0).max(0.0);
+        }
+    }
+
+    /// Get current head bob offset
+    fn bob_offset(&self) -> Vec3 {
+        if self.bob_intensity < 0.001 {
+            return Vec3::ZERO;
+        }
+
+        // Vertical bob (up/down)
+        const BOB_HEIGHT: f32 = 0.04;
+        // Horizontal bob (side-to-side)
+        const BOB_SIDE: f32 = 0.015;
+
+        let vertical = self.bob_time.sin().abs() * BOB_HEIGHT * self.bob_intensity;
+        let horizontal = (self.bob_time * 0.5).sin() * BOB_SIDE * self.bob_intensity;
+
+        let right = self.right();
+        Vec3::new(0.0, vertical, 0.0) + right * horizontal
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -50,8 +90,10 @@ impl Camera {
 
     pub fn view_matrix(&self) -> Mat4 {
         let forward = self.forward();
-        let target = self.position + forward;
-        Mat4::look_at_rh(self.position, target, Vec3::Y)
+        let bob = self.bob_offset();
+        let pos = self.position + bob;
+        let target = pos + forward;
+        Mat4::look_at_rh(pos, target, Vec3::Y)
     }
 
     pub fn projection_matrix(&self) -> Mat4 {

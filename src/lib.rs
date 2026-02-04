@@ -64,6 +64,9 @@ pub struct AppState {
 
     // Timing
     last_frame: std::time::Instant,
+    fps: f32,
+    frame_time_accum: f32,
+    frame_count: u32,
 }
 
 impl AppState {
@@ -128,6 +131,9 @@ impl AppState {
             game_settings: GameSettings::default(),
             prev_screen: UiScreen::MainMenu,
             last_frame: std::time::Instant::now(),
+            fps: 0.0,
+            frame_time_accum: 0.0,
+            frame_count: 0,
         })
     }
 
@@ -158,8 +164,17 @@ impl AppState {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
 
+        // FPS calculation (update every 0.5 seconds)
+        self.frame_time_accum += dt;
+        self.frame_count += 1;
+        if self.frame_time_accum >= 0.5 {
+            self.fps = self.frame_count as f32 / self.frame_time_accum;
+            self.frame_time_accum = 0.0;
+            self.frame_count = 0;
+        }
+
         // Player movement input
-        const MOVE_SPEED: f32 = 100.0;
+        const MOVE_SPEED: f32 = 35.0;
         let input = Vec3::new(
             (self.input.right as i32 - self.input.left as i32) as f32,
             0.0,
@@ -178,6 +193,11 @@ impl AppState {
         self.player.update(&self.chunk, dt);
         self.camera.position = self.player.eye_position();
         self.camera.fov = self.game_settings.fov.to_radians();
+
+        // Head bob when walking
+        let is_walking = input.length_squared() > 0.0;
+        self.camera
+            .update_bob(is_walking, self.player.on_ground, dt);
 
         self.camera_resources
             .update(&self.render_ctx.queue, &self.camera);
@@ -209,7 +229,7 @@ impl AppState {
             UiScreen::Settings => ui::settings(&self.egui.ctx, &mut self.game_settings),
             UiScreen::PauseMenu => ui::pause_menu(&self.egui.ctx),
             UiScreen::InGame => {
-                ui::hud(&self.egui.ctx);
+                ui::hud(&self.egui.ctx, self.fps);
                 None
             }
         };

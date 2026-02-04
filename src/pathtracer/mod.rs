@@ -12,6 +12,16 @@ use crate::voxel::{Chunk, CHUNK_SIZE};
 pub use gbuffer::GBuffer;
 pub use materials::{Material, BLOCK_MATERIALS};
 
+/// Denoise parameters uniform
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+pub struct DenoiseParams {
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub step_size: u32,
+    pub _padding: u32,
+}
+
 /// Path tracer parameters uniform
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
@@ -162,6 +172,17 @@ pub struct PathTracer {
     pub accumulate_bind_group_layout: wgpu::BindGroupLayout,
     pub accumulate_bind_group: wgpu::BindGroup,
 
+    // Denoise pass (3 passes with step sizes 1, 2, 4)
+    pub denoise_pipeline: wgpu::ComputePipeline,
+    pub denoise_bind_group_layout: wgpu::BindGroupLayout,
+    pub denoise_params_buffers: [wgpu::Buffer; 3],
+    pub denoise_ping_texture: wgpu::Texture,
+    pub denoise_ping_view: wgpu::TextureView,
+    pub denoise_pong_texture: wgpu::Texture,
+    pub denoise_pong_view: wgpu::TextureView,
+    // 3 passes: [0] accum->ping, [1] ping->pong, [2] pong->ping
+    pub denoise_bind_groups: [wgpu::BindGroup; 3],
+
     // Tonemap pass
     pub tonemap_pipeline: wgpu::RenderPipeline,
     pub tonemap_bind_group_layout: wgpu::BindGroupLayout,
@@ -252,8 +273,29 @@ impl PathTracer {
         let (accumulate_bind_group_layout, accumulate_pipeline) =
             Self::create_accumulate_pipeline(device);
 
+        let (denoise_bind_group_layout, denoise_pipeline) = Self::create_denoise_pipeline(device);
+
         let (tonemap_bind_group_layout, tonemap_pipeline) =
             Self::create_tonemap_pipeline(device, surface_format);
+
+        // Create denoise resources (3 passes with step sizes 1, 2, 4)
+        let step_sizes: [u32; 3] = [1, 2, 4];
+        let denoise_params_buffers: [wgpu::Buffer; 3] = std::array::from_fn(|i| {
+            let params = DenoiseParams {
+                screen_width: width,
+                screen_height: height,
+                step_size: step_sizes[i],
+                _padding: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("Denoise Params Buffer {}", i)),
+                contents: bytemuck::cast_slice(&[params]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+
+        let (denoise_ping_texture, denoise_ping_view, denoise_pong_texture, denoise_pong_view) =
+            Self::create_denoise_textures(device, width, height);
 
         // Create bind groups
         let pathtrace_bind_group = Self::create_pathtrace_bind_group(
@@ -292,6 +334,18 @@ impl PathTracer {
             &params_buffer,
         );
 
+        // Create 3 denoise bind groups for multi-pass denoising
+        // Pass 0: accum.output -> ping, Pass 1: ping -> pong, Pass 2: pong -> ping
+        let denoise_bind_groups = Self::create_denoise_bind_groups_multipass(
+            device,
+            &denoise_bind_group_layout,
+            &denoise_params_buffers,
+            &gbuffer,
+            &accumulation.output_view,
+            &denoise_ping_view,
+            &denoise_pong_view,
+        );
+
         Self {
             gbuffer,
             accumulation,
@@ -310,6 +364,14 @@ impl PathTracer {
             accumulate_pipeline,
             accumulate_bind_group_layout,
             accumulate_bind_group,
+            denoise_pipeline,
+            denoise_bind_group_layout,
+            denoise_params_buffers,
+            denoise_ping_texture,
+            denoise_ping_view,
+            denoise_pong_texture,
+            denoise_pong_view,
+            denoise_bind_groups,
             tonemap_pipeline,
             tonemap_bind_group_layout,
             tonemap_bind_group,
@@ -610,6 +672,174 @@ impl PathTracer {
         (bind_group_layout, pipeline)
     }
 
+    fn create_denoise_pipeline(
+        device: &wgpu::Device,
+    ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Denoise Bind Group Layout"),
+                entries: &[
+                    // Params uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Color input
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
+                    // Normal
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
+                    // Position
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
+                    // Output
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_denoise.wgsl"));
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Denoise Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Denoise Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        (bind_group_layout, pipeline)
+    }
+
+    fn create_denoise_textures(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView) {
+        let create_texture = |label: &str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+
+        let ping = create_texture("Denoise Ping");
+        let pong = create_texture("Denoise Pong");
+        let ping_view = ping.create_view(&wgpu::TextureViewDescriptor::default());
+        let pong_view = pong.create_view(&wgpu::TextureViewDescriptor::default());
+
+        (ping, ping_view, pong, pong_view)
+    }
+
+    fn create_denoise_bind_groups_multipass(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        params_buffers: &[wgpu::Buffer; 3],
+        gbuffer: &GBuffer,
+        accum_output_view: &wgpu::TextureView,
+        ping_view: &wgpu::TextureView,
+        pong_view: &wgpu::TextureView,
+    ) -> [wgpu::BindGroup; 3] {
+        // Pass 0: accum.output -> ping (step 1)
+        // Pass 1: ping -> pong (step 2)
+        // Pass 2: pong -> ping (step 4)
+        // Final result in ping
+
+        let create_bind_group =
+            |label: &str, params: &wgpu::Buffer, input: &wgpu::TextureView, output: &wgpu::TextureView| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(input),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(output),
+                        },
+                    ],
+                })
+            };
+
+        [
+            create_bind_group("Denoise Pass 0 (accum->ping)", &params_buffers[0], accum_output_view, ping_view),
+            create_bind_group("Denoise Pass 1 (ping->pong)", &params_buffers[1], ping_view, pong_view),
+            create_bind_group("Denoise Pass 2 (pong->ping)", &params_buffers[2], pong_view, ping_view),
+        ]
+    }
+
     fn create_tonemap_pipeline(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -840,6 +1070,41 @@ impl PathTracer {
             &self.accumulation.output_view,
             &self.tonemap_sampler,
             &self.params_buffer,
+        );
+
+        // Recreate denoise buffers
+        let (ping, ping_view, pong, pong_view) =
+            Self::create_denoise_textures(device, width, height);
+        self.denoise_ping_texture = ping;
+        self.denoise_ping_view = ping_view;
+        self.denoise_pong_texture = pong;
+        self.denoise_pong_view = pong_view;
+
+        // Recreate denoise params buffers with new dimensions
+        let step_sizes: [u32; 3] = [1, 2, 4];
+        self.denoise_params_buffers = std::array::from_fn(|i| {
+            let params = DenoiseParams {
+                screen_width: width,
+                screen_height: height,
+                step_size: step_sizes[i],
+                _padding: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("Denoise Params Buffer {}", i)),
+                contents: bytemuck::cast_slice(&[params]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+
+        // Recreate denoise bind groups for 5 passes
+        self.denoise_bind_groups = Self::create_denoise_bind_groups_multipass(
+            device,
+            &self.denoise_bind_group_layout,
+            &self.denoise_params_buffers,
+            &self.gbuffer,
+            &self.accumulation.output_view,
+            &self.denoise_ping_view,
+            &self.denoise_pong_view,
         );
 
         // Reset accumulation
@@ -1086,7 +1351,9 @@ impl PathTracer {
             }
         }
 
-        // Pass 4: Tonemap to screen
+        // Denoise pass disabled - temporal accumulation handles noise reduction
+
+        // Pass 5: Tonemap to screen
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Tonemap Pass"),

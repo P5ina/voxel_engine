@@ -164,7 +164,7 @@ pub fn settings(ctx: &egui::Context, settings: &mut GameSettings) -> Option<UiMe
     msg
 }
 
-pub fn hud(ctx: &egui::Context) {
+pub fn hud(ctx: &egui::Context, fps: f32) {
     // Crosshair
     Area::new(egui::Id::new("crosshair"))
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -173,6 +173,17 @@ pub fn hud(ctx: &egui::Context) {
                 RichText::new("+")
                     .font(FontId::monospace(24.0))
                     .color(Color32::WHITE),
+            );
+        });
+
+    // FPS counter
+    Area::new(egui::Id::new("fps"))
+        .anchor(Align2::LEFT_TOP, Vec2::new(10.0, 10.0))
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!("{:.0} FPS", fps))
+                    .font(FontId::monospace(16.0))
+                    .color(Color32::YELLOW),
             );
         });
 }
