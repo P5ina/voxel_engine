@@ -10,7 +10,10 @@ use winit::{
     window::{CursorGrabMode, Window},
 };
 
+mod bvh;
 mod camera;
+mod character;
+mod model;
 mod pathtracer;
 mod player;
 mod renderer;
@@ -19,13 +22,14 @@ mod voxel;
 mod world;
 
 use camera::Camera;
+use model::load_glb;
 use pathtracer::PathTracer;
 use player::Player;
 use renderer::{
     CameraResources, DepthBuffer, LightingParams, MeshResources, RenderContext, TextureResources,
 };
 use ui::{EditorState, EguiRenderer, GameSettings, UiMessage, UiScreen};
-use voxel::{generate_chunk_mesh, raycast, BlockType, Chunk};
+use voxel::{BlockType, Chunk, generate_chunk_mesh, raycast};
 use world::{ChunkManager, ChunkPosition, SaveFormat};
 
 #[derive(Default)]
@@ -51,6 +55,7 @@ pub struct AppState {
     chunk_meshes: HashMap<ChunkPosition, MeshResources>,
     lighting: LightingParams,
     path_tracer: PathTracer,
+    character_manager: character::CharacterManager,
 
     // Game state
     camera: Camera,
@@ -119,6 +124,42 @@ impl AppState {
         // UI
         let egui = EguiRenderer::new(&render_ctx.device, render_ctx.format(), &window);
 
+        // Character Manager (must be created before PathTracer)
+        let mut character_manager = character::CharacterManager::new(&render_ctx.device);
+
+        // Load first-person arms model
+        match load_glb("assets/models/player/fps_arms.glb") {
+            Ok(fps_model) => {
+                eprintln!(
+                    "[FPS] Loaded: {} meshes, {} animations",
+                    fps_model.meshes.len(),
+                    fps_model.animations.len()
+                );
+                // Print skeleton info
+                if let Some(skeleton) = &fps_model.skeleton {
+                    eprintln!("[FPS] Skeleton: {} joints, roots: {:?}",
+                        skeleton.joints.len(), skeleton.root_joints);
+                    for (i, joint) in skeleton.joints.iter().enumerate() {
+                        eprintln!("[FPS]   Joint {}: '{}' children={:?}",
+                            i, joint.name, joint.children);
+                    }
+                } else {
+                    eprintln!("[FPS] No skeleton!");
+                }
+                // Print vertex joint info for first mesh
+                if let Some(mesh) = fps_model.meshes.first() {
+                    if let Some(v) = mesh.vertices.first() {
+                        eprintln!("[FPS] First vertex joints: {:?}, weights: {:?}",
+                            v.joint_indices, v.joint_weights);
+                    }
+                }
+                character_manager.first_person.set_model(Arc::new(fps_model));
+            }
+            Err(e) => {
+                eprintln!("[FPS] Failed to load: {}", e);
+            }
+        }
+
         // Path Tracer
         let mut path_tracer = PathTracer::new(
             &render_ctx.device,
@@ -128,6 +169,7 @@ impl AppState {
             render_ctx.format(),
             &camera_resources.bind_group_layout,
             &texture_resources.bind_group_layout,
+            character_manager.bind_group_layout(),
         );
         path_tracer.update_world_voxels(&render_ctx.device, &render_ctx.queue, &world);
 
@@ -143,6 +185,7 @@ impl AppState {
             chunk_meshes,
             lighting,
             path_tracer,
+            character_manager,
             camera,
             player,
             world,
@@ -185,7 +228,8 @@ impl AppState {
             self.depth_buffer
                 .resize(&self.render_ctx.device, width, height);
             self.camera.resize(width, height);
-            self.path_tracer.resize(&self.render_ctx.device, width, height);
+            self.path_tracer
+                .resize(&self.render_ctx.device, width, height);
         }
     }
 
@@ -233,7 +277,7 @@ impl AppState {
         }
 
         // Player movement input
-        const MOVE_SPEED: f32 = 35.0;
+        const MOVE_SPEED: f32 = 45.0;
         let input = Vec3::new(
             (self.input.right as i32 - self.input.left as i32) as f32,
             0.0,
@@ -261,6 +305,25 @@ impl AppState {
         self.camera_resources
             .update(&self.render_ctx.queue, &self.camera);
         self.lighting.update_time(0.1);
+
+        // Build camera rotation for first-person view (yaw + pitch)
+        let yaw_quat = glam::Quat::from_rotation_y(-self.camera.yaw - std::f32::consts::FRAC_PI_2);
+        let pitch_quat = glam::Quat::from_rotation_x(self.camera.pitch);
+        let camera_rotation = yaw_quat * pitch_quat;
+
+        // Update character manager (builds BVH for path tracing)
+        self.character_manager.update(
+            &self.render_ctx.device,
+            &self.render_ctx.queue,
+            dt,
+            is_walking,
+            self.camera.position,
+            camera_rotation,
+        );
+
+        // Apply camera shake from first-person animation
+        let (shake_pos, _shake_rot) = self.character_manager.first_person.get_camera_shake();
+        self.camera.position += camera_rotation * shake_pos;
 
         if !self.world.dirty_chunks().is_empty() {
             self.rebuild_dirty_meshes();
@@ -351,6 +414,7 @@ impl AppState {
                 &self.depth_buffer.view,
                 &self.camera_resources.bind_group,
                 &self.texture_resources.bind_group,
+                self.character_manager.bind_group(),
                 meshes,
                 self.game_settings.lighting_mode,
             );
@@ -491,8 +555,10 @@ impl AppState {
         for chunk_pos in self.world.chunk_positions().cloned().collect::<Vec<_>>() {
             let vertices = generate_chunk_mesh(&self.world, chunk_pos);
             if !vertices.is_empty() {
-                self.chunk_meshes
-                    .insert(chunk_pos, MeshResources::new(&self.render_ctx.device, &vertices));
+                self.chunk_meshes.insert(
+                    chunk_pos,
+                    MeshResources::new(&self.render_ctx.device, &vertices),
+                );
             }
         }
         self.world.take_dirty_chunks();
@@ -663,6 +729,13 @@ impl AppState {
                 KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.down = true,
                 KeyCode::KeyQ => self.input.up = true,
                 KeyCode::KeyE => self.input.down = true,
+                KeyCode::F5 => {
+                    // Toggle debug detach mode for first-person view
+                    let yaw_quat = glam::Quat::from_rotation_y(-self.camera.yaw - std::f32::consts::FRAC_PI_2);
+                    let pitch_quat = glam::Quat::from_rotation_x(self.camera.pitch);
+                    let camera_rotation = yaw_quat * pitch_quat;
+                    self.character_manager.first_person.toggle_detach(self.camera.position, camera_rotation);
+                }
                 _ => {}
             }
         }
@@ -730,7 +803,8 @@ impl AppState {
                         is_editor || !self.player.intersects_block(place_x, place_y, place_z);
 
                     if can_place {
-                        self.world.set_block(place_x, place_y, place_z, block_to_place);
+                        self.world
+                            .set_block(place_x, place_y, place_z, block_to_place);
                     }
                 }
             }
@@ -783,7 +857,8 @@ impl AppState {
             move_dir = move_dir.normalize() * speed;
             self.camera.position += move_dir;
             // Keep player position synced for spawn point
-            self.player.position = self.camera.position - Vec3::new(0.0, self.player.height - 0.2, 0.0);
+            self.player.position =
+                self.camera.position - Vec3::new(0.0, self.player.height - 0.2, 0.0);
         }
 
         self.camera.fov = self.game_settings.fov.to_radians();

@@ -133,6 +133,7 @@ fn get_tile(block: BlockType, dir: FaceDir) -> (u32, u32) {
             FaceDir::Bottom => (0, 0),
             FaceDir::Side => (3, 0),
         },
+        BlockType::Light => (1, 0), // Use stone texture for now (will glow via emission)
     }
 }
 
@@ -174,6 +175,7 @@ fn add_face(
     by: i32,
     bz: i32,
     tile: (u32, u32),
+    block: BlockType,
 ) {
     let u_base = tile.0 as f32 * TILE_SIZE;
     let v_base = tile.1 as f32 * TILE_SIZE;
@@ -181,6 +183,8 @@ fn add_face(
     let x = bx as f32;
     let y = by as f32;
     let z = bz as f32;
+
+    let material_id = block as u32;
 
     // Calculate AO for each vertex
     let ao = [
@@ -205,6 +209,7 @@ fn add_face(
             face.normal,
             [u_base + uv[0] * TILE_SIZE, v_base + uv[1] * TILE_SIZE],
             ao[i],
+            material_id,
         ));
     }
 }
@@ -226,27 +231,27 @@ pub fn generate_mesh(chunk: &Chunk) -> Vec<Vertex> {
 
                 if !chunk.get_signed(bx, by + 1, bz).is_solid() {
                     let tile = get_tile(block, FaceDir::Top);
-                    add_face(&mut vertices, &FACE_TOP, chunk, bx, by, bz, tile);
+                    add_face(&mut vertices, &FACE_TOP, chunk, bx, by, bz, tile, block);
                 }
                 if !chunk.get_signed(bx, by - 1, bz).is_solid() {
                     let tile = get_tile(block, FaceDir::Bottom);
-                    add_face(&mut vertices, &FACE_BOTTOM, chunk, bx, by, bz, tile);
+                    add_face(&mut vertices, &FACE_BOTTOM, chunk, bx, by, bz, tile, block);
                 }
                 if !chunk.get_signed(bx, by, bz + 1).is_solid() {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face(&mut vertices, &FACE_FRONT, chunk, bx, by, bz, tile);
+                    add_face(&mut vertices, &FACE_FRONT, chunk, bx, by, bz, tile, block);
                 }
                 if !chunk.get_signed(bx, by, bz - 1).is_solid() {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face(&mut vertices, &FACE_BACK, chunk, bx, by, bz, tile);
+                    add_face(&mut vertices, &FACE_BACK, chunk, bx, by, bz, tile, block);
                 }
                 if !chunk.get_signed(bx + 1, by, bz).is_solid() {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face(&mut vertices, &FACE_RIGHT, chunk, bx, by, bz, tile);
+                    add_face(&mut vertices, &FACE_RIGHT, chunk, bx, by, bz, tile, block);
                 }
                 if !chunk.get_signed(bx - 1, by, bz).is_solid() {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face(&mut vertices, &FACE_LEFT, chunk, bx, by, bz, tile);
+                    add_face(&mut vertices, &FACE_LEFT, chunk, bx, by, bz, tile, block);
                 }
             }
         }
@@ -263,6 +268,7 @@ fn add_face_world(
     wy: i32,
     wz: i32,
     tile: (u32, u32),
+    block: BlockType,
 ) {
     let u_base = tile.0 as f32 * TILE_SIZE;
     let v_base = tile.1 as f32 * TILE_SIZE;
@@ -270,6 +276,8 @@ fn add_face_world(
     let x = wx as f32;
     let y = wy as f32;
     let z = wz as f32;
+
+    let material_id = block as u32;
 
     // Calculate AO for each vertex
     let ao = [
@@ -294,6 +302,7 @@ fn add_face_world(
             face.normal,
             [u_base + uv[0] * TILE_SIZE, v_base + uv[1] * TILE_SIZE],
             ao[i],
+            material_id,
         ));
     }
 }
@@ -325,27 +334,27 @@ pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Ve
                 // Check neighbors using world coordinates (crosses chunk boundaries)
                 if !world.is_solid(wx, wy + 1, wz) {
                     let tile = get_tile(block, FaceDir::Top);
-                    add_face_world(&mut vertices, &FACE_TOP, world, wx, wy, wz, tile);
+                    add_face_world(&mut vertices, &FACE_TOP, world, wx, wy, wz, tile, block);
                 }
                 if !world.is_solid(wx, wy - 1, wz) {
                     let tile = get_tile(block, FaceDir::Bottom);
-                    add_face_world(&mut vertices, &FACE_BOTTOM, world, wx, wy, wz, tile);
+                    add_face_world(&mut vertices, &FACE_BOTTOM, world, wx, wy, wz, tile, block);
                 }
                 if !world.is_solid(wx, wy, wz + 1) {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face_world(&mut vertices, &FACE_FRONT, world, wx, wy, wz, tile);
+                    add_face_world(&mut vertices, &FACE_FRONT, world, wx, wy, wz, tile, block);
                 }
                 if !world.is_solid(wx, wy, wz - 1) {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face_world(&mut vertices, &FACE_BACK, world, wx, wy, wz, tile);
+                    add_face_world(&mut vertices, &FACE_BACK, world, wx, wy, wz, tile, block);
                 }
                 if !world.is_solid(wx + 1, wy, wz) {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face_world(&mut vertices, &FACE_RIGHT, world, wx, wy, wz, tile);
+                    add_face_world(&mut vertices, &FACE_RIGHT, world, wx, wy, wz, tile, block);
                 }
                 if !world.is_solid(wx - 1, wy, wz) {
                     let tile = get_tile(block, FaceDir::Side);
-                    add_face_world(&mut vertices, &FACE_LEFT, world, wx, wy, wz, tile);
+                    add_face_world(&mut vertices, &FACE_LEFT, world, wx, wy, wz, tile, block);
                 }
             }
         }

@@ -5,15 +5,17 @@ pub struct Vertex {
     pub normal: [f32; 3],
     pub uv: [f32; 2],
     pub ao: f32,
+    pub material_id: f32,
 }
 
 impl Vertex {
-    pub fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], ao: f32) -> Self {
+    pub fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], ao: f32, material_id: u32) -> Self {
         Self {
             position,
             normal,
             uv,
             ao,
+            material_id: material_id as f32,
         }
     }
 
@@ -40,6 +42,11 @@ impl Vertex {
                 wgpu::VertexAttribute {
                     offset: std::mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
                     shader_location: 3,
+                    format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 9]>() as wgpu::BufferAddress,
+                    shader_location: 4,
                     format: wgpu::VertexFormat::Float32,
                 },
             ],

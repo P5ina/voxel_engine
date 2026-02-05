@@ -339,6 +339,7 @@ pub fn editor_hud(ctx: &egui::Context, editor: &mut EditorState, fps: f32) -> Op
                             (BlockType::Stone, "Stone"),
                             (BlockType::Dirt, "Dirt"),
                             (BlockType::Grass, "Grass"),
+                            (BlockType::Light, "Light"),
                         ];
 
                         for (block, name) in blocks {

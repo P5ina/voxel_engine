@@ -55,7 +55,7 @@ impl Default for PathTracerParams {
             camera_up: [0.0, 1.0, 0.0],
             accumulated_frames: 0,
             camera_right: [1.0, 0.0, 0.0],
-            max_bounces: 4,
+            max_bounces: 12,
             camera_forward: [0.0, 0.0, -1.0],
             voxel_size: 1.0,
             volume_min: [0.0; 3],
@@ -212,6 +212,7 @@ impl PathTracer {
         surface_format: wgpu::TextureFormat,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
         texture_bind_group_layout: &wgpu::BindGroupLayout,
+        character_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         // Create G-buffer
         let gbuffer = GBuffer::new(device, width, height);
@@ -271,9 +272,9 @@ impl PathTracer {
         );
 
         let (pathtrace_bind_group_layout, pathtrace_pipeline) =
-            Self::create_pathtrace_pipeline(device);
+            Self::create_pathtrace_pipeline(device, character_bind_group_layout);
 
-        let direct_pipeline = Self::create_direct_pipeline(device, &pathtrace_bind_group_layout);
+        let direct_pipeline = Self::create_direct_pipeline(device, &pathtrace_bind_group_layout, character_bind_group_layout);
 
         let (accumulate_bind_group_layout, accumulate_pipeline) =
             Self::create_accumulate_pipeline(device);
@@ -478,6 +479,7 @@ impl PathTracer {
 
     fn create_pathtrace_pipeline(
         device: &wgpu::Device,
+        character_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -567,7 +569,7 @@ impl PathTracer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PathTrace Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, character_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -586,12 +588,13 @@ impl PathTracer {
     fn create_direct_pipeline(
         device: &wgpu::Device,
         bind_group_layout: &wgpu::BindGroupLayout,
+        character_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> wgpu::ComputePipeline {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_direct.wgsl"));
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Direct Lighting Pipeline Layout"),
-            bind_group_layouts: &[bind_group_layout],
+            bind_group_layouts: &[bind_group_layout, character_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -1302,7 +1305,7 @@ impl PathTracer {
             camera_up: up.to_array(),
             accumulated_frames: self.accumulated_frames,
             camera_right: right.to_array(),
-            max_bounces: 4,
+            max_bounces: 12,
             camera_forward: camera_forward.to_array(),
             voxel_size: 1.0,
             volume_min: [
@@ -1340,6 +1343,7 @@ impl PathTracer {
         depth_view: &wgpu::TextureView,
         camera_bind_group: &wgpu::BindGroup,
         texture_bind_group: &wgpu::BindGroup,
+        character_bind_group: &wgpu::BindGroup,
         meshes: impl Iterator<Item = (&'a wgpu::Buffer, u32)>,
         lighting_mode: LightingMode,
     ) {
@@ -1426,10 +1430,12 @@ impl PathTracer {
                 LightingMode::PathTracing => {
                     compute_pass.set_pipeline(&self.pathtrace_pipeline);
                     compute_pass.set_bind_group(0, &self.pathtrace_bind_group, &[]);
+                    compute_pass.set_bind_group(1, character_bind_group, &[]);
                 }
                 LightingMode::Simple => {
                     compute_pass.set_pipeline(&self.direct_pipeline);
                     compute_pass.set_bind_group(0, &self.direct_bind_group, &[]);
+                    compute_pass.set_bind_group(1, character_bind_group, &[]);
                 }
             }
 

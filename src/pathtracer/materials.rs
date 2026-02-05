@@ -33,8 +33,8 @@ impl Material {
 }
 
 /// Block materials indexed by BlockType
-/// Index 0 = Air, 1 = Dirt, 2 = Stone, 3 = Grass
-pub const BLOCK_MATERIALS: [Material; 4] = [
+/// Index 0 = Air, 1 = Dirt, 2 = Stone, 3 = Grass, 4 = Light
+pub const BLOCK_MATERIALS: [Material; 5] = [
     // Air - transparent, no material properties
     Material {
         albedo: [0.0, 0.0, 0.0],
@@ -45,22 +45,29 @@ pub const BLOCK_MATERIALS: [Material; 4] = [
     // Dirt - brown, rough
     Material {
         albedo: [0.55, 0.35, 0.2],
-        roughness: 0.9,
+        roughness: 1.0,
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
     },
     // Stone - gray, moderately rough
     Material {
         albedo: [0.5, 0.5, 0.5],
-        roughness: 0.7,
+        roughness: 0.0,
         emission: [0.0, 0.0, 0.0],
-        metallic: 0.0,
+        metallic: 1.0,
     },
     // Grass - green, rough
     Material {
         albedo: [0.3, 0.6, 0.2],
-        roughness: 0.85,
+        roughness: 1.0,
         emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+    },
+    // Light - emissive block (warm white light)
+    Material {
+        albedo: [1.0, 0.95, 0.8],
+        roughness: 1.0,
+        emission: [10.0, 9.0, 7.0],
         metallic: 0.0,
     },
 ];

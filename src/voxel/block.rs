@@ -8,6 +8,7 @@ pub enum BlockType {
     Dirt = 1,
     Stone = 2,
     Grass = 3,
+    Light = 4,
 }
 
 impl BlockType {
