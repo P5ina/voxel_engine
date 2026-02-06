@@ -22,6 +22,11 @@ impl Chunk {
         }
     }
 
+    /// Create a chunk from existing voxel data
+    pub fn from_data(data: [[[Voxel; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]) -> Self {
+        Self { voxels: data }
+    }
+
     #[inline]
     pub fn get(&self, x: usize, y: usize, z: usize) -> Voxel {
         if x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE {
@@ -38,22 +43,16 @@ impl Chunk {
         }
     }
 
-    #[inline]
-    pub fn get_signed(&self, x: i32, y: i32, z: i32) -> Voxel {
-        if x < 0 || y < 0 || z < 0 {
-            return AIR;
-        }
-        self.get(x as usize, y as usize, z as usize)
-    }
-
-    #[inline]
-    pub fn is_solid(&self, x: usize, y: usize, z: usize) -> bool {
-        self.get(x, y, z) != AIR
-    }
-
-    #[inline]
-    pub fn is_solid_signed(&self, x: i32, y: i32, z: i32) -> bool {
-        self.get_signed(x, y, z) != AIR
+    /// Check if all voxels are air
+    pub fn is_empty(&self) -> bool {
+        // Check as flat byte slice for speed
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.voxels.as_ptr() as *const u8,
+                CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE,
+            )
+        };
+        bytes.iter().all(|&v| v == AIR)
     }
 
     /// Get raw voxel data array reference

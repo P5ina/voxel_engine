@@ -27,39 +27,11 @@ pub struct LocalPlayer {
 }
 
 impl LocalPlayer {
-    pub fn new(model: Arc<LoadedModel>) -> Self {
-        let skeleton_state = model
-            .skeleton
-            .as_ref()
-            .map(|s| SkeletonState::from_skeleton(s));
-
-        let mut animation_player = AnimationPlayer::new();
-        for clip in &model.animations {
-            animation_player.add_clip(clip.clone());
-        }
-
-        Self {
-            model,
-            skeleton_state,
-            animation_player,
-            position: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: 1.0,
-            hide_head: true,
-            hidden_mesh_indices: Vec::new(),
-        }
-    }
-
     /// Update animation and skeleton
     pub fn update(&mut self, dt: f32) {
         if let (Some(skeleton), Some(state)) = (&self.model.skeleton, &mut self.skeleton_state) {
             self.animation_player.update(dt, skeleton, state);
         }
-    }
-
-    /// Play an animation by name
-    pub fn play_animation(&mut self, name: &str) {
-        self.animation_player.play_by_name(name);
     }
 
     /// Get the transformation matrix
@@ -69,18 +41,6 @@ impl LocalPlayer {
             self.rotation,
             self.position,
         )
-    }
-
-    /// Set which meshes to hide in first-person mode
-    pub fn set_hidden_meshes(&mut self, mesh_names: &[&str]) {
-        self.hidden_mesh_indices = self
-            .model
-            .meshes
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| mesh_names.iter().any(|name| m.name.contains(name)))
-            .map(|(i, _)| i)
-            .collect();
     }
 
     /// Check if a mesh should be visible (considering first-person mode)

@@ -1,9 +1,8 @@
 //! Character manager - handles all characters and GPU resources
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use glam::{Quat, Vec3};
+use glam::Vec3;
 use wgpu::util::DeviceExt;
 
 use crate::bvh::builder::BvhBuilder;
@@ -248,30 +247,8 @@ impl CharacterManager {
         &self.bind_group
     }
 
-    /// Set the local player model
-    pub fn set_local_player(&mut self, model: Arc<LoadedModel>) {
-        self.local_player = Some(LocalPlayer::new(model));
-    }
-
-    /// Add a remote player
-    pub fn add_remote_player(&mut self, id: u64, model: Arc<LoadedModel>) {
-        self.remote_players.insert(id, RemotePlayer::new(id, model));
-    }
-
-    /// Remove a remote player
-    pub fn remove_remote_player(&mut self, id: u64) {
-        self.remote_players.remove(&id);
-    }
-
-    /// Update local player position
-    pub fn update_local_position(&mut self, position: Vec3, rotation: Quat) {
-        if let Some(player) = &mut self.local_player {
-            player.position = position;
-            player.rotation = rotation;
-        }
-    }
-
     /// Update all characters and rebuild GPU data
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         device: &wgpu::Device,
@@ -570,10 +547,5 @@ impl CharacterManager {
                 depth_or_array_layers: 1,
             },
         );
-    }
-
-    /// Check if characters are enabled
-    pub fn is_enabled(&self) -> bool {
-        self.params.enabled != 0
     }
 }

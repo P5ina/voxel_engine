@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::voxel::{CHUNK_SIZE, Voxel};
 
 /// LOD level: 0 = full resolution, higher = coarser
@@ -6,51 +8,27 @@ pub type LodLevel = u8;
 /// LOD configuration
 #[derive(Clone, Debug)]
 pub struct LodConfig {
-    /// Number of LOD levels (recommend 4)
+    /// Number of LOD levels (recommend 6 for 1km+ worlds)
     pub levels: u8,
 
     /// Distance thresholds in world units (meters)
     /// Index 0 = max distance for LOD0, etc.
-    pub distances: [f32; 4],
-
-    /// Voxel resolution at each level
-    pub resolutions: [usize; 4],
+    pub distances: [f32; 6],
 }
 
 impl Default for LodConfig {
     fn default() -> Self {
         Self {
-            levels: 4,
+            levels: 6,
             distances: [
-                32.0,  // LOD0 -> LOD1 at 32m
-                96.0,  // LOD1 -> LOD2 at 96m
-                192.0, // LOD2 -> LOD3 at 192m
-                384.0, // LOD3 -> cull beyond 384m
+                32.0,   // LOD0 -> LOD1 at 32m
+                64.0,   // LOD1 -> LOD2 at 64m
+                160.0,  // LOD2 -> LOD3 at 160m
+                384.0,  // LOD3 -> LOD4 at 384m
+                768.0,  // LOD4 -> LOD5 at 768m
+                1024.0, // LOD5 -> cull beyond 1024m
             ],
-            resolutions: [32, 16, 8, 4],
         }
-    }
-}
-
-impl LodConfig {
-    /// Get appropriate LOD level for given distance
-    pub fn lod_for_distance(&self, distance: f32) -> LodLevel {
-        for (i, &threshold) in self.distances.iter().enumerate() {
-            if distance < threshold {
-                return i as LodLevel;
-            }
-        }
-        self.levels - 1
-    }
-
-    /// Get resolution for LOD level
-    pub fn resolution(&self, lod: LodLevel) -> usize {
-        self.resolutions[lod as usize].min(CHUNK_SIZE)
-    }
-
-    /// Get scale factor (how many voxels are merged)
-    pub fn scale_factor(&self, lod: LodLevel) -> usize {
-        CHUNK_SIZE / self.resolution(lod)
     }
 }
 
@@ -73,12 +51,142 @@ pub enum VoxelData {
     Homogeneous(Voxel),
 }
 
-impl VoxelData {
-    /// Create new full resolution data filled with air
-    pub fn new_full() -> Self {
-        Self::Full(Box::new([[[0; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]))
+impl Serialize for VoxelData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        match self {
+            VoxelData::Full(data) => {
+                // tag 0 + 32^3 bytes
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, 32 * 32 * 32) };
+                let mut tup = serializer.serialize_tuple(2)?;
+                tup.serialize_element(&0u8)?;
+                tup.serialize_element(bytes)?;
+                tup.end()
+            }
+            VoxelData::Lod1(data) => {
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, 16 * 16 * 16) };
+                let mut tup = serializer.serialize_tuple(2)?;
+                tup.serialize_element(&1u8)?;
+                tup.serialize_element(bytes)?;
+                tup.end()
+            }
+            VoxelData::Lod2(data) => {
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, 8 * 8 * 8) };
+                let mut tup = serializer.serialize_tuple(2)?;
+                tup.serialize_element(&2u8)?;
+                tup.serialize_element(bytes)?;
+                tup.end()
+            }
+            VoxelData::Lod3(data) => {
+                let bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, 4 * 4 * 4) };
+                let mut tup = serializer.serialize_tuple(2)?;
+                tup.serialize_element(&3u8)?;
+                tup.serialize_element(bytes)?;
+                tup.end()
+            }
+            VoxelData::Homogeneous(v) => {
+                let mut tup = serializer.serialize_tuple(2)?;
+                tup.serialize_element(&4u8)?;
+                tup.serialize_element(v)?;
+                tup.end()
+            }
+        }
     }
+}
 
+impl<'de> Deserialize<'de> for VoxelData {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct VoxelDataVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for VoxelDataVisitor {
+            type Value = VoxelData;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("VoxelData (tag, bytes)")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<VoxelData, A::Error> {
+                let tag: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+
+                match tag {
+                    0 => {
+                        let bytes: Vec<u8> = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        let mut data = Box::new([[[0u8; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]);
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                data.as_mut_ptr() as *mut u8,
+                                32 * 32 * 32,
+                            )
+                        };
+                        dst.copy_from_slice(&bytes);
+                        Ok(VoxelData::Full(data))
+                    }
+                    1 => {
+                        let bytes: Vec<u8> = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        let mut data = Box::new([[[0u8; 16]; 16]; 16]);
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                data.as_mut_ptr() as *mut u8,
+                                16 * 16 * 16,
+                            )
+                        };
+                        dst.copy_from_slice(&bytes);
+                        Ok(VoxelData::Lod1(data))
+                    }
+                    2 => {
+                        let bytes: Vec<u8> = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        let mut data = Box::new([[[0u8; 8]; 8]; 8]);
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 8 * 8 * 8)
+                        };
+                        dst.copy_from_slice(&bytes);
+                        Ok(VoxelData::Lod2(data))
+                    }
+                    3 => {
+                        let bytes: Vec<u8> = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        let mut data = Box::new([[[0u8; 4]; 4]; 4]);
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 4 * 4 * 4)
+                        };
+                        dst.copy_from_slice(&bytes);
+                        Ok(VoxelData::Lod3(data))
+                    }
+                    4 => {
+                        let v: u8 = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                        Ok(VoxelData::Homogeneous(v))
+                    }
+                    _ => Err(serde::de::Error::custom(format!(
+                        "invalid VoxelData tag: {}",
+                        tag
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_tuple(2, VoxelDataVisitor)
+    }
+}
+
+impl VoxelData {
     /// Create from existing chunk data
     pub fn from_full(data: [[[Voxel; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]) -> Self {
         // Check if homogeneous
@@ -93,70 +201,6 @@ impl VoxelData {
             Self::Homogeneous(first)
         } else {
             Self::Full(Box::new(data))
-        }
-    }
-
-    /// Get voxel at local coordinates
-    pub fn get(&self, x: usize, y: usize, z: usize) -> Voxel {
-        match self {
-            Self::Full(data) => {
-                if x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE {
-                    data[x][y][z]
-                } else {
-                    0
-                }
-            }
-            Self::Lod1(data) => {
-                let lx = x / 2;
-                let ly = y / 2;
-                let lz = z / 2;
-                if lx < 16 && ly < 16 && lz < 16 {
-                    data[lx][ly][lz]
-                } else {
-                    0
-                }
-            }
-            Self::Lod2(data) => {
-                let lx = x / 4;
-                let ly = y / 4;
-                let lz = z / 4;
-                if lx < 8 && ly < 8 && lz < 8 {
-                    data[lx][ly][lz]
-                } else {
-                    0
-                }
-            }
-            Self::Lod3(data) => {
-                let lx = x / 8;
-                let ly = y / 8;
-                let lz = z / 8;
-                if lx < 4 && ly < 4 && lz < 4 {
-                    data[lx][ly][lz]
-                } else {
-                    0
-                }
-            }
-            Self::Homogeneous(v) => *v,
-        }
-    }
-
-    /// Set voxel at local coordinates (only for Full resolution)
-    pub fn set(&mut self, x: usize, y: usize, z: usize, voxel: Voxel) {
-        if let Self::Full(data) = self {
-            if x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE {
-                data[x][y][z] = voxel;
-            }
-        }
-    }
-
-    /// Get LOD level of this data
-    pub fn lod_level(&self) -> LodLevel {
-        match self {
-            Self::Full(_) => 0,
-            Self::Lod1(_) => 1,
-            Self::Lod2(_) => 2,
-            Self::Lod3(_) => 3,
-            Self::Homogeneous(_) => 0, // Can be used at any level
         }
     }
 
@@ -188,14 +232,15 @@ impl VoxelData {
         }
     }
 
-    /// Get memory size in bytes
-    pub fn memory_size(&self) -> usize {
+    /// Access voxel at native resolution coordinates (no coordinate mapping).
+    /// For Full, coords are 0..32; for Lod1, 0..16; for Lod2, 0..8; for Lod3, 0..4.
+    pub fn get_native(&self, x: usize, y: usize, z: usize) -> Voxel {
         match self {
-            Self::Full(_) => 32 * 32 * 32,
-            Self::Lod1(_) => 16 * 16 * 16,
-            Self::Lod2(_) => 8 * 8 * 8,
-            Self::Lod3(_) => 4 * 4 * 4,
-            Self::Homogeneous(_) => 1,
+            Self::Full(data) => data[x][y][z],
+            Self::Lod1(data) => data[x][y][z],
+            Self::Lod2(data) => data[x][y][z],
+            Self::Lod3(data) => data[x][y][z],
+            Self::Homogeneous(v) => *v,
         }
     }
 
@@ -213,24 +258,13 @@ impl VoxelData {
         }
     }
 
-    /// Get raw data as slice for Full resolution (for meshing)
-    pub fn as_full(&self) -> Option<&[[[Voxel; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]> {
+    /// Convert to a Chunk if this is Full resolution data.
+    /// Returns None for Homogeneous(0) (air) or non-full LOD data.
+    pub fn to_chunk(&self) -> Option<crate::voxel::Chunk> {
         match self {
-            Self::Full(data) => Some(data),
-            _ => None,
-        }
-    }
-
-    /// Fill with ground (for terrain generation)
-    pub fn fill_ground(&mut self, height: usize, voxel: Voxel) {
-        if let Self::Full(data) = self {
-            for x in 0..CHUNK_SIZE {
-                for z in 0..CHUNK_SIZE {
-                    for y in 0..height.min(CHUNK_SIZE) {
-                        data[x][y][z] = voxel;
-                    }
-                }
-            }
+            Self::Full(data) => Some(crate::voxel::Chunk::from_data(**data)),
+            Self::Homogeneous(0) => None, // air
+            _ => None,                    // LOD data can't become a chunk
         }
     }
 }
@@ -273,9 +307,9 @@ fn sample_region_2x2x2<const N: usize>(
     if solid_count >= 2 {
         let mut best = 1u8;
         let mut best_count = 0u8;
-        for i in 1..=255 {
-            if counts[i] > best_count {
-                best_count = counts[i];
+        for (i, &count) in counts.iter().enumerate().skip(1) {
+            if count > best_count {
+                best_count = count;
                 best = i as u8;
             }
         }
@@ -316,9 +350,9 @@ fn sample_region_4x4x4<const N: usize>(
     if solid_count >= 16 {
         let mut best = 1u8;
         let mut best_count = 0u16;
-        for i in 1..=255 {
-            if counts[i] > best_count {
-                best_count = counts[i];
+        for (i, &count) in counts.iter().enumerate().skip(1) {
+            if count > best_count {
+                best_count = count;
                 best = i as u8;
             }
         }
@@ -359,9 +393,9 @@ fn sample_region_8x8x8(
     if solid_count >= 128 {
         let mut best = 1u8;
         let mut best_count = 0u16;
-        for i in 1..=255 {
-            if counts[i] > best_count {
-                best_count = counts[i];
+        for (i, &count) in counts.iter().enumerate().skip(1) {
+            if count > best_count {
+                best_count = count;
                 best = i as u8;
             }
         }
@@ -371,6 +405,7 @@ fn sample_region_8x8x8(
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn downsample_32_to_16(
     data: &[[[Voxel; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
 ) -> [[[Voxel; 16]; 16]; 16] {
@@ -385,6 +420,7 @@ fn downsample_32_to_16(
     result
 }
 
+#[allow(clippy::needless_range_loop)]
 fn downsample_32_to_8(
     data: &[[[Voxel; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
 ) -> [[[Voxel; 8]; 8]; 8] {
@@ -399,6 +435,7 @@ fn downsample_32_to_8(
     result
 }
 
+#[allow(clippy::needless_range_loop)]
 fn downsample_32_to_4(
     data: &[[[Voxel; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
 ) -> [[[Voxel; 4]; 4]; 4] {
@@ -413,6 +450,7 @@ fn downsample_32_to_4(
     result
 }
 
+#[allow(clippy::needless_range_loop)]
 fn downsample_16_to_8(data: &[[[Voxel; 16]; 16]; 16]) -> [[[Voxel; 8]; 8]; 8] {
     let mut result = [[[0u8; 8]; 8]; 8];
     for x in 0..8 {
@@ -425,6 +463,7 @@ fn downsample_16_to_8(data: &[[[Voxel; 16]; 16]; 16]) -> [[[Voxel; 8]; 8]; 8] {
     result
 }
 
+#[allow(clippy::needless_range_loop)]
 fn downsample_16_to_4(data: &[[[Voxel; 16]; 16]; 16]) -> [[[Voxel; 4]; 4]; 4] {
     let mut result = [[[0u8; 4]; 4]; 4];
     for x in 0..4 {
@@ -437,6 +476,7 @@ fn downsample_16_to_4(data: &[[[Voxel; 16]; 16]; 16]) -> [[[Voxel; 4]; 4]; 4] {
     result
 }
 
+#[allow(clippy::needless_range_loop)]
 fn downsample_8_to_4(data: &[[[Voxel; 8]; 8]; 8]) -> [[[Voxel; 4]; 4]; 4] {
     let mut result = [[[0u8; 4]; 4]; 4];
     for x in 0..4 {
@@ -457,6 +497,7 @@ fn downsample_8_to_4(data: &[[[Voxel; 8]; 8]; 8]) -> [[[Voxel; 4]; 4]; 4] {
 /// Octant layout: bit 0 = +X, bit 1 = +Y, bit 2 = +Z
 ///   octant 0: (0,0,0)  octant 1: (1,0,0)  octant 2: (0,1,0)  octant 3: (1,1,0)
 ///   octant 4: (0,0,1)  octant 5: (1,0,1)  octant 6: (0,1,1)  octant 7: (1,1,1)
+#[allow(clippy::needless_range_loop)]
 pub fn build_lod_from_children(children: &[Option<&VoxelData>; 8]) -> VoxelData {
     // Fast path: check if all children are homogeneous with the same value
     let mut all_same = true;
@@ -468,7 +509,7 @@ pub fn build_lod_from_children(children: &[Option<&VoxelData>; 8]) -> VoxelData 
                 // Missing child = air
                 match common_value {
                     None => common_value = Some(0),
-                    Some(v) if v == 0 => {}
+                    Some(0) => {}
                     _ => {
                         all_same = false;
                         break;

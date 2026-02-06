@@ -39,11 +39,11 @@ impl Default for StreamingConfig {
     fn default() -> Self {
         Self {
             lod: LodConfig::default(),
-            max_loads_per_frame: 16,
+            max_loads_per_frame: 32,
             max_unloads_per_frame: 32,
             max_mesh_rebuilds_per_frame: 16,
             hysteresis: 1.15,
-            vertical_range: 4,
+            vertical_range: 8,
             world_min: glam::IVec3::new(i32::MIN, i32::MIN, i32::MIN),
             world_max: glam::IVec3::new(i32::MAX, i32::MAX, i32::MAX),
         }
@@ -60,14 +60,6 @@ impl ChunkPriority {
         let lod_penalty = (lod as u32) * 1000;
         let visibility_penalty = if is_visible { 0 } else { 500 };
         Self(base + lod_penalty + visibility_penalty)
-    }
-
-    pub fn immediate() -> Self {
-        Self(0)
-    }
-
-    pub fn value(&self) -> u32 {
-        self.0
     }
 }
 
@@ -97,7 +89,6 @@ pub struct LoadedChunkState {
     pub position: ChunkPosition,
     pub lod_level: LodLevel,
     pub has_mesh: bool,
-    pub distance: f32,
 }
 
 /// State of a loaded LOD node
@@ -105,7 +96,6 @@ pub struct LoadedChunkState {
 pub struct LoadedLodNodeState {
     pub key: LodNodeKey,
     pub has_mesh: bool,
-    pub distance: f32,
 }
 
 /// Result of streaming update
@@ -196,11 +186,11 @@ impl ChunkStreamer {
                 }
             } else {
                 // Check if LOD needs to change
-                if let Some(state) = self.loaded.iter().find(|s| s.position == *pos) {
-                    if state.lod_level != *desired_lod {
-                        // LOD change needed
-                        result.lod_requests.push((*pos, *desired_lod));
-                    }
+                if let Some(state) = self.loaded.iter().find(|s| s.position == *pos)
+                    && state.lod_level != *desired_lod
+                {
+                    // LOD change needed
+                    result.lod_requests.push((*pos, *desired_lod));
                 }
             }
         }
@@ -220,12 +210,10 @@ impl ChunkStreamer {
                 }
 
                 // Mark as loaded
-                let distance = self.chunk_distance(request.position, player_pos);
                 self.loaded.push(LoadedChunkState {
                     position: request.position,
                     lod_level: request.lod_level,
                     has_mesh: false,
-                    distance,
                 });
                 self.loaded_set.insert(request.position);
 
@@ -267,16 +255,16 @@ impl ChunkStreamer {
             self.loaded_set.remove(&state.position);
         }
 
-        // 5. Request mesh updates for loaded chunks that need it
-        let mut mesh_count = result.mesh_requests.len();
-        for state in &mut self.loaded {
-            if mesh_count >= self.config.max_mesh_rebuilds_per_frame {
+        // 5. Request mesh updates for loaded chunks that need it (independent budget)
+        let mut retry_count = 0;
+        let max_retries = self.config.max_mesh_rebuilds_per_frame;
+        for state in &self.loaded {
+            if retry_count >= max_retries {
                 break;
             }
             if !state.has_mesh {
                 result.mesh_requests.push((state.position, state.lod_level));
-                state.has_mesh = true;
-                mesh_count += 1;
+                retry_count += 1;
             }
         }
 
@@ -286,17 +274,9 @@ impl ChunkStreamer {
         // Queue new LOD nodes
         for key in &desired_lod_nodes {
             if !self.loaded_lod_set.contains(key) {
-                let center = key.center_world_pos();
-                let distance = Vec3::new(
-                    center.0 - player_pos.x,
-                    center.1 - player_pos.y,
-                    center.2 - player_pos.z,
-                )
-                .length();
                 self.loaded_lod_nodes.push(LoadedLodNodeState {
                     key: *key,
                     has_mesh: false,
-                    distance,
                 });
                 self.loaded_lod_set.insert(*key);
                 result.lod_mesh_requests.push(*key);
@@ -344,9 +324,12 @@ impl ChunkStreamer {
                     );
 
                     // Skip chunks outside world bounds
-                    if pos.x < self.config.world_min.x || pos.x >= self.config.world_max.x
-                        || pos.y < self.config.world_min.y || pos.y >= self.config.world_max.y
-                        || pos.z < self.config.world_min.z || pos.z >= self.config.world_max.z
+                    if pos.x < self.config.world_min.x
+                        || pos.x >= self.config.world_max.x
+                        || pos.y < self.config.world_min.y
+                        || pos.y >= self.config.world_max.y
+                        || pos.z < self.config.world_min.z
+                        || pos.z >= self.config.world_max.z
                     {
                         continue;
                     }
@@ -410,35 +393,15 @@ impl ChunkStreamer {
         self.loaded_set.contains(&pos)
     }
 
-    /// Get LOD level for a loaded chunk
-    pub fn get_lod(&self, pos: ChunkPosition) -> Option<LodLevel> {
-        self.loaded
-            .iter()
-            .find(|s| s.position == pos)
-            .map(|s| s.lod_level)
-    }
-
-    /// Get configuration
-    pub fn config(&self) -> &StreamingConfig {
-        &self.config
-    }
-
-    /// Get all loaded chunk positions
-    pub fn loaded_positions(&self) -> impl Iterator<Item = ChunkPosition> + '_ {
-        self.loaded.iter().map(|s| s.position)
+    /// Check if a chunk is loaded AND has its mesh built
+    pub fn has_mesh(&self, pos: ChunkPosition) -> bool {
+        self.loaded.iter().any(|s| s.position == pos && s.has_mesh)
     }
 
     /// Mark a LOD node as having its mesh built
     pub fn mark_lod_mesh_built(&mut self, key: &LodNodeKey) {
         if let Some(state) = self.loaded_lod_nodes.iter_mut().find(|s| s.key == *key) {
             state.has_mesh = true;
-        }
-    }
-
-    /// Mark a LOD node as dirty (needs mesh rebuild)
-    pub fn mark_lod_dirty(&mut self, key: &LodNodeKey) {
-        if let Some(state) = self.loaded_lod_nodes.iter_mut().find(|s| s.key == *key) {
-            state.has_mesh = false;
         }
     }
 
@@ -449,10 +412,7 @@ impl ChunkStreamer {
 
     /// Calculate which LOD nodes should be loaded.
     /// For LOD 1+, we group chunks into LodNodeKeys (deduplicated).
-    fn calculate_desired_lod_nodes(
-        &self,
-        player_pos: Vec3,
-    ) -> HashSet<LodNodeKey> {
+    fn calculate_desired_lod_nodes(&self, player_pos: Vec3) -> HashSet<LodNodeKey> {
         let mut result = HashSet::new();
 
         let player_chunk = ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
@@ -513,16 +473,16 @@ impl ChunkStreamer {
 
                         // Only load if in the right distance band
                         if distance >= lod_distance_min && distance < lod_distance_max {
-                            // For LOD level 1, check that constituent chunks aren't all loaded
-                            // (prevents double-rendering at LOD0/LOD1 boundary)
-                            // For LOD 2+, no individual chunks exist at those distances, skip check
+                            // For LOD level 1, only exclude if all constituent chunks
+                            // have their meshes built (not just queued for loading).
+                            // This prevents gaps where LOD1 is unloaded before LOD0 is visible.
                             if lod == 1 {
-                                let all_loaded = key
+                                let all_meshed = key
                                     .child_chunk_positions()
                                     .iter()
-                                    .all(|cp| self.loaded_set.contains(cp));
+                                    .all(|cp| self.has_mesh(*cp));
 
-                                if !all_loaded {
+                                if !all_meshed {
                                     result.insert(key);
                                 }
                             } else {
@@ -535,16 +495,6 @@ impl ChunkStreamer {
         }
 
         result
-    }
-
-    /// Clear all state (for level transitions)
-    pub fn clear(&mut self) {
-        self.load_queue.clear();
-        self.queued.clear();
-        self.loaded.clear();
-        self.loaded_set.clear();
-        self.loaded_lod_nodes.clear();
-        self.loaded_lod_set.clear();
     }
 
     /// Set player position before first update (e.g. after preloading)
@@ -560,7 +510,6 @@ impl ChunkStreamer {
                     position: pos,
                     lod_level: 0,
                     has_mesh: true,
-                    distance: self.chunk_distance(pos, self.last_player_pos),
                 });
                 self.loaded_set.insert(pos);
             }
@@ -571,17 +520,9 @@ impl ChunkStreamer {
     pub fn preload_lod_nodes(&mut self, keys: Vec<LodNodeKey>) {
         for key in keys {
             if !self.loaded_lod_set.contains(&key) {
-                let center = key.center_world_pos();
-                let distance = Vec3::new(
-                    center.0 - self.last_player_pos.x,
-                    center.1 - self.last_player_pos.y,
-                    center.2 - self.last_player_pos.z,
-                )
-                .length();
                 self.loaded_lod_nodes.push(LoadedLodNodeState {
                     key,
                     has_mesh: true,
-                    distance,
                 });
                 self.loaded_lod_set.insert(key);
             }

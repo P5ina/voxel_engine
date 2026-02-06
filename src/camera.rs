@@ -19,18 +19,6 @@ pub struct Camera {
 }
 
 impl Camera {
-    pub fn up(&self) -> Vec3 {
-        let forward = self.forward();
-        let right = self.right();
-        forward.cross(right).normalize()
-    }
-
-    pub fn inverse_view_projection_matrix(&self) -> Mat4 {
-        self.view_projection_matrix().inverse()
-    }
-}
-
-impl Camera {
     pub fn new(position: Vec3, aspect: f32) -> Self {
         Self {
             position,
@@ -51,22 +39,6 @@ impl Camera {
     pub fn apply_shake(&mut self, offset: Vec3, rotation: Quat) {
         self.shake_offset = offset;
         self.shake_rotation = rotation;
-    }
-
-    /// Update head bob state
-    pub fn update_bob(&mut self, is_walking: bool, is_grounded: bool, dt: f32) {
-        let should_bob = is_walking && is_grounded;
-
-        if should_bob {
-            // Bob frequency
-            const BOB_SPEED: f32 = 8.0;
-            self.bob_time += dt * BOB_SPEED;
-            // Ramp up intensity
-            self.bob_intensity = (self.bob_intensity + dt * 5.0).min(1.0);
-        } else {
-            // Fade out intensity smoothly
-            self.bob_intensity = (self.bob_intensity - dt * 3.0).max(0.0);
-        }
     }
 
     /// Get current head bob offset
@@ -119,26 +91,6 @@ impl Camera {
 
         let target = pos + forward;
         Mat4::look_at_rh(pos, target, up)
-    }
-
-    /// View matrix without shake/bob (for path tracing stability)
-    pub fn view_matrix_stable(&self) -> Mat4 {
-        let pos = self.position;
-
-        let yaw_quat = Quat::from_rotation_y(-self.yaw - std::f32::consts::FRAC_PI_2);
-        let pitch_quat = Quat::from_rotation_x(self.pitch);
-        let base_rotation = yaw_quat * pitch_quat;
-
-        let forward = base_rotation * Vec3::NEG_Z;
-        let up = base_rotation * Vec3::Y;
-
-        let target = pos + forward;
-        Mat4::look_at_rh(pos, target, up)
-    }
-
-    /// View-projection matrix without shake/bob (for path tracing)
-    pub fn view_projection_matrix_stable(&self) -> Mat4 {
-        self.projection_matrix() * self.view_matrix_stable()
     }
 
     pub fn projection_matrix(&self) -> Mat4 {

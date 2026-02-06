@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ChunkPosition;
 use super::chunk_manager::ChunkManager;
-use crate::renderer::Vertex;
-use crate::voxel::{Chunk, generate_merged_mesh_simple};
+use super::octree::VoxelOctree;
+use crate::voxel::Chunk;
 
 /// Compute world size in chunks from ChunkManager bounds.
 fn world_size(world: &ChunkManager) -> (i32, i32, i32) {
@@ -25,9 +25,9 @@ fn world_size(world: &ChunkManager) -> (i32, i32, i32) {
     }
 }
 
-const MAGIC: &[u8; 8] = b"BIGWORLD";
 const MAGIC_FAST: &[u8; 8] = b"BIGWFAST";
 const VERSION: u32 = 1;
+const VERSION_FAST_STREAMING: u32 = 2;
 
 #[derive(Debug)]
 pub enum BigWorldError {
@@ -68,65 +68,6 @@ impl From<lz4_flex::block::DecompressError> for BigWorldError {
     fn from(e: lz4_flex::block::DecompressError) -> Self {
         BigWorldError::Lz4(e)
     }
-}
-
-/// Header for big world file
-#[derive(Serialize, Deserialize)]
-struct BigWorldHeader {
-    world_size_x: i32,
-    world_size_y: i32,
-    world_size_z: i32,
-    mesh_group_size: i32,
-    mesh_count: u32,
-    spawn_position: [f32; 3],
-}
-
-/// Serializable vertex (same layout as Vertex but with Serialize/Deserialize)
-#[derive(Serialize, Deserialize, Clone, Copy)]
-struct SerVertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-    ao: f32,
-    color_index: f32,
-}
-
-impl From<Vertex> for SerVertex {
-    fn from(v: Vertex) -> Self {
-        Self {
-            position: v.position,
-            normal: v.normal,
-            ao: v.ao,
-            color_index: v.color_index,
-        }
-    }
-}
-
-impl From<SerVertex> for Vertex {
-    fn from(v: SerVertex) -> Self {
-        Self {
-            position: v.position,
-            normal: v.normal,
-            ao: v.ao,
-            color_index: v.color_index,
-        }
-    }
-}
-
-/// Pre-computed mesh for a group of chunks
-#[derive(Serialize, Deserialize)]
-struct MeshData {
-    base_chunk: [i32; 3],
-    vertices: Vec<SerVertex>,
-}
-
-/// Data for saving/loading big world
-#[derive(Serialize, Deserialize)]
-struct BigWorldData {
-    header: BigWorldHeader,
-    /// Compressed chunk voxel data (RLE encoded)
-    chunk_data: Vec<CompressedChunk>,
-    /// Pre-computed meshes
-    meshes: Vec<MeshData>,
 }
 
 /// RLE compressed chunk data
@@ -190,276 +131,11 @@ impl CompressedChunk {
     }
 }
 
-/// Progress callback for save/load operations
-pub type ProgressCallback = Box<dyn Fn(f32, &str) + Send + Sync>;
-
-/// Save a big world with pre-computed meshes
-pub fn save_big_world(
-    path: impl AsRef<Path>,
-    world: &ChunkManager,
-    mesh_group_size: i32,
-    spawn_position: [f32; 3],
-    progress: Option<ProgressCallback>,
-) -> Result<(), BigWorldError> {
-    let path = path.as_ref();
-    let (size_x, size_y, size_z) = world_size(world);
-
-    let report = |pct: f32, msg: &str| {
-        if let Some(ref cb) = progress {
-            cb(pct, msg);
-        }
-    };
-
-    report(0.0, "Compressing chunk data...");
-
-    // Compress chunks in parallel
-    let chunks: Vec<_> = world.chunks().collect();
-    let compressed_chunks: Vec<CompressedChunk> = chunks
-        .par_iter()
-        .map(|(pos, chunk)| CompressedChunk::from_chunk(**pos, chunk))
-        .collect();
-
-    report(0.2, "Generating meshes...");
-
-    // Calculate mesh positions
-    let mesh_count_x = (size_x + mesh_group_size - 1) / mesh_group_size;
-    let mesh_count_z = (size_z + mesh_group_size - 1) / mesh_group_size;
-    let total_meshes = (mesh_count_x * mesh_count_z) as usize;
-
-    let mesh_positions: Vec<ChunkPosition> = (0..mesh_count_z)
-        .flat_map(|mz| {
-            (0..mesh_count_x)
-                .map(move |mx| ChunkPosition::new(mx * mesh_group_size, 0, mz * mesh_group_size))
-        })
-        .collect();
-
-    // Generate meshes (sequential — world isn't Sync)
-    let meshes: Vec<MeshData> = mesh_positions
-        .iter()
-        .enumerate()
-        .map(|(i, &pos)| {
-            if i % 100 == 0 {
-                let pct = 0.2 + 0.6 * (i as f32 / total_meshes as f32);
-                report(pct, &format!("Generating mesh {}/{}...", i, total_meshes));
-            }
-
-            let vertices = generate_merged_mesh_simple(world, pos, mesh_group_size);
-            MeshData {
-                base_chunk: [pos.x, pos.y, pos.z],
-                vertices: vertices.into_iter().map(SerVertex::from).collect(),
-            }
-        })
-        .collect();
-
-    report(0.8, "Writing file...");
-
-    let data = BigWorldData {
-        header: BigWorldHeader {
-            world_size_x: size_x,
-            world_size_y: size_y,
-            world_size_z: size_z,
-            mesh_group_size,
-            mesh_count: meshes.len() as u32,
-            spawn_position,
-        },
-        chunk_data: compressed_chunks,
-        meshes,
-    };
-
-    // Serialize to bytes
-    let serialized = bincode::serialize(&data)?;
-
-    // Compress with LZ4
-    let compressed = lz4_flex::compress_prepend_size(&serialized);
-
-    // Write file
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(MAGIC)?;
-    writer.write_all(&VERSION.to_le_bytes())?;
-    writer.write_all(&compressed)?;
-
-    report(1.0, "Done!");
-
-    log::info!(
-        "[BigWorld] Saved {} chunks, {} meshes, {:.1} MB compressed",
-        data.chunk_data.len(),
-        data.meshes.len(),
-        compressed.len() as f64 / 1024.0 / 1024.0
-    );
-
-    Ok(())
-}
-
-/// Save a big world with existing meshes (much faster - no mesh regeneration)
-pub fn save_big_world_with_meshes<'a>(
-    path: impl AsRef<Path>,
-    world: &ChunkManager,
-    meshes: impl Iterator<Item = (ChunkPosition, &'a [Vertex])>,
-    mesh_group_size: i32,
-    spawn_position: [f32; 3],
-) -> Result<(), BigWorldError> {
-    let path = path.as_ref();
-    let (size_x, size_y, size_z) = world_size(world);
-
-    log::info!("[BigWorld] Compressing chunk data...");
-
-    // Compress chunks in parallel
-    let chunks: Vec<_> = world.chunks().collect();
-    let compressed_chunks: Vec<CompressedChunk> = chunks
-        .par_iter()
-        .map(|(pos, chunk)| CompressedChunk::from_chunk(**pos, chunk))
-        .collect();
-
-    log::info!("[BigWorld] Converting meshes...");
-
-    // Convert existing meshes (no regeneration!)
-    let mesh_data: Vec<MeshData> = meshes
-        .map(|(pos, vertices)| MeshData {
-            base_chunk: [pos.x, pos.y, pos.z],
-            vertices: vertices.iter().map(|&v| SerVertex::from(v)).collect(),
-        })
-        .collect();
-
-    log::info!("[BigWorld] Writing file...");
-
-    let data = BigWorldData {
-        header: BigWorldHeader {
-            world_size_x: size_x,
-            world_size_y: size_y,
-            world_size_z: size_z,
-            mesh_group_size,
-            mesh_count: mesh_data.len() as u32,
-            spawn_position,
-        },
-        chunk_data: compressed_chunks,
-        meshes: mesh_data,
-    };
-
-    // Serialize to bytes
-    let serialized = bincode::serialize(&data)?;
-
-    // Compress with LZ4
-    let compressed = lz4_flex::compress_prepend_size(&serialized);
-
-    // Write file
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(MAGIC)?;
-    writer.write_all(&VERSION.to_le_bytes())?;
-    writer.write_all(&compressed)?;
-
-    log::info!(
-        "[BigWorld] Saved {} chunks, {} meshes, {:.1} MB compressed",
-        data.chunk_data.len(),
-        data.meshes.len(),
-        compressed.len() as f64 / 1024.0 / 1024.0
-    );
-
-    Ok(())
-}
-
-/// Loaded big world data
-pub struct LoadedBigWorld {
-    pub world: ChunkManager,
-    pub meshes: Vec<(ChunkPosition, Vec<Vertex>)>,
-    pub spawn_position: [f32; 3],
-    pub mesh_group_size: i32,
-}
-
-/// Load a big world from file
-pub fn load_big_world(
-    path: impl AsRef<Path>,
-    progress: Option<ProgressCallback>,
-) -> Result<LoadedBigWorld, BigWorldError> {
-    let path = path.as_ref();
-
-    let report = |pct: f32, msg: &str| {
-        if let Some(ref cb) = progress {
-            cb(pct, msg);
-        }
-    };
-
-    report(0.0, "Reading file...");
-
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    // Read and verify magic
-    let mut magic = [0u8; 8];
-    reader.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(BigWorldError::InvalidMagic);
-    }
-
-    // Read version
-    let mut version_bytes = [0u8; 4];
-    reader.read_exact(&mut version_bytes)?;
-    let version = u32::from_le_bytes(version_bytes);
-    if version != VERSION {
-        return Err(BigWorldError::UnsupportedVersion(version));
-    }
-
-    report(0.1, "Decompressing...");
-
-    // Read compressed data
-    let mut compressed = Vec::new();
-    reader.read_to_end(&mut compressed)?;
-
-    // Decompress
-    let decompressed = lz4_flex::decompress_size_prepended(&compressed)?;
-
-    report(0.3, "Deserializing...");
-
-    // Deserialize
-    let data: BigWorldData = bincode::deserialize(&decompressed)?;
-
-    report(0.5, "Loading chunks...");
-
-    // Create world storage
-    let mut world = ChunkManager::new();
-
-    // Load chunks in parallel
-    let chunks: Vec<_> = data.chunk_data.par_iter().map(|c| c.to_chunk()).collect();
-
-    for (pos, chunk) in chunks {
-        world.insert_chunk(pos, chunk);
-    }
-
-    report(0.7, "Converting meshes...");
-
-    // Convert meshes
-    let meshes: Vec<(ChunkPosition, Vec<Vertex>)> = data
-        .meshes
-        .into_par_iter()
-        .map(|m| {
-            let pos = ChunkPosition::new(m.base_chunk[0], m.base_chunk[1], m.base_chunk[2]);
-            let vertices: Vec<Vertex> = m.vertices.into_iter().map(Vertex::from).collect();
-            (pos, vertices)
-        })
-        .collect();
-
-    report(1.0, "Done!");
-
-    log::info!(
-        "[BigWorld] Loaded {} chunks, {} meshes",
-        world.chunk_count(),
-        meshes.len()
-    );
-
-    Ok(LoadedBigWorld {
-        world,
-        meshes,
-        spawn_position: data.header.spawn_position,
-        mesh_group_size: data.header.mesh_group_size,
-    })
-}
-
 // ============================================================================
-// Fast save/load - chunks only, meshes generated on load
+// Save/load with octree - chunks + octree, meshes built on load
 // ============================================================================
 
-/// Fast header (no mesh data)
+/// Header for world file with octree
 #[derive(Serialize, Deserialize)]
 struct FastWorldHeader {
     world_size_x: i32,
@@ -469,33 +145,54 @@ struct FastWorldHeader {
     spawn_position: [f32; 3],
 }
 
-/// Fast world data (chunks only)
+/// World data: chunks + octree
 #[derive(Serialize, Deserialize)]
 struct FastWorldData {
     header: FastWorldHeader,
     chunk_data: Vec<CompressedChunk>,
+    octree: VoxelOctree,
 }
 
-/// Save world fast - only chunk data, no meshes (very fast save)
-pub fn save_big_world_fast(
-    path: impl AsRef<Path>,
-    world: &ChunkManager,
-    mesh_group_size: i32,
-    spawn_position: [f32; 3],
-) -> Result<(), BigWorldError> {
-    let path = path.as_ref();
-    let (size_x, size_y, size_z) = world_size(world);
+/// Serializable reference wrapper — borrows octree instead of cloning it
+#[derive(Serialize)]
+struct FastWorldDataRef<'a> {
+    header: FastWorldHeader,
+    chunk_data: Vec<CompressedChunk>,
+    octree: &'a VoxelOctree,
+}
 
-    log::info!("[BigWorld] Compressing {} chunks...", world.chunk_count());
+/// Pre-compressed save data (cheap to move across threads).
+pub struct PreparedSaveData {
+    compressed_chunks: Vec<CompressedChunk>,
+    world_size: (i32, i32, i32),
+}
 
-    // Compress chunks in parallel
+/// Compress chunks from a ChunkManager for later saving.
+/// Fast (parallel RLE compression), designed to run on the main thread.
+pub fn prepare_save(world: &ChunkManager) -> PreparedSaveData {
     let chunks: Vec<_> = world.chunks().collect();
     let compressed_chunks: Vec<CompressedChunk> = chunks
         .par_iter()
         .map(|(pos, chunk)| CompressedChunk::from_chunk(**pos, chunk))
         .collect();
+    PreparedSaveData {
+        compressed_chunks,
+        world_size: world_size(world),
+    }
+}
 
-    let data = FastWorldData {
+/// Write a prepared save to disk (streaming serialization).
+/// Designed to run on a background thread with an owned octree.
+pub fn write_prepared_save(
+    path: impl AsRef<Path>,
+    data: PreparedSaveData,
+    octree: &VoxelOctree,
+    mesh_group_size: i32,
+    spawn_position: [f32; 3],
+) -> Result<(), BigWorldError> {
+    let (size_x, size_y, size_z) = data.world_size;
+
+    let data_ref = FastWorldDataRef {
         header: FastWorldHeader {
             world_size_x: size_x,
             world_size_y: size_y,
@@ -503,33 +200,37 @@ pub fn save_big_world_fast(
             mesh_group_size,
             spawn_position,
         },
-        chunk_data: compressed_chunks,
+        chunk_data: data.compressed_chunks,
+        octree,
     };
 
-    // Serialize to bytes
-    let serialized = bincode::serialize(&data)?;
-
-    // Compress with LZ4
-    let compressed = lz4_flex::compress_prepend_size(&serialized);
-
-    // Write file
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     writer.write_all(MAGIC_FAST)?;
-    writer.write_all(&VERSION.to_le_bytes())?;
-    writer.write_all(&compressed)?;
+    writer.write_all(&VERSION_FAST_STREAMING.to_le_bytes())?;
+
+    let mut encoder = lz4_flex::frame::FrameEncoder::new(writer);
+    bincode::serialize_into(&mut encoder, &data_ref).map_err(BigWorldError::Bincode)?;
+    let mut writer = encoder.finish().map_err(|e| BigWorldError::Io(e.into()))?;
+    writer.flush()?;
 
     log::info!(
-        "[BigWorld] Saved {} chunks, {:.2} MB",
-        data.chunk_data.len(),
-        compressed.len() as f64 / 1024.0 / 1024.0
+        "[BigWorld] Saved {} chunks + octree (streaming, background)",
+        data_ref.chunk_data.len(),
     );
 
     Ok(())
 }
 
-/// Load world fast - regenerates meshes on load
-pub fn load_big_world_fast(path: impl AsRef<Path>) -> Result<LoadedBigWorld, BigWorldError> {
+/// Result of loading world with octree
+pub struct LoadedChunks {
+    pub world: ChunkManager,
+    pub octree: VoxelOctree,
+    pub spawn_position: [f32; 3],
+}
+
+/// Load world with octree (supports v1 block format and v2 streaming format)
+pub fn load_big_world_fast(path: impl AsRef<Path>) -> Result<LoadedChunks, BigWorldError> {
     let path = path.as_ref();
 
     log::info!("[BigWorld] Reading file...");
@@ -548,23 +249,29 @@ pub fn load_big_world_fast(path: impl AsRef<Path>) -> Result<LoadedBigWorld, Big
     let mut version_bytes = [0u8; 4];
     reader.read_exact(&mut version_bytes)?;
     let version = u32::from_le_bytes(version_bytes);
-    if version != VERSION {
-        return Err(BigWorldError::UnsupportedVersion(version));
-    }
 
-    // Read compressed data
-    let mut compressed = Vec::new();
-    reader.read_to_end(&mut compressed)?;
+    let data: FastWorldData = match version {
+        VERSION => {
+            // V1: block-compressed (read all, decompress, deserialize)
+            let mut compressed = Vec::new();
+            reader.read_to_end(&mut compressed)?;
+            log::info!("[BigWorld] Decompressing (v1 block format)...");
+            let decompressed = lz4_flex::decompress_size_prepended(&compressed)?;
+            bincode::deserialize(&decompressed)?
+        }
+        VERSION_FAST_STREAMING => {
+            // V2: stream-decompress directly from file (much lower memory)
+            log::info!("[BigWorld] Stream-decompressing (v2 frame format)...");
+            let decoder = lz4_flex::frame::FrameDecoder::new(reader);
+            bincode::deserialize_from(decoder)?
+        }
+        _ => return Err(BigWorldError::UnsupportedVersion(version)),
+    };
 
-    log::info!("[BigWorld] Decompressing...");
-
-    // Decompress
-    let decompressed = lz4_flex::decompress_size_prepended(&compressed)?;
-
-    // Deserialize
-    let data: FastWorldData = bincode::deserialize(&decompressed)?;
-
-    log::info!("[BigWorld] Loading {} chunks...", data.chunk_data.len());
+    log::info!(
+        "[BigWorld] Loading {} chunks + octree...",
+        data.chunk_data.len()
+    );
 
     // Create world storage
     let mut world = ChunkManager::new();
@@ -576,39 +283,15 @@ pub fn load_big_world_fast(path: impl AsRef<Path>) -> Result<LoadedBigWorld, Big
         world.insert_chunk(pos, chunk);
     }
 
-    log::info!("[BigWorld] Generating meshes...");
-
-    // Generate meshes
-    let mesh_group_size = data.header.mesh_group_size;
-    let (size_x, _, size_z) = world_size(&world);
-    let mesh_count_x = (size_x + mesh_group_size - 1) / mesh_group_size;
-    let mesh_count_z = (size_z + mesh_group_size - 1) / mesh_group_size;
-
-    let mesh_positions: Vec<ChunkPosition> = (0..mesh_count_z)
-        .flat_map(|mz| {
-            (0..mesh_count_x)
-                .map(move |mx| ChunkPosition::new(mx * mesh_group_size, 0, mz * mesh_group_size))
-        })
-        .collect();
-
-    let meshes: Vec<(ChunkPosition, Vec<Vertex>)> = mesh_positions
-        .iter()
-        .map(|&pos| {
-            let vertices = generate_merged_mesh_simple(&world, pos, mesh_group_size);
-            (pos, vertices)
-        })
-        .collect();
-
     log::info!(
-        "[BigWorld] Loaded {} chunks, generated {} meshes",
+        "[BigWorld] Loaded {} chunks, octree: {} nodes",
         world.chunk_count(),
-        meshes.len()
+        data.octree.node_count()
     );
 
-    Ok(LoadedBigWorld {
+    Ok(LoadedChunks {
         world,
-        meshes,
+        octree: data.octree,
         spawn_position: data.header.spawn_position,
-        mesh_group_size: data.header.mesh_group_size,
     })
 }

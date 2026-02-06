@@ -2,14 +2,30 @@
 pub enum UiScreen {
     #[default]
     MainMenu,
+    WorldSelect,
     Settings,
     InGame,
     PauseMenu,
-    LevelSelect,
     Editor,
     EditorPause,
-    SaveDialog,
     Loading,
+}
+
+/// Info about a saved world file
+#[derive(Clone)]
+pub struct WorldInfo {
+    pub name: String,
+    pub path: String,
+    pub size_mb: f64,
+    pub modified: String,
+}
+
+/// State for the world select screen
+#[derive(Clone, Default)]
+pub struct WorldSelectState {
+    pub worlds: Vec<WorldInfo>,
+    pub new_map_name: String,
+    pub creating: bool,
 }
 
 /// Loading screen state
@@ -52,24 +68,20 @@ impl LoadingState {
 
 #[derive(Debug, Clone)]
 pub enum UiMessage {
-    Play,
     Settings,
     Exit,
     Back,
     Resume,
     QuitToMenu,
-    // Level select
-    OpenLevelSelect,
-    LoadLevel(String),
-    NewLevel,
     // Editor
-    OpenEditor,
-    SaveLevel(String),
     EditorQuitToMenu,
-    // Big world
-    GenerateBigWorld,
+    // World select
+    OpenWorldSelect,
+    PlayWorld(String),
+    EditWorld(String),
+    CreateNewMap(String),
+    // Save
     SaveBigWorld,
-    LoadBigWorld,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +174,6 @@ pub struct EditorState {
     pub brush_size: u8,
     pub fly_speed: f32,
     pub level_name: String,
-    pub show_grid: bool,
 }
 
 impl Default for EditorState {
@@ -173,7 +184,6 @@ impl Default for EditorState {
             brush_size: 2,
             fly_speed: 20.0,
             level_name: String::from("untitled"),
-            show_grid: true,
         }
     }
 }

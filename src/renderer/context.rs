@@ -85,8 +85,4 @@ impl RenderContext {
     pub fn format(&self) -> wgpu::TextureFormat {
         self.config.format
     }
-
-    pub fn size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
-    }
 }

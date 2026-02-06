@@ -11,9 +11,6 @@ use crate::model::{AnimationPlayer, LoadedModel, SkeletonState};
 pub enum HeldItem {
     #[default]
     None,
-    Pickaxe,
-    Pistol,
-    Sword,
 }
 
 impl HeldItem {
@@ -28,9 +25,6 @@ impl HeldItem {
                 "pistol",
                 "sword",
             ],
-            HeldItem::Pickaxe => &["item_pistol", "item_sword", "pistol", "sword"],
-            HeldItem::Pistol => &["item_pickaxe", "item_sword", "pick", "sword"],
-            HeldItem::Sword => &["item_pickaxe", "item_pistol", "pick", "pistol"],
         }
     }
 
@@ -38,19 +32,6 @@ impl HeldItem {
     pub fn idle_animation(&self) -> &'static str {
         match self {
             HeldItem::None => "idle",
-            HeldItem::Pickaxe => "pickaxe_idle",
-            HeldItem::Pistol => "pistol_idle",
-            HeldItem::Sword => "sword_idle",
-        }
-    }
-
-    /// Get walk animation name for this item
-    pub fn walk_animation(&self) -> &'static str {
-        match self {
-            HeldItem::None => "walk",
-            HeldItem::Pickaxe => "pickaxe_walk",
-            HeldItem::Pistol => "pistol_walk",
-            HeldItem::Sword => "sword_walk",
         }
     }
 
@@ -58,9 +39,6 @@ impl HeldItem {
     pub fn run_animation(&self) -> &'static str {
         match self {
             HeldItem::None => "run",
-            HeldItem::Pickaxe => "pickaxe_run",
-            HeldItem::Pistol => "pistol_run",
-            HeldItem::Sword => "sword_run",
         }
     }
 
@@ -68,9 +46,6 @@ impl HeldItem {
     pub fn attack_animation(&self) -> &'static str {
         match self {
             HeldItem::None => "hands_punch",
-            HeldItem::Pickaxe => "pickaxe_swing",
-            HeldItem::Pistol => "pistol_fire",
-            HeldItem::Sword => "sword_slash",
         }
     }
 }
@@ -136,22 +111,9 @@ impl FirstPersonView {
         }
     }
 
-    /// Toggle debug detach mode
-    pub fn toggle_detach(&mut self, camera_position: Vec3, camera_rotation: Quat) {
-        self.debug_detached = !self.debug_detached;
-        if self.debug_detached {
-            // Save current position
-            self.debug_position = camera_position;
-            self.debug_rotation = camera_rotation;
-        }
-    }
-
     /// Set the first-person model (arms/weapon)
     pub fn set_model(&mut self, model: Arc<LoadedModel>) {
-        self.skeleton_state = model
-            .skeleton
-            .as_ref()
-            .map(|s| SkeletonState::from_skeleton(s));
+        self.skeleton_state = model.skeleton.as_ref().map(SkeletonState::from_skeleton);
 
         self.animation_player = AnimationPlayer::new();
         for clip in &model.animations {
@@ -167,17 +129,6 @@ impl FirstPersonView {
         self.play_idle();
     }
 
-    /// Set the currently held item
-    pub fn set_held_item(&mut self, item: HeldItem) {
-        if self.held_item == item {
-            return;
-        }
-
-        self.held_item = item;
-        self.update_item_visibility();
-        self.play_idle();
-    }
-
     /// Update which meshes are hidden based on held item
     fn update_item_visibility(&mut self) {
         self.hidden_meshes = self
@@ -186,11 +137,6 @@ impl FirstPersonView {
             .iter()
             .map(|s| s.to_string())
             .collect();
-    }
-
-    /// Check if a mesh should be visible
-    pub fn is_mesh_visible(&self, mesh_name: &str) -> bool {
-        !self.hidden_meshes.iter().any(|h| mesh_name.contains(h))
     }
 
     /// Play idle animation for current item
@@ -203,20 +149,6 @@ impl FirstPersonView {
             self.animation_player.play_by_name("idle");
         }
         self.is_attacking = false;
-    }
-
-    /// Play walk animation for current item
-    pub fn play_walk(&mut self) {
-        if self.is_attacking {
-            return; // Don't interrupt attack
-        }
-
-        if !self
-            .animation_player
-            .play_by_name(self.held_item.walk_animation())
-        {
-            self.animation_player.play_by_name("walk");
-        }
     }
 
     /// Play run animation for current item
@@ -239,21 +171,8 @@ impl FirstPersonView {
             .animation_player
             .play_by_name_restart(self.held_item.attack_animation())
         {
-            // Fallback animations
-            match self.held_item {
-                HeldItem::None => {
-                    self.animation_player.play_by_name_restart("punch");
-                }
-                HeldItem::Pickaxe => {
-                    self.animation_player.play_by_name_restart("swing");
-                }
-                HeldItem::Pistol => {
-                    self.animation_player.play_by_name_restart("fire");
-                }
-                HeldItem::Sword => {
-                    self.animation_player.play_by_name_restart("slash");
-                }
-            }
+            // Fallback animation
+            self.animation_player.play_by_name_restart("punch");
         }
         self.is_attacking = true;
     }
@@ -270,8 +189,6 @@ impl FirstPersonView {
             self.is_attacking = false;
             if is_walking && is_sprinting {
                 self.play_run();
-            } else if is_walking {
-                self.play_idle();
             } else {
                 self.play_idle();
             }
@@ -291,16 +208,16 @@ impl FirstPersonView {
         }
 
         // Update animation
-        if let (Some(model), Some(state)) = (&self.model, &mut self.skeleton_state) {
-            if let Some(skeleton) = &model.skeleton {
-                self.animation_player.update(dt, skeleton, state);
+        if let (Some(model), Some(state)) = (&self.model, &mut self.skeleton_state)
+            && let Some(skeleton) = &model.skeleton
+        {
+            self.animation_player.update(dt, skeleton, state);
 
-                // Extract camera shake from "camera_target" bone
-                if let Some(idx) = skeleton.find_joint("camera_target") {
-                    let transform = &state.local_transforms[idx];
-                    self.camera_shake_pos = transform.translation;
-                    self.camera_shake_rot = transform.rotation;
-                }
+            // Extract camera shake from "camera_target" bone
+            if let Some(idx) = skeleton.find_joint("camera_target") {
+                let transform = &state.local_transforms[idx];
+                self.camera_shake_pos = transform.translation;
+                self.camera_shake_rot = transform.rotation;
             }
         }
     }
@@ -327,21 +244,6 @@ impl FirstPersonView {
             rot * self.rotation_offset,
             pos + world_offset,
         )
-    }
-
-    /// Play an animation by name
-    pub fn play_animation(&mut self, name: &str) {
-        self.animation_player.play_by_name(name);
-    }
-
-    /// Check if a model is loaded
-    pub fn has_model(&self) -> bool {
-        self.model.is_some()
-    }
-
-    /// Check if currently attacking
-    pub fn is_attacking(&self) -> bool {
-        self.is_attacking
     }
 }
 

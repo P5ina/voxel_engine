@@ -785,19 +785,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Path trace
     var color = path_trace(world_pos, world_normal, albedo, material_id);
 
-    // Distance fog — fade to sky color at world edge
-    let dist = length(world_pos - params.camera_position);
-    let fog_start = 150.0;
-    let fog_end = 350.0;
-    let fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    let sky_uv_fog = vec2<f32>(f32(pixel.x), f32(pixel.y)) / vec2<f32>(f32(params.screen_width), f32(params.screen_height));
-    let sky_fog = mix(
-        vec3<f32>(0.4, 0.6, 0.9),
-        vec3<f32>(0.7, 0.85, 1.0),
-        1.0 - sky_uv_fog.y
-    );
-    color = mix(color, sky_fog, fog_factor);
-
     // Output
     textureStore(output, pixel, vec4<f32>(color, 1.0));
 }

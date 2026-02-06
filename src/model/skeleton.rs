@@ -52,17 +52,8 @@ impl JointTransform {
     }
 
     /// Convert to a 4x4 transformation matrix
-    pub fn to_matrix(&self) -> Mat4 {
+    pub fn to_matrix(self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
-    }
-
-    /// Linearly interpolate between two transforms
-    pub fn lerp(&self, other: &Self, t: f32) -> Self {
-        Self {
-            translation: self.translation.lerp(other.translation, t),
-            rotation: self.rotation.slerp(other.rotation, t),
-            scale: self.scale.lerp(other.scale, t),
-        }
     }
 }
 
@@ -103,11 +94,6 @@ impl Skeleton {
     /// Find joint index by name
     pub fn find_joint(&self, name: &str) -> Option<usize> {
         self.joints.iter().position(|j| j.name == name)
-    }
-
-    /// Get the number of joints
-    pub fn joint_count(&self) -> usize {
-        self.joints.len()
     }
 }
 
@@ -180,22 +166,6 @@ impl SkeletonState {
         }
     }
 
-    /// Apply a pose from local transforms
-    pub fn set_local_transforms(&mut self, transforms: &[JointTransform], skeleton: &Skeleton) {
-        if transforms.len() == self.local_transforms.len() {
-            self.local_transforms.copy_from_slice(transforms);
-            self.compute_skin_matrices(skeleton);
-        }
-    }
-
-    /// Blend between two poses
-    pub fn blend(&mut self, other: &SkeletonState, t: f32, skeleton: &Skeleton) {
-        for i in 0..self.local_transforms.len() {
-            self.local_transforms[i] = self.local_transforms[i].lerp(&other.local_transforms[i], t);
-        }
-        self.compute_skin_matrices(skeleton);
-    }
-
     /// Transform a vertex position using skinning
     pub fn transform_vertex(
         &self,
@@ -216,29 +186,5 @@ impl SkeletonState {
         }
 
         result
-    }
-
-    /// Transform a normal using skinning (no translation)
-    pub fn transform_normal(
-        &self,
-        normal: Vec3,
-        joint_indices: [u32; 4],
-        joint_weights: [f32; 4],
-    ) -> Vec3 {
-        let mut result = Vec3::ZERO;
-
-        for i in 0..4 {
-            let weight = joint_weights[i];
-            if weight > 0.0 {
-                let joint_idx = joint_indices[i] as usize;
-                if joint_idx < self.skin_matrices.len() {
-                    // Use inverse transpose for normals (approximation: just rotation part)
-                    let mat3 = glam::Mat3::from_mat4(self.skin_matrices[joint_idx]);
-                    result += mat3 * normal * weight;
-                }
-            }
-        }
-
-        result.normalize_or_zero()
     }
 }

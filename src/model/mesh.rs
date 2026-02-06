@@ -59,17 +59,6 @@ impl MeshVertex {
             joint_weights,
         }
     }
-
-    /// Create a static vertex (no skinning)
-    pub const fn static_vertex(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
-        Self {
-            position,
-            normal,
-            uv,
-            joint_indices: [0, 0, 0, 0],
-            joint_weights: [1.0, 0.0, 0.0, 0.0],
-        }
-    }
 }
 
 /// A polygon mesh with vertices and optional material reference
@@ -90,15 +79,6 @@ impl PolygonMesh {
             material_index: None,
             texture_index: None,
             name: name.into(),
-        }
-    }
-
-    /// Get the number of triangles in this mesh
-    pub fn triangle_count(&self) -> usize {
-        if let Some(indices) = &self.indices {
-            indices.len() / 3
-        } else {
-            self.vertices.len() / 3
         }
     }
 
@@ -134,16 +114,14 @@ impl<'a> Iterator for TriangleIterator<'a> {
             } else {
                 None
             }
+        } else if self.index + 2 < self.mesh.vertices.len() {
+            let v0 = &self.mesh.vertices[self.index];
+            let v1 = &self.mesh.vertices[self.index + 1];
+            let v2 = &self.mesh.vertices[self.index + 2];
+            self.index += 3;
+            Some((v0, v1, v2))
         } else {
-            if self.index + 2 < self.mesh.vertices.len() {
-                let v0 = &self.mesh.vertices[self.index];
-                let v1 = &self.mesh.vertices[self.index + 1];
-                let v2 = &self.mesh.vertices[self.index + 2];
-                self.index += 3;
-                Some((v0, v1, v2))
-            } else {
-                None
-            }
+            None
         }
     }
 }
@@ -158,32 +136,15 @@ pub struct LoadedModel {
     pub skeleton: Option<Skeleton>,
     pub animations: Vec<AnimationClip>,
     pub textures: Vec<LoadedTexture>,
-    pub name: String,
 }
 
 impl LoadedModel {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
             meshes: Vec::new(),
             skeleton: None,
             animations: Vec::new(),
             textures: Vec::new(),
-            name: name.into(),
         }
-    }
-
-    /// Get total triangle count across all meshes
-    pub fn total_triangles(&self) -> usize {
-        self.meshes.iter().map(|m| m.triangle_count()).sum()
-    }
-
-    /// Check if model has skeletal animation data
-    pub fn is_skinned(&self) -> bool {
-        self.skeleton.is_some()
-    }
-
-    /// Check if model has any animations
-    pub fn has_animations(&self) -> bool {
-        !self.animations.is_empty()
     }
 }

@@ -7,7 +7,7 @@ use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
 use crate::ui::LightingMode;
-use crate::voxel::{CHUNK_SIZE, Chunk, VOXEL_SCALE};
+use crate::voxel::{CHUNK_SIZE, VOXEL_SCALE};
 use crate::world::ChunkManager;
 
 pub use gbuffer::GBuffer;
@@ -161,7 +161,6 @@ pub struct PathTracer {
 
     // G-buffer pass
     pub gbuffer_pipeline: wgpu::RenderPipeline,
-    pub gbuffer_bind_group_layout: wgpu::BindGroupLayout,
 
     // Path trace pass
     pub pathtrace_pipeline: wgpu::ComputePipeline,
@@ -178,7 +177,6 @@ pub struct PathTracer {
     pub accumulate_bind_group: wgpu::BindGroup,
 
     // Denoise pass (3 passes with step sizes 1, 2, 4)
-    pub denoise_pipeline: wgpu::ComputePipeline,
     pub denoise_bind_group_layout: wgpu::BindGroupLayout,
     pub denoise_params_buffers: [wgpu::Buffer; 3],
     pub denoise_ping_texture: wgpu::Texture,
@@ -203,6 +201,7 @@ pub struct PathTracer {
 }
 
 impl PathTracer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
@@ -265,7 +264,7 @@ impl PathTracer {
         });
 
         // Create bind group layouts and pipelines
-        let (gbuffer_bind_group_layout, gbuffer_pipeline) = Self::create_gbuffer_pipeline(
+        let (_gbuffer_bind_group_layout, gbuffer_pipeline) = Self::create_gbuffer_pipeline(
             device,
             camera_bind_group_layout,
             texture_bind_group_layout,
@@ -283,7 +282,7 @@ impl PathTracer {
         let (accumulate_bind_group_layout, accumulate_pipeline) =
             Self::create_accumulate_pipeline(device);
 
-        let (denoise_bind_group_layout, denoise_pipeline) = Self::create_denoise_pipeline(device);
+        let (denoise_bind_group_layout, _denoise_pipeline) = Self::create_denoise_pipeline(device);
 
         let (tonemap_bind_group_layout, tonemap_pipeline) =
             Self::create_tonemap_pipeline(device, surface_format);
@@ -365,7 +364,6 @@ impl PathTracer {
             voxel_texture,
             voxel_view,
             gbuffer_pipeline,
-            gbuffer_bind_group_layout,
             pathtrace_pipeline,
             pathtrace_bind_group_layout,
             pathtrace_bind_group,
@@ -374,7 +372,6 @@ impl PathTracer {
             accumulate_pipeline,
             accumulate_bind_group_layout,
             accumulate_bind_group,
-            denoise_pipeline,
             denoise_bind_group_layout,
             denoise_params_buffers,
             denoise_ping_texture,
@@ -1141,40 +1138,6 @@ impl PathTracer {
         self.accumulated_frames = 0;
     }
 
-    pub fn update_voxels(&self, queue: &wgpu::Queue, chunk: &Chunk) {
-        // Create voxel data (block type as u8)
-        let mut data = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
-        for x in 0..CHUNK_SIZE {
-            for y in 0..CHUNK_SIZE {
-                for z in 0..CHUNK_SIZE {
-                    let block = chunk.get(x, y, z);
-                    let idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE;
-                    data[idx] = block as u8;
-                }
-            }
-        }
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.voxel_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(CHUNK_SIZE as u32),
-                rows_per_image: Some(CHUNK_SIZE as u32),
-            },
-            wgpu::Extent3d {
-                width: CHUNK_SIZE as u32,
-                height: CHUNK_SIZE as u32,
-                depth_or_array_layers: CHUNK_SIZE as u32,
-            },
-        );
-    }
-
     /// Update voxels from a multi-chunk world
     pub fn update_world_voxels(
         &mut self,
@@ -1283,7 +1246,7 @@ impl PathTracer {
                         let world_z = chunk_offset_z + z;
 
                         let idx = world_x + world_y * size_x + world_z * size_x * size_y;
-                        data[idx] = block as u8;
+                        data[idx] = block;
                     }
                 }
             }
@@ -1341,7 +1304,7 @@ impl PathTracer {
                         let block = chunk.get(x, y, z);
                         // Layout: x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE
                         let idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE;
-                        data[idx] = block as u8;
+                        data[idx] = block;
                     }
                 }
             }
@@ -1453,6 +1416,7 @@ impl PathTracer {
         self.accumulated_frames += 1;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render<'a>(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1540,8 +1504,8 @@ impl PathTracer {
                 timestamp_writes: None,
             });
 
-            let workgroups_x = (self.width + 7) / 8;
-            let workgroups_y = (self.height + 7) / 8;
+            let workgroups_x = self.width.div_ceil(8);
+            let workgroups_y = self.height.div_ceil(8);
 
             match lighting_mode {
                 LightingMode::PathTracing => {
@@ -1572,8 +1536,8 @@ impl PathTracer {
                     compute_pass.set_pipeline(&self.accumulate_pipeline);
                     compute_pass.set_bind_group(0, &self.accumulate_bind_group, &[]);
 
-                    let workgroups_x = (self.width + 7) / 8;
-                    let workgroups_y = (self.height + 7) / 8;
+                    let workgroups_x = self.width.div_ceil(8);
+                    let workgroups_y = self.height.div_ceil(8);
                     compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
                 }
 

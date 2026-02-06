@@ -1,15 +1,15 @@
 /// G-buffer textures for deferred path tracing
 pub struct GBuffer {
-    /// World position + linear depth (Rgba32Float)
-    pub position_texture: wgpu::Texture,
+    /// World position + linear depth (Rgba32Float). Kept alive for `position_view`.
+    _position_texture: wgpu::Texture,
     pub position_view: wgpu::TextureView,
 
-    /// World normal (xyz) + material_id (w) (Rgba16Float)
-    pub normal_texture: wgpu::Texture,
+    /// World normal (xyz) + material_id (w) (Rgba16Float). Kept alive for `normal_view`.
+    _normal_texture: wgpu::Texture,
     pub normal_view: wgpu::TextureView,
 
-    /// Albedo color from texture (Rgba8Unorm)
-    pub albedo_texture: wgpu::Texture,
+    /// Albedo color from texture (Rgba8Unorm). Kept alive for `albedo_view`.
+    _albedo_texture: wgpu::Texture,
     pub albedo_view: wgpu::TextureView,
 }
 
@@ -64,11 +64,11 @@ impl GBuffer {
         let albedo_view = albedo_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         Self {
-            position_texture,
+            _position_texture: position_texture,
             position_view,
-            normal_texture,
+            _normal_texture: normal_texture,
             normal_view,
-            albedo_texture,
+            _albedo_texture: albedo_texture,
             albedo_view,
         }
     }

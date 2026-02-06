@@ -147,10 +147,6 @@ impl Player {
         }
     }
 
-    pub fn intersects_block(&self, bx: i32, by: i32, bz: i32) -> bool {
-        self.aabb_intersects_block(self.position, bx, by, bz)
-    }
-
     pub fn apply_movement(&mut self, forward: Vec3, right: Vec3, input: Vec3, speed: f32) {
         let move_dir = (forward * input.z + right * input.x).normalize_or_zero();
         self.velocity.x += move_dir.x * speed;

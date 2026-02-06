@@ -18,31 +18,12 @@ impl Aabb {
         }
     }
 
-    /// Create an AABB from min/max points
-    pub fn new(min: Vec3, max: Vec3) -> Self {
-        Self { min, max }
-    }
-
-    /// Create an AABB containing a single point
-    pub fn from_point(point: Vec3) -> Self {
-        Self {
-            min: point,
-            max: point,
-        }
-    }
-
     /// Create an AABB containing a triangle
     pub fn from_triangle(v0: Vec3, v1: Vec3, v2: Vec3) -> Self {
         Self {
             min: v0.min(v1).min(v2),
             max: v0.max(v1).max(v2),
         }
-    }
-
-    /// Expand AABB to include a point
-    pub fn expand_point(&mut self, point: Vec3) {
-        self.min = self.min.min(point);
-        self.max = self.max.max(point);
     }
 
     /// Expand AABB to include another AABB
@@ -77,11 +58,6 @@ impl Aabb {
         } else {
             2
         }
-    }
-
-    /// Check if AABB is valid (non-empty)
-    pub fn is_valid(&self) -> bool {
-        self.min.x <= self.max.x && self.min.y <= self.max.y && self.min.z <= self.max.z
     }
 }
 
@@ -150,37 +126,4 @@ pub enum BvhNode {
         first_triangle: u32,
         triangle_count: u32,
     },
-}
-
-impl BvhNode {
-    /// Get the bounding box of this node
-    pub fn bounds(&self) -> &Aabb {
-        match self {
-            BvhNode::Interior { bounds, .. } => bounds,
-            BvhNode::Leaf { bounds, .. } => bounds,
-        }
-    }
-
-    /// Check if this is a leaf node
-    pub fn is_leaf(&self) -> bool {
-        matches!(self, BvhNode::Leaf { .. })
-    }
-
-    /// Count total nodes in the tree
-    pub fn node_count(&self) -> usize {
-        match self {
-            BvhNode::Interior { left, right, .. } => 1 + left.node_count() + right.node_count(),
-            BvhNode::Leaf { .. } => 1,
-        }
-    }
-
-    /// Get the maximum depth of the tree
-    pub fn max_depth(&self) -> usize {
-        match self {
-            BvhNode::Interior { left, right, .. } => {
-                1 + left.max_depth().max(right.max_depth())
-            }
-            BvhNode::Leaf { .. } => 1,
-        }
-    }
 }

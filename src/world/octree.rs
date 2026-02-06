@@ -1,13 +1,17 @@
 use glam::IVec3;
+use serde::{Deserialize, Serialize};
 
-use crate::voxel::{CHUNK_SIZE, Voxel};
+use crate::voxel::Voxel;
 
 use super::ChunkPosition;
 use super::lod::{LodLevel, VoxelData, build_lod_from_children};
 use super::position::LodNodeKey;
 
+/// Per-child info: (present, data_index_in_voxel_data, is_homogeneous, homo_value)
+type ChildrenInfo = [(bool, u32, bool, u8); 8];
+
 /// Node flags for octree nodes
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct NodeFlags(u8);
 
 impl NodeFlags {
@@ -45,10 +49,6 @@ impl NodeFlags {
         }
     }
 
-    pub fn is_mesh_dirty(&self) -> bool {
-        self.0 & Self::MESH_DIRTY != 0
-    }
-
     pub fn set_mesh_dirty(&mut self, value: bool) {
         if value {
             self.0 |= Self::MESH_DIRTY;
@@ -83,7 +83,7 @@ impl NodeFlags {
 }
 
 /// Octree node
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OctreeNode {
     /// Bit flags for which children exist (8 bits for 8 octants)
     pub children_mask: u8,
@@ -106,32 +106,6 @@ pub struct OctreeNode {
 }
 
 impl OctreeNode {
-    pub fn new_leaf(data_index: u32, lod_level: LodLevel) -> Self {
-        let mut flags = NodeFlags::new();
-        flags.set_leaf(true);
-        flags.set_mesh_dirty(true);
-
-        Self {
-            children_mask: 0,
-            data_index,
-            lod_data_index: u32::MAX,
-            lod_level,
-            flags,
-            homogeneous_value: 0,
-        }
-    }
-
-    pub fn new_internal(children_index: u32, lod_level: LodLevel) -> Self {
-        Self {
-            children_mask: 0xFF, // All 8 children exist by default
-            data_index: children_index,
-            lod_data_index: u32::MAX,
-            lod_level,
-            flags: NodeFlags::new(),
-            homogeneous_value: 0,
-        }
-    }
-
     pub fn new_homogeneous(value: Voxel, lod_level: LodLevel) -> Self {
         let mut flags = NodeFlags::new();
         flags.set_leaf(true);
@@ -164,6 +138,7 @@ impl OctreeNode {
 }
 
 /// Main octree structure for storing voxel world
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VoxelOctree {
     /// Root node index (always 0)
     root: u32,
@@ -236,25 +211,6 @@ impl VoxelOctree {
         Self::new_at_origin(chunks, IVec3::ZERO)
     }
 
-    /// Get voxel at world coordinates
-    pub fn get_voxel(&self, wx: i32, wy: i32, wz: i32) -> Voxel {
-        let chunk_pos = ChunkPosition::from_world_coords(wx, wy, wz);
-        let local_x = wx.rem_euclid(CHUNK_SIZE as i32) as usize;
-        let local_y = wy.rem_euclid(CHUNK_SIZE as i32) as usize;
-        let local_z = wz.rem_euclid(CHUNK_SIZE as i32) as usize;
-
-        if let Some(data) = self.get_chunk_data(chunk_pos) {
-            data.get(local_x, local_y, local_z)
-        } else {
-            0 // Air
-        }
-    }
-
-    /// Check if voxel is solid at world coordinates
-    pub fn is_solid(&self, wx: i32, wy: i32, wz: i32) -> bool {
-        self.get_voxel(wx, wy, wz) != 0
-    }
-
     /// Get chunk data at given position
     pub fn get_chunk_data(&self, pos: ChunkPosition) -> Option<&VoxelData> {
         let node_idx = self.find_leaf_node(pos)?;
@@ -262,20 +218,6 @@ impl VoxelOctree {
 
         if node.flags.is_homogeneous() {
             None // Homogeneous nodes don't have separate data
-        } else {
-            self.voxel_data.get(node.data_index as usize)
-        }
-    }
-
-    /// Get chunk data at given position and LOD level
-    pub fn get_lod_data(&self, pos: ChunkPosition, lod: LodLevel) -> Option<&VoxelData> {
-        // For LOD > 0, we need to find the appropriate parent node
-        let scaled_pos = ChunkPosition::new(pos.x >> lod, pos.y >> lod, pos.z >> lod);
-        let node_idx = self.find_node_at_level(scaled_pos, lod)?;
-        let node = &self.nodes[node_idx as usize];
-
-        if node.flags.is_homogeneous() {
-            None
         } else {
             self.voxel_data.get(node.data_index as usize)
         }
@@ -315,33 +257,6 @@ impl VoxelOctree {
         node.flags.set_mesh_dirty(true);
 
         // Mark parent LOD nodes as dirty
-        self.mark_lod_dirty(pos);
-    }
-
-    /// Remove chunk at given position
-    pub fn remove_chunk(&mut self, pos: ChunkPosition) {
-        if let Some(node_idx) = self.find_leaf_node(pos) {
-            let node = &mut self.nodes[node_idx as usize];
-
-            if !node.flags.is_homogeneous() && node.data_index != 0 {
-                self.free_data_indices.push(node.data_index);
-            }
-
-            // Convert to homogeneous air
-            node.flags.set_homogeneous(true);
-            node.homogeneous_value = 0;
-            node.data_index = 0;
-            node.flags.set_loaded(false);
-
-            self.mark_lod_dirty(pos);
-        }
-    }
-
-    /// Mark chunk and its LOD parents as dirty
-    pub fn mark_dirty(&mut self, pos: ChunkPosition) {
-        if let Some(node_idx) = self.find_leaf_node(pos) {
-            self.nodes[node_idx as usize].flags.set_mesh_dirty(true);
-        }
         self.mark_lod_dirty(pos);
     }
 
@@ -449,61 +364,6 @@ impl VoxelOctree {
         bx | (by << 1) | (bz << 2)
     }
 
-    /// Get all dirty chunks at LOD 0
-    pub fn take_dirty_chunks(&mut self) -> Vec<ChunkPosition> {
-        let mut dirty = Vec::new();
-        self.collect_dirty_recursive(self.root, IVec3::ZERO, self.depth, &mut dirty);
-
-        // Clear dirty flags
-        for pos in &dirty {
-            if let Some(idx) = self.find_leaf_node(*pos) {
-                self.nodes[idx as usize].flags.set_mesh_dirty(false);
-            }
-        }
-
-        dirty
-    }
-
-    fn collect_dirty_recursive(
-        &self,
-        node_idx: u32,
-        offset: IVec3,
-        level: u8,
-        dirty: &mut Vec<ChunkPosition>,
-    ) {
-        let node = &self.nodes[node_idx as usize];
-
-        if node.flags.is_leaf() {
-            if level == 0 && node.flags.is_mesh_dirty() && node.flags.is_loaded() {
-                dirty.push(ChunkPosition::new(
-                    offset.x + self.world_min.x,
-                    offset.y + self.world_min.y,
-                    offset.z + self.world_min.z,
-                ));
-            }
-            return;
-        }
-
-        let child_size = 1i32 << (level - 1);
-
-        for octant in 0..8u8 {
-            if node.has_child(octant) {
-                let child_idx = node.child_index(octant).unwrap();
-                let child_offset = IVec3::new(
-                    offset.x + (octant & 1) as i32 * child_size,
-                    offset.y + ((octant >> 1) & 1) as i32 * child_size,
-                    offset.z + ((octant >> 2) & 1) as i32 * child_size,
-                );
-                self.collect_dirty_recursive(child_idx, child_offset, level - 1, dirty);
-            }
-        }
-    }
-
-    /// Iterator over all loaded chunks
-    pub fn loaded_chunks(&self) -> impl Iterator<Item = ChunkPosition> + '_ {
-        LoadedChunkIterator::new(self)
-    }
-
     /// Get depth of the octree
     pub fn depth(&self) -> u8 {
         self.depth
@@ -521,35 +381,182 @@ impl VoxelOctree {
 
     /// Process all dirty LOD nodes bottom-up. Returns keys of regenerated nodes.
     pub fn process_dirty_lods(&mut self) -> Vec<LodNodeKey> {
+        self.process_dirty_lods_with_progress(|_, _| {})
+    }
+
+    /// Process all dirty LOD nodes bottom-up with per-level progress callback.
+    /// Callback receives (nodes_completed_so_far, total_nodes).
+    pub fn process_dirty_lods_with_progress(
+        &mut self,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Vec<LodNodeKey> {
+        use rayon::prelude::*;
+
         let mut regenerated = Vec::new();
-        self.process_dirty_lods_recursive(
+
+        // Phase 1: Collect all internal nodes grouped by level (fast, single-threaded)
+        let mut nodes_by_level: Vec<Vec<(u32, IVec3)>> = vec![Vec::new(); self.depth as usize + 1];
+        Self::collect_internal_nodes(
+            &self.nodes,
             self.root,
             IVec3::ZERO,
             self.depth,
-            &mut regenerated,
+            &mut nodes_by_level,
         );
+
+        let total_nodes: usize = nodes_by_level.iter().map(|v| v.len()).sum();
+        let mut completed_nodes: usize = 0;
+
+        // Phase 2: Process bottom-up (level 1 first, then 2, etc.)
+        // At each level, children are already processed, so their LOD data is stable.
+        #[allow(clippy::needless_range_loop)]
+        for level in 1..=self.depth as usize {
+            let level_nodes = &nodes_by_level[level];
+            if level_nodes.is_empty() {
+                continue;
+            }
+
+            // Collect info for dirty nodes: (node_idx, offset, children_info)
+            // children_info: (present, data_index_in_voxel_data, is_homogeneous, homo_value)
+            let dirty_items: Vec<(u32, IVec3, ChildrenInfo)> = level_nodes
+                .iter()
+                .filter_map(|&(node_idx, offset)| {
+                    let node = &self.nodes[node_idx as usize];
+                    if !node.flags.is_lod_dirty() {
+                        return None;
+                    }
+
+                    let mut children: [(bool, u32, bool, u8); 8] = [(false, 0, false, 0); 8];
+                    for octant in 0..8u8 {
+                        if node.has_child(octant) {
+                            let child_idx = node.child_index(octant).unwrap();
+                            let child = &self.nodes[child_idx as usize];
+                            if child.flags.is_leaf() {
+                                if child.flags.is_homogeneous() {
+                                    children[octant as usize] =
+                                        (true, 0, true, child.homogeneous_value);
+                                } else if child.flags.is_loaded() {
+                                    children[octant as usize] = (true, child.data_index, false, 0);
+                                }
+                            } else {
+                                // Internal node — use its LOD data
+                                if child.lod_data_index != u32::MAX {
+                                    children[octant as usize] =
+                                        (true, child.lod_data_index, false, 0);
+                                } else if child.flags.is_homogeneous() {
+                                    children[octant as usize] =
+                                        (true, 0, true, child.homogeneous_value);
+                                }
+                            }
+                        }
+                    }
+                    Some((node_idx, offset, children))
+                })
+                .collect();
+
+            if dirty_items.is_empty() {
+                continue;
+            }
+
+            // Parallel compute: read from voxel_data (immutable), produce LOD results
+            // SAFETY: voxel_data is only read during par_iter; all writes happen after collect().
+            // Children data at level L-1 was written in the previous iteration and is stable.
+            // We fabricate a shared slice to avoid borrow checker conflicts with &mut self.
+            let vd_slice: &[VoxelData] = unsafe {
+                std::slice::from_raw_parts(self.voxel_data.as_ptr(), self.voxel_data.len())
+            };
+
+            let results: Vec<(u32, IVec3, VoxelData)> = dirty_items
+                .par_iter()
+                .map(|&(node_idx, offset, ref children)| {
+                    // Pre-build homogeneous storage for all 8 slots
+                    let homo_storage: [VoxelData; 8] = std::array::from_fn(|i| {
+                        let (present, _, is_homo, homo_val) = children[i];
+                        if present && is_homo {
+                            VoxelData::Homogeneous(homo_val)
+                        } else {
+                            VoxelData::Homogeneous(0) // placeholder, won't be referenced
+                        }
+                    });
+
+                    // Build references to children data without cloning
+                    let refs: [Option<&VoxelData>; 8] = std::array::from_fn(|i| {
+                        let (present, data_idx, is_homo, _) = children[i];
+                        if !present {
+                            None
+                        } else if is_homo {
+                            Some(&homo_storage[i])
+                        } else {
+                            vd_slice.get(data_idx as usize)
+                        }
+                    });
+
+                    let lod_data = build_lod_from_children(&refs);
+                    (node_idx, offset, lod_data)
+                })
+                .collect();
+
+            // Sequential store: write LOD results back into the octree
+            let world_min = self.world_min;
+            for (node_idx, offset, lod_data) in results {
+                let node = &mut self.nodes[node_idx as usize];
+                if let Some(value) = lod_data.is_homogeneous() {
+                    node.flags.set_homogeneous(true);
+                    node.homogeneous_value = value;
+                    if node.lod_data_index != u32::MAX {
+                        self.free_data_indices.push(node.lod_data_index);
+                        node.lod_data_index = u32::MAX;
+                    }
+                } else {
+                    node.flags.set_homogeneous(false);
+                    if node.lod_data_index != u32::MAX {
+                        self.voxel_data[node.lod_data_index as usize] = lod_data;
+                    } else if let Some(idx) = self.free_data_indices.pop() {
+                        self.voxel_data[idx as usize] = lod_data;
+                        node.lod_data_index = idx;
+                    } else {
+                        let idx = self.voxel_data.len() as u32;
+                        self.voxel_data.push(lod_data);
+                        node.lod_data_index = idx;
+                    }
+                }
+                node.flags.set_lod_dirty(false);
+
+                let key = LodNodeKey::new(
+                    (offset.x + world_min.x) >> level as i32,
+                    (offset.y + world_min.y) >> level as i32,
+                    (offset.z + world_min.z) >> level as i32,
+                    level as u8,
+                );
+                regenerated.push(key);
+            }
+
+            completed_nodes += level_nodes.len();
+            on_progress(completed_nodes, total_nodes);
+        }
+
         regenerated
     }
 
-    /// Recursive bottom-up LOD processing.
-    fn process_dirty_lods_recursive(
-        &mut self,
+    /// Collect all internal (non-leaf) nodes grouped by their level in the tree.
+    fn collect_internal_nodes(
+        nodes: &[OctreeNode],
         node_idx: u32,
         offset: IVec3,
         level: u8,
-        regenerated: &mut Vec<LodNodeKey>,
+        result: &mut Vec<Vec<(u32, IVec3)>>,
     ) {
-        // Read node info into locals to avoid holding borrows during recursion
-        let node = &self.nodes[node_idx as usize];
+        let node = &nodes[node_idx as usize];
         if node.flags.is_leaf() {
             return;
         }
-        let is_dirty = node.flags.is_lod_dirty();
+
+        result[level as usize].push((node_idx, offset));
+
+        let child_size = 1i32 << (level - 1);
         let children_mask = node.children_mask;
         let data_index = node.data_index;
 
-        // Recurse into children first (bottom-up)
-        let child_size = 1i32 << (level - 1);
         for octant in 0..8u8 {
             if children_mask & (1 << octant) != 0 {
                 let before = (children_mask & ((1 << octant) - 1)).count_ones();
@@ -559,89 +566,9 @@ impl VoxelOctree {
                     offset.y + ((octant >> 1) & 1) as i32 * child_size,
                     offset.z + ((octant >> 2) & 1) as i32 * child_size,
                 );
-                self.process_dirty_lods_recursive(child_idx, child_offset, level - 1, regenerated);
+                Self::collect_internal_nodes(nodes, child_idx, child_offset, level - 1, result);
             }
         }
-
-        if !is_dirty {
-            return;
-        }
-
-        // Collect children's data for LOD building (re-read node since tree may have been modified)
-        let node = &self.nodes[node_idx as usize];
-        let mut children_data: [Option<VoxelData>; 8] = Default::default();
-
-        for octant in 0..8u8 {
-            if node.has_child(octant) {
-                let child_idx = node.child_index(octant).unwrap();
-                let child = &self.nodes[child_idx as usize];
-
-                if child.flags.is_leaf() {
-                    if child.flags.is_homogeneous() {
-                        children_data[octant as usize] = Some(VoxelData::Homogeneous(child.homogeneous_value));
-                    } else if child.flags.is_loaded() {
-                        children_data[octant as usize] = self.voxel_data.get(child.data_index as usize).cloned();
-                    }
-                } else {
-                    // Internal node — use its LOD data if available
-                    if child.lod_data_index != u32::MAX {
-                        children_data[octant as usize] = self.voxel_data.get(child.lod_data_index as usize).cloned();
-                    } else if child.flags.is_homogeneous() {
-                        children_data[octant as usize] = Some(VoxelData::Homogeneous(child.homogeneous_value));
-                    }
-                }
-            }
-        }
-
-        // Build LOD data from children
-        let children_refs: [Option<&VoxelData>; 8] = [
-            children_data[0].as_ref(),
-            children_data[1].as_ref(),
-            children_data[2].as_ref(),
-            children_data[3].as_ref(),
-            children_data[4].as_ref(),
-            children_data[5].as_ref(),
-            children_data[6].as_ref(),
-            children_data[7].as_ref(),
-        ];
-
-        let lod_data = build_lod_from_children(&children_refs);
-
-        // Store the LOD data
-        let node = &mut self.nodes[node_idx as usize];
-        if let Some(value) = lod_data.is_homogeneous() {
-            node.flags.set_homogeneous(true);
-            node.homogeneous_value = value;
-            // Free old LOD data if any
-            if node.lod_data_index != u32::MAX {
-                self.free_data_indices.push(node.lod_data_index);
-                node.lod_data_index = u32::MAX;
-            }
-        } else {
-            node.flags.set_homogeneous(false);
-            if node.lod_data_index != u32::MAX {
-                self.voxel_data[node.lod_data_index as usize] = lod_data;
-            } else if let Some(idx) = self.free_data_indices.pop() {
-                self.voxel_data[idx as usize] = lod_data;
-                node.lod_data_index = idx;
-            } else {
-                let idx = self.voxel_data.len() as u32;
-                self.voxel_data.push(lod_data);
-                node.lod_data_index = idx;
-            }
-        }
-
-        node.flags.set_lod_dirty(false);
-
-        // Build the LodNodeKey for this node
-        // Convert offset (in [0, size) space) back to world chunk position, then to LOD-level coords
-        let key = LodNodeKey::new(
-            (offset.x + self.world_min.x) >> level,
-            (offset.y + self.world_min.y) >> level,
-            (offset.z + self.world_min.z) >> level,
-            level,
-        );
-        regenerated.push(key);
     }
 
     /// Get LOD data for a specific LodNodeKey.
@@ -666,61 +593,6 @@ impl VoxelOctree {
         } else {
             None
         }
-    }
-}
-
-/// Iterator over loaded chunks in the octree
-struct LoadedChunkIterator<'a> {
-    octree: &'a VoxelOctree,
-    stack: Vec<(u32, IVec3, u8)>, // (node_idx, offset, level)
-}
-
-impl<'a> LoadedChunkIterator<'a> {
-    fn new(octree: &'a VoxelOctree) -> Self {
-        let mut iter = Self {
-            octree,
-            stack: Vec::new(),
-        };
-        iter.stack.push((octree.root, IVec3::ZERO, octree.depth));
-        iter
-    }
-}
-
-impl<'a> Iterator for LoadedChunkIterator<'a> {
-    type Item = ChunkPosition;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some((node_idx, offset, level)) = self.stack.pop() {
-            let node = &self.octree.nodes[node_idx as usize];
-
-            if node.flags.is_leaf() {
-                if level == 0 && node.flags.is_loaded() {
-                    return Some(ChunkPosition::new(
-                        offset.x + self.octree.world_min.x,
-                        offset.y + self.octree.world_min.y,
-                        offset.z + self.octree.world_min.z,
-                    ));
-                }
-                continue;
-            }
-
-            let child_size = 1i32 << (level - 1);
-
-            // Push children in reverse order so we process them in order
-            for octant in (0..8u8).rev() {
-                if node.has_child(octant) {
-                    let child_idx = node.child_index(octant).unwrap();
-                    let child_offset = IVec3::new(
-                        offset.x + (octant & 1) as i32 * child_size,
-                        offset.y + ((octant >> 1) & 1) as i32 * child_size,
-                        offset.z + ((octant >> 2) & 1) as i32 * child_size,
-                    );
-                    self.stack.push((child_idx, child_offset, level - 1));
-                }
-            }
-        }
-
-        None
     }
 }
 

@@ -1,36 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
-
-use super::position::ChunkPosition;
+use super::position::{ChunkPosition, RegionCoord};
 use crate::voxel::Voxel;
 use crate::voxel::chunk::{AIR, Chunk};
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct WorldMetadata {
-    pub name: String,
-    pub spawn_position: [f32; 3],
-}
-
-impl Default for WorldMetadata {
-    fn default() -> Self {
-        Self {
-            name: "Untitled".to_string(),
-            spawn_position: [1.0, 1.25, 1.0], // In world coordinates (scaled by VOXEL_SCALE)
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct WorldData {
-    pub metadata: WorldMetadata,
-    pub chunks: HashMap<ChunkPosition, Chunk>,
-}
 
 pub struct ChunkManager {
     chunks: HashMap<ChunkPosition, Chunk>,
     dirty_chunks: HashSet<ChunkPosition>,
-    metadata: WorldMetadata,
 }
 
 impl ChunkManager {
@@ -38,19 +14,11 @@ impl ChunkManager {
         Self {
             chunks: HashMap::new(),
             dirty_chunks: HashSet::new(),
-            metadata: WorldMetadata::default(),
         }
     }
 
-    pub fn with_metadata(name: impl Into<String>, spawn: [f32; 3]) -> Self {
-        Self {
-            chunks: HashMap::new(),
-            dirty_chunks: HashSet::new(),
-            metadata: WorldMetadata {
-                name: name.into(),
-                spawn_position: spawn,
-            },
-        }
+    pub fn with_metadata(_name: impl Into<String>, _spawn: [f32; 3]) -> Self {
+        Self::new()
     }
 
     /// Get a voxel at world coordinates. Returns AIR if out of bounds or chunk doesn't exist.
@@ -61,59 +29,6 @@ impl ChunkManager {
             .get(&chunk_pos)
             .map(|chunk| chunk.get(lx, ly, lz))
             .unwrap_or(AIR)
-    }
-
-    /// Set a voxel at world coordinates. Creates chunk if needed, marks it dirty.
-    pub fn set_voxel(&mut self, wx: i32, wy: i32, wz: i32, voxel: Voxel) {
-        let (chunk_pos, lx, ly, lz) = ChunkPosition::world_to_local(wx, wy, wz);
-
-        let chunk = self.chunks.entry(chunk_pos).or_insert_with(Chunk::new);
-        chunk.set(lx, ly, lz, voxel);
-        self.dirty_chunks.insert(chunk_pos);
-
-        // Mark neighboring chunks dirty if at chunk boundary (for mesh updates)
-        if lx == 0 {
-            self.dirty_chunks.insert(ChunkPosition::new(
-                chunk_pos.x - 1,
-                chunk_pos.y,
-                chunk_pos.z,
-            ));
-        }
-        if lx == 31 {
-            self.dirty_chunks.insert(ChunkPosition::new(
-                chunk_pos.x + 1,
-                chunk_pos.y,
-                chunk_pos.z,
-            ));
-        }
-        if ly == 0 {
-            self.dirty_chunks.insert(ChunkPosition::new(
-                chunk_pos.x,
-                chunk_pos.y - 1,
-                chunk_pos.z,
-            ));
-        }
-        if ly == 31 {
-            self.dirty_chunks.insert(ChunkPosition::new(
-                chunk_pos.x,
-                chunk_pos.y + 1,
-                chunk_pos.z,
-            ));
-        }
-        if lz == 0 {
-            self.dirty_chunks.insert(ChunkPosition::new(
-                chunk_pos.x,
-                chunk_pos.y,
-                chunk_pos.z - 1,
-            ));
-        }
-        if lz == 31 {
-            self.dirty_chunks.insert(ChunkPosition::new(
-                chunk_pos.x,
-                chunk_pos.y,
-                chunk_pos.z + 1,
-            ));
-        }
     }
 
     /// Check if a voxel is solid at world coordinates
@@ -138,7 +53,7 @@ impl ChunkManager {
 
         // Apply updates per chunk
         for (chunk_pos, updates) in chunk_updates {
-            let chunk = self.chunks.entry(chunk_pos).or_insert_with(Chunk::new);
+            let chunk = self.chunks.entry(chunk_pos).or_default();
 
             let mut has_boundary_x_low = false;
             let mut has_boundary_x_high = false;
@@ -224,12 +139,6 @@ impl ChunkManager {
         self.chunks.get(&pos)
     }
 
-    /// Get a mutable reference to a chunk at the given position
-    pub fn get_chunk_mut(&mut self, pos: ChunkPosition) -> Option<&mut Chunk> {
-        self.dirty_chunks.insert(pos);
-        self.chunks.get_mut(&pos)
-    }
-
     /// Insert a chunk at the given position
     pub fn insert_chunk(&mut self, pos: ChunkPosition, chunk: Chunk) {
         self.chunks.insert(pos, chunk);
@@ -262,11 +171,14 @@ impl ChunkManager {
         std::mem::take(&mut self.dirty_chunks)
     }
 
-    /// Mark all chunks as dirty
-    pub fn mark_all_dirty(&mut self) {
-        for pos in self.chunks.keys() {
-            self.dirty_chunks.insert(*pos);
-        }
+    /// Mark a single chunk as dirty (needs mesh rebuild)
+    pub fn mark_chunk_dirty(&mut self, pos: ChunkPosition) {
+        self.dirty_chunks.insert(pos);
+    }
+
+    /// Clear dirty flag for a single chunk (e.g. after streaming mesh was just built)
+    pub fn clear_chunk_dirty(&mut self, pos: ChunkPosition) {
+        self.dirty_chunks.remove(&pos);
     }
 
     /// Get the bounding box of occupied chunks (min, max)
@@ -290,43 +202,43 @@ impl ChunkManager {
         Some((min, max))
     }
 
-    /// Get world metadata
-    pub fn metadata(&self) -> &WorldMetadata {
-        &self.metadata
-    }
-
-    /// Set spawn position
-    pub fn set_spawn(&mut self, spawn: [f32; 3]) {
-        self.metadata.spawn_position = spawn;
-    }
-
-    /// Get spawn position
-    pub fn spawn_position(&self) -> [f32; 3] {
-        self.metadata.spawn_position
-    }
-
-    /// Convert to serializable WorldData
-    pub fn to_world_data(&self) -> WorldData {
-        WorldData {
-            metadata: self.metadata.clone(),
-            chunks: self.chunks.clone(),
-        }
-    }
-
-    /// Create from WorldData
-    pub fn from_world_data(data: WorldData) -> Self {
-        let mut manager = Self {
-            chunks: data.chunks,
-            dirty_chunks: HashSet::new(),
-            metadata: data.metadata,
-        };
-        manager.mark_all_dirty();
-        manager
-    }
-
     /// Get the number of chunks
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+}
+
+impl ChunkManager {
+    /// Collect all chunks belonging to a region (borrows).
+    pub fn chunks_in_region(&self, coord: RegionCoord) -> Vec<(ChunkPosition, &Chunk)> {
+        let min_x = coord.rx * super::position::REGION_SIZE;
+        let max_x = min_x + super::position::REGION_SIZE;
+        let min_z = coord.rz * super::position::REGION_SIZE;
+        let max_z = min_z + super::position::REGION_SIZE;
+        self.chunks
+            .iter()
+            .filter(|(pos, _)| pos.x >= min_x && pos.x < max_x && pos.z >= min_z && pos.z < max_z)
+            .map(|(pos, chunk)| (*pos, chunk))
+            .collect()
+    }
+
+    /// Remove all chunks in a region, returning their positions for mesh cleanup.
+    pub fn remove_region_chunks(&mut self, coord: RegionCoord) -> Vec<ChunkPosition> {
+        let min_x = coord.rx * super::position::REGION_SIZE;
+        let max_x = min_x + super::position::REGION_SIZE;
+        let min_z = coord.rz * super::position::REGION_SIZE;
+        let max_z = min_z + super::position::REGION_SIZE;
+        let to_remove: Vec<ChunkPosition> = self
+            .chunks
+            .keys()
+            .filter(|pos| pos.x >= min_x && pos.x < max_x && pos.z >= min_z && pos.z < max_z)
+            .copied()
+            .collect();
+        for pos in &to_remove {
+            self.chunks.remove(pos);
+            self.dirty_chunks.remove(pos);
+        }
+        to_remove
     }
 }
 

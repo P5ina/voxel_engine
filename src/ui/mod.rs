@@ -13,26 +13,20 @@ pub struct EguiRenderer {
 }
 
 impl EguiRenderer {
-    pub fn new(
-        device: &wgpu::Device,
-        output_format: wgpu::TextureFormat,
-        window: &Window,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, output_format: wgpu::TextureFormat, window: &Window) -> Self {
         let ctx = egui::Context::default();
 
         // Dark style
-        let mut style = egui::Style::default();
-        style.visuals = egui::Visuals::dark();
-        ctx.set_style(style);
+        ctx.set_style(egui::Style {
+            visuals: egui::Visuals::dark(),
+            ..Default::default()
+        });
 
         let viewport_id = ctx.viewport_id();
         let state = egui_winit::State::new(ctx.clone(), viewport_id, window, None, None, None);
 
-        let renderer = egui_wgpu::Renderer::new(
-            device,
-            output_format,
-            egui_wgpu::RendererOptions::default(),
-        );
+        let renderer =
+            egui_wgpu::Renderer::new(device, output_format, egui_wgpu::RendererOptions::default());
 
         Self {
             ctx,
@@ -68,9 +62,7 @@ impl EguiRenderer {
         self.state
             .handle_platform_output(window, output.platform_output);
 
-        let tris = self
-            .ctx
-            .tessellate(output.shapes, output.pixels_per_point);
+        let tris = self.ctx.tessellate(output.shapes, output.pixels_per_point);
 
         for (id, delta) in &output.textures_delta.set {
             self.renderer.update_texture(device, queue, *id, delta);

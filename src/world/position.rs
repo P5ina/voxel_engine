@@ -1,6 +1,12 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::voxel::chunk::CHUNK_SIZE;
+
+/// Size of a region in chunks along X and Z axes.
+/// Each region covers REGION_SIZE x WORLD_HEIGHT x REGION_SIZE chunks.
+pub const REGION_SIZE: i32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkPosition {
@@ -74,22 +80,7 @@ pub struct LodNodeKey {
 
 impl LodNodeKey {
     pub fn new(x: i32, y: i32, z: i32, lod_level: u8) -> Self {
-        Self {
-            x,
-            y,
-            z,
-            lod_level,
-        }
-    }
-
-    /// Map a chunk position to the LOD node that contains it at a given level.
-    pub fn from_chunk_pos(pos: ChunkPosition, lod_level: u8) -> Self {
-        Self {
-            x: pos.x >> lod_level,
-            y: pos.y >> lod_level,
-            z: pos.z >> lod_level,
-            lod_level,
-        }
+        Self { x, y, z, lod_level }
     }
 
     /// World-space origin (minimum corner) in voxel coordinates.
@@ -143,5 +134,46 @@ impl LodNodeKey {
             }
         }
         positions
+    }
+}
+
+/// Identifies a region (16x16 chunk column in XZ, full Y height).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RegionCoord {
+    pub rx: i32,
+    pub rz: i32,
+}
+
+impl RegionCoord {
+    pub fn new(rx: i32, rz: i32) -> Self {
+        Self { rx, rz }
+    }
+
+    /// Derive region coordinate from a chunk position.
+    pub fn from_chunk_pos(pos: ChunkPosition) -> Self {
+        Self {
+            rx: pos.x.div_euclid(REGION_SIZE),
+            rz: pos.z.div_euclid(REGION_SIZE),
+        }
+    }
+
+    /// Region file name (e.g. `r_0_0.region`).
+    pub fn file_name(&self) -> String {
+        format!("r_{}_{}.region", self.rx, self.rz)
+    }
+
+    /// Full path to this region file within a world directory.
+    pub fn file_path(&self, world_dir: &std::path::Path) -> PathBuf {
+        world_dir.join("regions").join(self.file_name())
+    }
+
+    /// Center of this region in world-space (meters), for distance calculations.
+    pub fn center_world_pos(&self) -> (f32, f32) {
+        use crate::voxel::chunk::VOXEL_SCALE;
+        let half = REGION_SIZE as f32 * CHUNK_SIZE as f32 / 2.0;
+        (
+            (self.rx as f32 * REGION_SIZE as f32 * CHUNK_SIZE as f32 + half) * VOXEL_SCALE,
+            (self.rz as f32 * REGION_SIZE as f32 * CHUNK_SIZE as f32 + half) * VOXEL_SCALE,
+        )
     }
 }

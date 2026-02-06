@@ -1,6 +1,7 @@
 /// Depth buffer for 3D rendering
 pub struct DepthBuffer {
-    pub texture: wgpu::Texture,
+    /// Kept alive so `view` remains valid.
+    _texture: wgpu::Texture,
     pub view: wgpu::TextureView,
 }
 
@@ -27,7 +28,10 @@ impl DepthBuffer {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Self { texture, view }
+        Self {
+            _texture: texture,
+            view,
+        }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {

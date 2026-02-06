@@ -8,8 +8,6 @@ use crate::model::{AnimationPlayer, LoadedModel, SkeletonState};
 
 /// A remote player's character (seen in multiplayer)
 pub struct RemotePlayer {
-    /// Player ID
-    pub id: u64,
     /// Model
     pub model: Arc<LoadedModel>,
     /// Current skeleton state
@@ -29,30 +27,6 @@ pub struct RemotePlayer {
 }
 
 impl RemotePlayer {
-    pub fn new(id: u64, model: Arc<LoadedModel>) -> Self {
-        let skeleton_state = model
-            .skeleton
-            .as_ref()
-            .map(|s| SkeletonState::from_skeleton(s));
-
-        let mut animation_player = AnimationPlayer::new();
-        for clip in &model.animations {
-            animation_player.add_clip(clip.clone());
-        }
-
-        Self {
-            id,
-            model,
-            skeleton_state,
-            animation_player,
-            position: Vec3::ZERO,
-            rotation: Quat::IDENTITY,
-            scale: 1.0,
-            target_position: Vec3::ZERO,
-            target_rotation: Quat::IDENTITY,
-        }
-    }
-
     /// Update animation, skeleton, and interpolation
     pub fn update(&mut self, dt: f32) {
         // Interpolate position and rotation
@@ -65,25 +39,6 @@ impl RemotePlayer {
         if let (Some(skeleton), Some(state)) = (&self.model.skeleton, &mut self.skeleton_state) {
             self.animation_player.update(dt, skeleton, state);
         }
-    }
-
-    /// Set target position (from network update)
-    pub fn set_target(&mut self, position: Vec3, rotation: Quat) {
-        self.target_position = position;
-        self.target_rotation = rotation;
-    }
-
-    /// Teleport to position (no interpolation)
-    pub fn teleport(&mut self, position: Vec3, rotation: Quat) {
-        self.position = position;
-        self.target_position = position;
-        self.rotation = rotation;
-        self.target_rotation = rotation;
-    }
-
-    /// Play an animation by name
-    pub fn play_animation(&mut self, name: &str) {
-        self.animation_player.play_by_name(name);
     }
 
     /// Get the transformation matrix

@@ -28,95 +28,6 @@ impl BvhBuilder {
         self.triangles.push(triangle);
     }
 
-    /// Add triangles from vertices (assumes triangle list)
-    pub fn add_triangles_from_vertices(
-        &mut self,
-        vertices: &[[f32; 3]],
-        normals: &[[f32; 3]],
-        uvs: &[[f32; 2]],
-        material_id: u32,
-        texture_id: u32,
-    ) {
-        for i in (0..vertices.len()).step_by(3) {
-            if i + 2 < vertices.len() {
-                let v0 = Vec3::from(vertices[i]);
-                let v1 = Vec3::from(vertices[i + 1]);
-                let v2 = Vec3::from(vertices[i + 2]);
-
-                let mut tri = Triangle::new(v0, v1, v2);
-
-                if i < normals.len() {
-                    tri.normal = Vec3::from(normals[i]).normalize_or_zero();
-                }
-
-                if i < uvs.len() {
-                    tri.uv0 = uvs[i];
-                    tri.uv1 = uvs.get(i + 1).copied().unwrap_or([1.0, 0.0]);
-                    tri.uv2 = uvs.get(i + 2).copied().unwrap_or([0.0, 1.0]);
-                }
-
-                tri.material_id = material_id;
-                tri.texture_id = texture_id;
-
-                self.add_triangle(tri);
-            }
-        }
-    }
-
-    /// Build the BVH tree
-    pub fn build(&mut self) -> Option<BvhNode> {
-        if self.triangles.is_empty() {
-            return None;
-        }
-
-        // Create index array
-        let mut indices: Vec<usize> = (0..self.triangles.len()).collect();
-
-        Some(self.build_recursive(&mut indices, 0, self.triangles.len()))
-    }
-
-    fn build_recursive(&self, indices: &mut [usize], start: usize, end: usize) -> BvhNode {
-        let count = end - start;
-
-        // Calculate bounds for this subset
-        let mut bounds = Aabb::empty();
-        for &idx in &indices[start..end] {
-            bounds.expand_aabb(&self.triangles[idx].bounds());
-        }
-
-        // Create leaf if few enough triangles
-        if count <= MAX_LEAF_SIZE {
-            return BvhNode::Leaf {
-                bounds,
-                first_triangle: start as u32,
-                triangle_count: count as u32,
-            };
-        }
-
-        // Find best split using SAH
-        let (split_axis, split_pos) = self.find_best_split(indices, start, end, &bounds);
-
-        // Partition triangles
-        let mid = self.partition(indices, start, end, split_axis, split_pos);
-
-        // Handle degenerate cases
-        let mid = if mid == start || mid == end {
-            start + count / 2
-        } else {
-            mid
-        };
-
-        // Recursively build children
-        let left = Box::new(self.build_recursive(indices, start, mid));
-        let right = Box::new(self.build_recursive(indices, mid, end));
-
-        BvhNode::Interior {
-            bounds,
-            left,
-            right,
-        }
-    }
-
     fn find_best_split(
         &self,
         indices: &[usize],
@@ -222,7 +133,7 @@ impl BvhBuilder {
         let mut gpu_nodes: Vec<GpuBvhNode> = Vec::new();
 
         // Pass indices to flatten so it can look up real triangle indices
-        self.flatten_to_gpu_with_indices(&root, &mut gpu_nodes, &mut triangle_order, &indices);
+        flatten_to_gpu_with_indices(&root, &mut gpu_nodes, &mut triangle_order, &indices);
 
         // Create GPU triangles in the new order
         let gpu_triangles: Vec<GpuTriangle> = triangle_order
@@ -295,138 +206,67 @@ impl BvhBuilder {
             right,
         })
     }
+}
 
-    fn flatten_to_gpu(
-        &self,
-        node: &BvhNode,
-        gpu_nodes: &mut Vec<GpuBvhNode>,
-        triangle_order: &mut Vec<usize>,
-    ) -> u32 {
-        let node_index = gpu_nodes.len() as u32;
+fn flatten_to_gpu_with_indices(
+    node: &BvhNode,
+    gpu_nodes: &mut Vec<GpuBvhNode>,
+    triangle_order: &mut Vec<usize>,
+    indices: &[usize],
+) -> u32 {
+    let node_index = gpu_nodes.len() as u32;
 
-        match node {
-            BvhNode::Leaf {
-                bounds,
-                first_triangle,
-                triangle_count,
-            } => {
-                let first_gpu_tri = triangle_order.len() as u32;
+    match node {
+        BvhNode::Leaf {
+            bounds,
+            first_triangle,
+            triangle_count,
+        } => {
+            let first_gpu_tri = triangle_order.len() as u32;
 
-                // Add triangles to the order
-                for i in 0..*triangle_count {
-                    triangle_order.push((*first_triangle + i) as usize);
-                }
-
-                gpu_nodes.push(GpuBvhNode::leaf(
-                    bounds.min.to_array(),
-                    bounds.max.to_array(),
-                    first_gpu_tri,
-                    *triangle_count,
-                ));
+            // Add REAL triangle indices from the reordered indices array
+            let start = *first_triangle as usize;
+            for i in 0..*triangle_count as usize {
+                // indices[start + i] gives us the real triangle index
+                triangle_order.push(indices[start + i]);
             }
-            BvhNode::Interior {
-                bounds,
-                left,
-                right,
-            } => {
-                // Reserve space for this node
-                gpu_nodes.push(GpuBvhNode::interior(
-                    bounds.min.to_array(),
-                    bounds.max.to_array(),
-                    0,
-                    0,
-                ));
 
-                // Build children
-                let left_index = self.flatten_to_gpu(left, gpu_nodes, triangle_order);
-                let right_index = self.flatten_to_gpu(right, gpu_nodes, triangle_order);
-
-                // Update this node with child indices
-                gpu_nodes[node_index as usize] = GpuBvhNode::interior(
-                    bounds.min.to_array(),
-                    bounds.max.to_array(),
-                    left_index,
-                    right_index,
-                );
-            }
+            gpu_nodes.push(GpuBvhNode::leaf(
+                bounds.min.to_array(),
+                bounds.max.to_array(),
+                first_gpu_tri,
+                *triangle_count,
+            ));
         }
+        BvhNode::Interior {
+            bounds,
+            left,
+            right,
+        } => {
+            // Reserve space for this node
+            gpu_nodes.push(GpuBvhNode::interior(
+                bounds.min.to_array(),
+                bounds.max.to_array(),
+                0,
+                0,
+            ));
 
-        node_index
-    }
+            // Build children
+            let left_index = flatten_to_gpu_with_indices(left, gpu_nodes, triangle_order, indices);
+            let right_index =
+                flatten_to_gpu_with_indices(right, gpu_nodes, triangle_order, indices);
 
-    fn flatten_to_gpu_with_indices(
-        &self,
-        node: &BvhNode,
-        gpu_nodes: &mut Vec<GpuBvhNode>,
-        triangle_order: &mut Vec<usize>,
-        indices: &[usize], // The reordered indices array from build
-    ) -> u32 {
-        let node_index = gpu_nodes.len() as u32;
-
-        match node {
-            BvhNode::Leaf {
-                bounds,
-                first_triangle,
-                triangle_count,
-            } => {
-                let first_gpu_tri = triangle_order.len() as u32;
-
-                // Add REAL triangle indices from the reordered indices array
-                let start = *first_triangle as usize;
-                for i in 0..*triangle_count as usize {
-                    // indices[start + i] gives us the real triangle index
-                    triangle_order.push(indices[start + i]);
-                }
-
-                gpu_nodes.push(GpuBvhNode::leaf(
-                    bounds.min.to_array(),
-                    bounds.max.to_array(),
-                    first_gpu_tri,
-                    *triangle_count,
-                ));
-            }
-            BvhNode::Interior {
-                bounds,
-                left,
-                right,
-            } => {
-                // Reserve space for this node
-                gpu_nodes.push(GpuBvhNode::interior(
-                    bounds.min.to_array(),
-                    bounds.max.to_array(),
-                    0,
-                    0,
-                ));
-
-                // Build children
-                let left_index =
-                    self.flatten_to_gpu_with_indices(left, gpu_nodes, triangle_order, indices);
-                let right_index =
-                    self.flatten_to_gpu_with_indices(right, gpu_nodes, triangle_order, indices);
-
-                // Update this node with child indices
-                gpu_nodes[node_index as usize] = GpuBvhNode::interior(
-                    bounds.min.to_array(),
-                    bounds.max.to_array(),
-                    left_index,
-                    right_index,
-                );
-            }
+            // Update this node with child indices
+            gpu_nodes[node_index as usize] = GpuBvhNode::interior(
+                bounds.min.to_array(),
+                bounds.max.to_array(),
+                left_index,
+                right_index,
+            );
         }
-
-        node_index
     }
 
-    /// Get the number of triangles
-    pub fn triangle_count(&self) -> usize {
-        self.triangles.len()
-    }
-
-    /// Clear all triangles
-    pub fn clear(&mut self) {
-        self.triangles.clear();
-        self.centroids.clear();
-    }
+    node_index
 }
 
 impl Default for BvhBuilder {

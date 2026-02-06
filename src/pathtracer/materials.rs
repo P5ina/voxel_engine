@@ -238,11 +238,11 @@ impl Palette {
         materials[160] = Material::new([0.65, 0.6, 0.55], 0.45, [0.0, 0.0, 0.0], 0.7); // Weathered metal
 
         // Fill remaining slots (161-254) with a gradient spectrum
-        for i in 161..255 {
+        for (i, material) in materials.iter_mut().enumerate().take(255).skip(161) {
             let t = (i - 161) as f32 / 93.0;
             // HSV-like hue rotation
             let (r, g, b) = hsv_to_rgb(t * 360.0, 0.7, 0.8);
-            materials[i] = Material::color(r, g, b);
+            *material = Material::color(r, g, b);
         }
 
         // Index 255: Light (emissive)
@@ -253,10 +253,6 @@ impl Palette {
 
     pub fn get(&self, index: u8) -> &Material {
         &self.materials[index as usize]
-    }
-
-    pub fn get_mut(&mut self, index: u8) -> &mut Material {
-        &mut self.materials[index as usize]
     }
 
     pub fn as_slice(&self) -> &[Material] {
@@ -286,43 +282,3 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 
     (r + m, g + m, b + m)
 }
-
-// Legacy constant for backward compatibility
-pub const BLOCK_MATERIALS: [Material; 6] = [
-    Material {
-        albedo: [0.0, 0.0, 0.0],
-        roughness: 1.0,
-        emission: [0.0, 0.0, 0.0],
-        metallic: 0.0,
-    },
-    Material {
-        albedo: [0.55, 0.35, 0.2],
-        roughness: 1.0,
-        emission: [0.0, 0.0, 0.0],
-        metallic: 0.0,
-    },
-    Material {
-        albedo: [0.5, 0.5, 0.5],
-        roughness: 0.0,
-        emission: [0.0, 0.0, 0.0],
-        metallic: 1.0,
-    },
-    Material {
-        albedo: [0.3, 0.6, 0.2],
-        roughness: 1.0,
-        emission: [0.0, 0.0, 0.0],
-        metallic: 0.0,
-    },
-    Material {
-        albedo: [1.0, 0.95, 0.8],
-        roughness: 1.0,
-        emission: [10.0, 9.0, 7.0],
-        metallic: 0.0,
-    },
-    Material {
-        albedo: [1.0, 0.5, 0.0],
-        roughness: 0.8,
-        emission: [0.0, 0.0, 0.0],
-        metallic: 0.0,
-    },
-];

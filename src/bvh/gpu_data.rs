@@ -13,7 +13,7 @@ use bytemuck::{Pod, Zeroable};
 /// If (right_or_count & 0x80000000) != 0, this is a leaf node:
 ///   - left_or_first = first triangle index
 ///   - right_or_count & 0x7FFFFFFF = triangle count
-/// Otherwise, this is an interior node:
+///     Otherwise, this is an interior node:
 ///   - left_or_first = left child index
 ///   - right_or_count = right child index
 #[repr(C)]
@@ -58,16 +58,6 @@ impl GpuBvhNode {
             right_or_count: triangle_count | Self::LEAF_FLAG,
         }
     }
-
-    /// Check if this is a leaf node
-    pub fn is_leaf(&self) -> bool {
-        (self.right_or_count & Self::LEAF_FLAG) != 0
-    }
-
-    /// Get triangle count (only valid for leaf nodes)
-    pub fn triangle_count(&self) -> u32 {
-        self.right_or_count & !Self::LEAF_FLAG
-    }
 }
 
 /// GPU triangle (48 bytes for efficiency, padded to 64 for alignment)
@@ -96,6 +86,7 @@ pub struct GpuTriangle {
 
 impl GpuTriangle {
     /// Create a GPU triangle from vertices
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         v0: [f32; 3],
         v1: [f32; 3],
@@ -130,7 +121,7 @@ impl GpuTriangle {
 
 /// Character parameters for the GPU
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, Default)]
 pub struct CharacterParams {
     /// Number of BVH nodes
     pub node_count: u32,
@@ -139,15 +130,4 @@ pub struct CharacterParams {
     /// Whether characters are enabled
     pub enabled: u32,
     pub _padding: u32,
-}
-
-impl Default for CharacterParams {
-    fn default() -> Self {
-        Self {
-            node_count: 0,
-            triangle_count: 0,
-            enabled: 0,
-            _padding: 0,
-        }
-    }
 }

@@ -56,28 +56,14 @@ pub fn load_glb<P: AsRef<Path>>(path: P) -> Result<LoadedModel, LoadError> {
     load_from_gltf(document, buffers, images, name)
 }
 
-/// Load a GLTF file (with separate .bin and textures)
-pub fn load_gltf<P: AsRef<Path>>(path: P) -> Result<LoadedModel, LoadError> {
-    let path = path.as_ref();
-    let (document, buffers, images) = gltf::import(path)?;
-
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    load_from_gltf(document, buffers, images, name)
-}
-
 /// Load model from parsed GLTF data
 fn load_from_gltf(
     document: gltf::Document,
     buffers: Vec<gltf::buffer::Data>,
     images: Vec<gltf::image::Data>,
-    name: String,
+    _name: String,
 ) -> Result<LoadedModel, LoadError> {
-    let mut model = LoadedModel::new(name);
+    let mut model = LoadedModel::new();
 
     // Load textures
     for image in images {
@@ -274,7 +260,7 @@ fn create_skeleton_from_nodes(
         parent_joint_idx: Option<usize>,
         skeleton: &mut Skeleton,
         node_to_joint: &mut std::collections::HashMap<usize, usize>,
-        document: &gltf::Document,
+        _document: &gltf::Document,
     ) {
         let name = node.name().unwrap_or("").to_string();
 
@@ -298,7 +284,7 @@ fn create_skeleton_from_nodes(
 
         // Recurse to children
         for child in node.children() {
-            add_node_recursive(&child, Some(joint_idx), skeleton, node_to_joint, document);
+            add_node_recursive(&child, Some(joint_idx), skeleton, node_to_joint, _document);
         }
     }
 
@@ -317,12 +303,6 @@ fn create_skeleton_from_nodes(
     (skeleton, node_to_joint)
 }
 
-/// Compute world transform for a single node
-fn compute_node_world_transform(document: &gltf::Document, node_idx: usize) -> Mat4 {
-    let transforms = compute_node_world_transforms(document);
-    transforms.get(&node_idx).copied().unwrap_or(Mat4::IDENTITY)
-}
-
 /// Load animation with node-based joint mapping (for Blockbench models)
 fn load_animation_for_nodes(
     animation: &gltf::Animation,
@@ -336,14 +316,14 @@ fn load_animation_for_nodes(
     // Check extras for loop information (Blockbench exports this)
     if let Some(extras) = animation.extras().as_ref() {
         let extras_str = extras.get();
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(extras_str) {
-            if let Some(loop_val) = json.get("loop") {
-                clip.looping = match loop_val {
-                    serde_json::Value::Bool(b) => *b,
-                    serde_json::Value::String(s) => s == "loop" || s == "true",
-                    _ => clip.looping,
-                };
-            }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(extras_str)
+            && let Some(loop_val) = json.get("loop")
+        {
+            clip.looping = match loop_val {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => s == "loop" || s == "true",
+                _ => clip.looping,
+            };
         }
     }
 
@@ -632,113 +612,6 @@ fn load_primitive(
     mesh.material_index = material.index();
 
     Ok(mesh)
-}
-
-/// Load an animation
-fn load_animation(
-    animation: &gltf::Animation,
-    buffers: &[gltf::buffer::Data],
-    skin_joint_map: &[usize],
-) -> Result<AnimationClip, LoadError> {
-    let name = animation.name().unwrap_or("animation").to_string();
-    let mut clip = AnimationClip::new(name);
-
-    for channel in animation.channels() {
-        let target = channel.target();
-        let node_index = target.node().index();
-
-        // Find the joint index in our skeleton
-        let joint_index = skin_joint_map
-            .iter()
-            .position(|&idx| idx == node_index)
-            .unwrap_or(0);
-
-        let sampler = channel.sampler();
-        let reader = channel.reader(|buffer| Some(&buffers[buffer.index()]));
-
-        // Read input (times)
-        let times: Vec<f32> = reader
-            .read_inputs()
-            .ok_or_else(|| LoadError::InvalidData("Missing animation times".to_string()))?
-            .collect();
-
-        // Read outputs based on property
-        let interpolation = match sampler.interpolation() {
-            gltf::animation::Interpolation::Step => Interpolation::Step,
-            gltf::animation::Interpolation::Linear => Interpolation::Linear,
-            gltf::animation::Interpolation::CubicSpline => Interpolation::CubicSpline,
-        };
-
-        let keyframes: Vec<Keyframe> = match target.property() {
-            gltf::animation::Property::Translation => {
-                let outputs = reader.read_outputs().ok_or_else(|| {
-                    LoadError::InvalidData("Missing translation outputs".to_string())
-                })?;
-
-                if let gltf::animation::util::ReadOutputs::Translations(iter) = outputs {
-                    times
-                        .iter()
-                        .zip(iter)
-                        .map(|(&time, translation)| Keyframe {
-                            time,
-                            value: KeyframeValue::Translation(Vec3::from(translation)),
-                        })
-                        .collect()
-                } else {
-                    continue;
-                }
-            }
-            gltf::animation::Property::Rotation => {
-                let outputs = reader.read_outputs().ok_or_else(|| {
-                    LoadError::InvalidData("Missing rotation outputs".to_string())
-                })?;
-
-                if let gltf::animation::util::ReadOutputs::Rotations(iter) = outputs {
-                    times
-                        .iter()
-                        .zip(iter.into_f32())
-                        .map(|(&time, rotation)| Keyframe {
-                            time,
-                            value: KeyframeValue::Rotation(Quat::from_array(rotation)),
-                        })
-                        .collect()
-                } else {
-                    continue;
-                }
-            }
-            gltf::animation::Property::Scale => {
-                let outputs = reader
-                    .read_outputs()
-                    .ok_or_else(|| LoadError::InvalidData("Missing scale outputs".to_string()))?;
-
-                if let gltf::animation::util::ReadOutputs::Scales(iter) = outputs {
-                    times
-                        .iter()
-                        .zip(iter)
-                        .map(|(&time, scale)| Keyframe {
-                            time,
-                            value: KeyframeValue::Scale(Vec3::from(scale)),
-                        })
-                        .collect()
-                } else {
-                    continue;
-                }
-            }
-            gltf::animation::Property::MorphTargetWeights => {
-                // Skip morph targets for now
-                continue;
-            }
-        };
-
-        clip.channels.push(AnimationChannel {
-            joint_index,
-            keyframes,
-            interpolation,
-        });
-    }
-
-    clip.calculate_duration();
-    Ok(clip)
 }
 
 /// Read Mat4 values from an accessor

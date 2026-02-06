@@ -5,7 +5,6 @@ use super::chunk::VOXEL_SCALE;
 pub struct RaycastHit {
     pub block_pos: [i32; 3],
     pub normal: [i32; 3],
-    pub distance: f32,
 }
 
 /// DDA raycasting algorithm to find the first solid voxel hit
@@ -94,7 +93,6 @@ where
             return Some(RaycastHit {
                 block_pos: [x, y, z],
                 normal,
-                distance,
             });
         }
 

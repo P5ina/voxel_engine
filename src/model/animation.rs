@@ -232,12 +232,12 @@ impl AnimationPlayer {
     pub fn play_by_name_restart(&mut self, name: &str) -> bool {
         if let Some(idx) = self.clips.iter().position(|c| c.name == name) {
             // Save current animation for blending
-            if let Some(current) = self.current_clip {
-                if self.playing {
-                    self.prev_clip = Some(current);
-                    self.prev_time = self.time;
-                    self.blend_factor = 0.0;
-                }
+            if let Some(current) = self.current_clip
+                && self.playing
+            {
+                self.prev_clip = Some(current);
+                self.prev_time = self.time;
+                self.blend_factor = 0.0;
             }
 
             // Force restart - reset time
@@ -248,27 +248,6 @@ impl AnimationPlayer {
         } else {
             false
         }
-    }
-
-    /// Set blend duration for transitions
-    pub fn set_blend_duration(&mut self, duration: f32) {
-        self.blend_duration = duration;
-    }
-
-    /// Stop playback
-    pub fn stop(&mut self) {
-        self.playing = false;
-        self.time = 0.0;
-    }
-
-    /// Pause playback
-    pub fn pause(&mut self) {
-        self.playing = false;
-    }
-
-    /// Resume playback
-    pub fn resume(&mut self) {
-        self.playing = true;
     }
 
     /// Update the animation player
@@ -289,7 +268,7 @@ impl AnimationPlayer {
         // Handle looping or clamping based on clip's looping setting
         if self.time >= clip.duration {
             if clip.looping {
-                self.time = self.time % clip.duration;
+                self.time %= clip.duration;
             } else {
                 self.time = clip.duration;
                 self.playing = false;
@@ -306,7 +285,7 @@ impl AnimationPlayer {
                 self.prev_time += dt * self.speed;
                 if self.prev_time >= prev_clip.duration {
                     if prev_clip.looping {
-                        self.prev_time = self.prev_time % prev_clip.duration;
+                        self.prev_time %= prev_clip.duration;
                     } else {
                         // Non-looping: clamp to final frame
                         self.prev_time = prev_clip.duration;
@@ -350,27 +329,6 @@ impl AnimationPlayer {
             // No blending, just sample current animation
             clip.sample(self.time, skeleton, state);
         }
-    }
-
-    /// Get the current animation name
-    pub fn current_animation_name(&self) -> Option<&str> {
-        self.current_clip
-            .and_then(|idx| self.clips.get(idx))
-            .map(|c| c.name.as_str())
-    }
-
-    /// Get normalized progress (0.0 to 1.0)
-    pub fn progress(&self) -> f32 {
-        self.current_clip
-            .and_then(|idx| self.clips.get(idx))
-            .map(|c| {
-                if c.duration > 0.0 {
-                    self.time / c.duration
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0)
     }
 }
 
