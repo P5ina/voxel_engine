@@ -2,16 +2,16 @@ pub mod gbuffer;
 pub mod materials;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
 use crate::ui::LightingMode;
-use crate::voxel::{Chunk, CHUNK_SIZE};
+use crate::voxel::{CHUNK_SIZE, Chunk, VOXEL_SCALE};
 use crate::world::ChunkManager;
 
 pub use gbuffer::GBuffer;
-pub use materials::{Material, BLOCK_MATERIALS};
+pub use materials::Palette;
 
 /// Denoise parameters uniform
 #[repr(C)]
@@ -55,12 +55,12 @@ impl Default for PathTracerParams {
             camera_up: [0.0, 1.0, 0.0],
             accumulated_frames: 0,
             camera_right: [1.0, 0.0, 0.0],
-            max_bounces: 12,
+            max_bounces: 4,
             camera_forward: [0.0, 0.0, -1.0],
-            voxel_size: 1.0,
+            voxel_size: VOXEL_SCALE,
             volume_min: [0.0; 3],
             screen_width: 800,
-            volume_max: [32.0; 3],
+            volume_max: [32.0 * VOXEL_SCALE; 3],
             screen_height: 600,
             sun_direction: [0.5, 1.0, 0.3],
             sun_intensity: 1.0,
@@ -197,8 +197,7 @@ pub struct PathTracer {
     // State
     pub frame_index: u32,
     pub accumulated_frames: u32,
-    pub prev_camera_position: Vec3,
-    pub prev_camera_forward: Vec3,
+    pub prev_view_proj: Mat4,
     pub width: u32,
     pub height: u32,
 }
@@ -228,10 +227,11 @@ impl PathTracer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Create materials buffer
+        // Create materials buffer with full 256-color palette
+        let palette = Palette::new();
         let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Materials Buffer"),
-            contents: bytemuck::cast_slice(&BLOCK_MATERIALS),
+            contents: bytemuck::cast_slice(palette.as_slice()),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -274,7 +274,11 @@ impl PathTracer {
         let (pathtrace_bind_group_layout, pathtrace_pipeline) =
             Self::create_pathtrace_pipeline(device, character_bind_group_layout);
 
-        let direct_pipeline = Self::create_direct_pipeline(device, &pathtrace_bind_group_layout, character_bind_group_layout);
+        let direct_pipeline = Self::create_direct_pipeline(
+            device,
+            &pathtrace_bind_group_layout,
+            character_bind_group_layout,
+        );
 
         let (accumulate_bind_group_layout, accumulate_pipeline) =
             Self::create_accumulate_pipeline(device);
@@ -384,8 +388,7 @@ impl PathTracer {
             tonemap_sampler,
             frame_index: 0,
             accumulated_frames: 0,
-            prev_camera_position: Vec3::ZERO,
-            prev_camera_forward: Vec3::NEG_Z,
+            prev_view_proj: Mat4::IDENTITY,
             width,
             height,
             world_size: (CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE),
@@ -401,11 +404,10 @@ impl PathTracer {
         use crate::renderer::Vertex;
 
         // G-buffer doesn't need extra bind group (uses camera + texture)
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("GBuffer Bind Group Layout"),
-                entries: &[],
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GBuffer Bind Group Layout"),
+            entries: &[],
+        });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_gbuffer.wgsl"));
 
@@ -481,89 +483,88 @@ impl PathTracer {
         device: &wgpu::Device,
         character_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("PathTrace Bind Group Layout"),
-                entries: &[
-                    // Params uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PathTrace Bind Group Layout"),
+            entries: &[
+                // Params uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // Materials buffer
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Materials buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // Voxel texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D3,
-                            sample_type: wgpu::TextureSampleType::Uint,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Voxel texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        sample_type: wgpu::TextureSampleType::Uint,
                     },
-                    // G-buffer position
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // G-buffer position
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // G-buffer normal
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // G-buffer normal
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // G-buffer albedo
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // G-buffer albedo
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // Output texture (write)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba32Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Output texture (write)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_pathtrace.wgsl"));
 
@@ -611,56 +612,55 @@ impl PathTracer {
     fn create_accumulate_pipeline(
         device: &wgpu::Device,
     ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Accumulate Bind Group Layout"),
-                entries: &[
-                    // Params uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Accumulate Bind Group Layout"),
+            entries: &[
+                // Params uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // Current frame (read only)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Current frame (read only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // History (read only)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // History (read only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // Output (write only)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba32Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Output (write only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_accumulate.wgsl"));
 
@@ -685,67 +685,66 @@ impl PathTracer {
     fn create_denoise_pipeline(
         device: &wgpu::Device,
     ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Denoise Bind Group Layout"),
-                entries: &[
-                    // Params uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Denoise Bind Group Layout"),
+            entries: &[
+                // Params uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // Color input
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Color input
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // Normal
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Normal
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // Position
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Position
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // Output
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba32Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
+                    count: None,
+                },
+                // Output
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_denoise.wgsl"));
 
@@ -771,7 +770,12 @@ impl PathTracer {
         device: &wgpu::Device,
         width: u32,
         height: u32,
-    ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView) {
+    ) -> (
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+    ) {
         let create_texture = |label: &str| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -813,40 +817,57 @@ impl PathTracer {
         // Pass 2: pong -> ping (step 4)
         // Final result in ping
 
-        let create_bind_group =
-            |label: &str, params: &wgpu::Buffer, input: &wgpu::TextureView, output: &wgpu::TextureView| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(input),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(output),
-                        },
-                    ],
-                })
-            };
+        let create_bind_group = |label: &str,
+                                 params: &wgpu::Buffer,
+                                 input: &wgpu::TextureView,
+                                 output: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(input),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(output),
+                    },
+                ],
+            })
+        };
 
         [
-            create_bind_group("Denoise Pass 0 (accum->ping)", &params_buffers[0], accum_output_view, ping_view),
-            create_bind_group("Denoise Pass 1 (ping->pong)", &params_buffers[1], ping_view, pong_view),
-            create_bind_group("Denoise Pass 2 (pong->ping)", &params_buffers[2], pong_view, ping_view),
+            create_bind_group(
+                "Denoise Pass 0 (accum->ping)",
+                &params_buffers[0],
+                accum_output_view,
+                ping_view,
+            ),
+            create_bind_group(
+                "Denoise Pass 1 (ping->pong)",
+                &params_buffers[1],
+                ping_view,
+                pong_view,
+            ),
+            create_bind_group(
+                "Denoise Pass 2 (pong->ping)",
+                &params_buffers[2],
+                pong_view,
+                ping_view,
+            ),
         ]
     }
 
@@ -854,41 +875,40 @@ impl PathTracer {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
     ) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Tonemap Bind Group Layout"),
-                entries: &[
-                    // Input texture (Rgba32Float is not filterable)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Tonemap Bind Group Layout"),
+            entries: &[
+                // Input texture (Rgba32Float is not filterable)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
-                    // Sampler (non-filtering)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
+                    count: None,
+                },
+                // Sampler (non-filtering)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                // Params
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    // Params
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_tonemap.wgsl"));
 
@@ -1156,7 +1176,12 @@ impl PathTracer {
     }
 
     /// Update voxels from a multi-chunk world
-    pub fn update_world_voxels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, world: &ChunkManager) {
+    pub fn update_world_voxels(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        world: &ChunkManager,
+    ) {
         // Get world bounds
         let Some((min, max)) = world.bounds() else {
             return;
@@ -1170,6 +1195,21 @@ impl PathTracer {
         let size_x = chunks_x * CHUNK_SIZE;
         let size_y = chunks_y * CHUNK_SIZE;
         let size_z = chunks_z * CHUNK_SIZE;
+
+        // GPU texture size limit (most GPUs support at least 2048)
+        const MAX_TEXTURE_SIZE: usize = 2048;
+
+        // Skip path tracer voxel texture update if world is too large
+        if size_x > MAX_TEXTURE_SIZE || size_y > MAX_TEXTURE_SIZE || size_z > MAX_TEXTURE_SIZE {
+            log::warn!(
+                "[PathTracer] World too large for voxel texture ({}x{}x{}), max is {}. Path tracing disabled for this world.",
+                size_x,
+                size_y,
+                size_z,
+                MAX_TEXTURE_SIZE
+            );
+            return;
+        }
 
         // Check if we need to resize the voxel texture
         let needs_resize = size_x != self.world_size.0
@@ -1193,7 +1233,9 @@ impl PathTracer {
                 view_formats: &[],
             });
 
-            self.voxel_view = self.voxel_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.voxel_view = self
+                .voxel_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
             self.world_size = (size_x, size_y, size_z);
             self.world_origin = (
                 min.x * CHUNK_SIZE as i32,
@@ -1268,6 +1310,86 @@ impl PathTracer {
         );
     }
 
+    /// Update only specific chunks (incremental update - much faster)
+    pub fn update_chunks(
+        &mut self,
+        queue: &wgpu::Queue,
+        world: &ChunkManager,
+        dirty_chunks: &std::collections::HashSet<super::world::ChunkPosition>,
+    ) {
+        let Some((min, _max)) = world.bounds() else {
+            return;
+        };
+
+        let (_size_x, _size_y, _size_z) = self.world_size;
+
+        for chunk_pos in dirty_chunks {
+            let Some(chunk) = world.get_chunk(*chunk_pos) else {
+                continue;
+            };
+
+            // Calculate chunk offset in the voxel texture
+            let chunk_offset_x = ((chunk_pos.x - min.x) as usize) * CHUNK_SIZE;
+            let chunk_offset_y = ((chunk_pos.y - min.y) as usize) * CHUNK_SIZE;
+            let chunk_offset_z = ((chunk_pos.z - min.z) as usize) * CHUNK_SIZE;
+
+            // Create chunk data
+            let mut data = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    for z in 0..CHUNK_SIZE {
+                        let block = chunk.get(x, y, z);
+                        // Layout: x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE
+                        let idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE;
+                        data[idx] = block as u8;
+                    }
+                }
+            }
+
+            // Upload only this chunk's region
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.voxel_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: chunk_offset_x as u32,
+                        y: chunk_offset_y as u32,
+                        z: chunk_offset_z as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(CHUNK_SIZE as u32),
+                    rows_per_image: Some(CHUNK_SIZE as u32),
+                },
+                wgpu::Extent3d {
+                    width: CHUNK_SIZE as u32,
+                    height: CHUNK_SIZE as u32,
+                    depth_or_array_layers: CHUNK_SIZE as u32,
+                },
+            );
+        }
+    }
+
+    /// Check if world bounds changed (need full rebuild)
+    pub fn needs_resize(&self, world: &ChunkManager) -> bool {
+        let Some((min, max)) = world.bounds() else {
+            return false;
+        };
+
+        let chunks_x = (max.x - min.x + 1) as usize;
+        let chunks_y = (max.y - min.y + 1) as usize;
+        let chunks_z = (max.z - min.z + 1) as usize;
+
+        let size_x = chunks_x * CHUNK_SIZE;
+        let size_y = chunks_y * CHUNK_SIZE;
+        let size_z = chunks_z * CHUNK_SIZE;
+
+        size_x != self.world_size.0 || size_y != self.world_size.1 || size_z != self.world_size.2
+    }
+
     pub fn update_params(
         &mut self,
         queue: &wgpu::Queue,
@@ -1275,27 +1397,26 @@ impl PathTracer {
         sun_direction: [f32; 3],
         sun_intensity: f32,
         sun_color: [f32; 3],
+        is_moving: bool,
     ) {
-        let camera_position = camera.position;
-        let camera_forward = camera.forward();
+        // Calculate view-projection matrix (must match G-buffer render)
+        let view_proj = camera.view_projection_matrix();
 
-        // Check if camera moved
-        let pos_delta = (camera_position - self.prev_camera_position).length();
-        let dir_delta = (camera_forward - self.prev_camera_forward).length();
+        // Check if view changed by comparing matrices
+        let matrix_changed = view_proj.to_cols_array_2d() != self.prev_view_proj.to_cols_array_2d();
 
-        if pos_delta > 0.001 || dir_delta > 0.001 {
+        if matrix_changed || is_moving {
             self.accumulated_frames = 0;
         }
 
-        self.prev_camera_position = camera_position;
-        self.prev_camera_forward = camera_forward;
+        self.prev_view_proj = view_proj;
 
         // Calculate camera vectors
+        let camera_position = camera.position;
+        let camera_forward = camera.forward();
         let right = camera.right();
         let up = camera_forward.cross(right).normalize();
 
-        // Calculate inverse view-projection matrix
-        let view_proj = camera.view_projection_matrix();
         let inv_view_proj = view_proj.inverse();
 
         self.params = PathTracerParams {
@@ -1305,19 +1426,19 @@ impl PathTracer {
             camera_up: up.to_array(),
             accumulated_frames: self.accumulated_frames,
             camera_right: right.to_array(),
-            max_bounces: 12,
+            max_bounces: 4,
             camera_forward: camera_forward.to_array(),
-            voxel_size: 1.0,
+            voxel_size: VOXEL_SCALE,
             volume_min: [
-                self.world_origin.0 as f32,
-                self.world_origin.1 as f32,
-                self.world_origin.2 as f32,
+                self.world_origin.0 as f32 * VOXEL_SCALE,
+                self.world_origin.1 as f32 * VOXEL_SCALE,
+                self.world_origin.2 as f32 * VOXEL_SCALE,
             ],
             screen_width: self.width,
             volume_max: [
-                (self.world_origin.0 + self.world_size.0 as i32) as f32,
-                (self.world_origin.1 + self.world_size.1 as i32) as f32,
-                (self.world_origin.2 + self.world_size.2 as i32) as f32,
+                (self.world_origin.0 + self.world_size.0 as i32) as f32 * VOXEL_SCALE,
+                (self.world_origin.1 + self.world_size.1 as i32) as f32 * VOXEL_SCALE,
+                (self.world_origin.2 + self.world_size.2 as i32) as f32 * VOXEL_SCALE,
             ],
             screen_height: self.height,
             sun_direction,
@@ -1326,11 +1447,7 @@ impl PathTracer {
             _padding: 0,
         };
 
-        queue.write_buffer(
-            &self.params_buffer,
-            0,
-            bytemuck::cast_slice(&[self.params]),
-        );
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
 
         self.frame_index = self.frame_index.wrapping_add(1);
         self.accumulated_frames += 1;
@@ -1344,7 +1461,7 @@ impl PathTracer {
         camera_bind_group: &wgpu::BindGroup,
         texture_bind_group: &wgpu::BindGroup,
         character_bind_group: &wgpu::BindGroup,
-        meshes: impl Iterator<Item = (&'a wgpu::Buffer, u32)>,
+        meshes: impl Iterator<Item = (&'a wgpu::Buffer, u32, u32)>,
         lighting_mode: LightingMode,
     ) {
         // Pass 1: G-buffer
@@ -1410,9 +1527,9 @@ impl PathTracer {
             render_pass.set_bind_group(0, camera_bind_group, &[]);
             render_pass.set_bind_group(1, texture_bind_group, &[]);
 
-            for (vertex_buffer, num_vertices) in meshes {
+            for (vertex_buffer, num_vertices, lod_level) in meshes {
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                render_pass.draw(0..num_vertices, 0..1);
+                render_pass.draw(0..num_vertices, lod_level..lod_level + 1);
             }
         }
 

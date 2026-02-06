@@ -5,7 +5,3 @@
 pub mod builder;
 pub mod gpu_data;
 pub mod node;
-
-pub use builder::BvhBuilder;
-pub use gpu_data::{GpuBvhNode, GpuTriangle};
-pub use node::{Aabb, BvhNode};

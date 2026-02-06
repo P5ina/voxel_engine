@@ -20,7 +20,14 @@ impl HeldItem {
     /// Get mesh names to hide for this item (all other items)
     pub fn hidden_meshes(&self) -> &'static [&'static str] {
         match self {
-            HeldItem::None => &["item_pickaxe", "item_pistol", "item_sword", "pick", "pistol", "sword"],
+            HeldItem::None => &[
+                "item_pickaxe",
+                "item_pistol",
+                "item_sword",
+                "pick",
+                "pistol",
+                "sword",
+            ],
             HeldItem::Pickaxe => &["item_pistol", "item_sword", "pistol", "sword"],
             HeldItem::Pistol => &["item_pickaxe", "item_sword", "pick", "sword"],
             HeldItem::Sword => &["item_pickaxe", "item_pistol", "pick", "pistol"],
@@ -44,6 +51,16 @@ impl HeldItem {
             HeldItem::Pickaxe => "pickaxe_walk",
             HeldItem::Pistol => "pistol_walk",
             HeldItem::Sword => "sword_walk",
+        }
+    }
+
+    /// Get run animation name for this item
+    pub fn run_animation(&self) -> &'static str {
+        match self {
+            HeldItem::None => "run",
+            HeldItem::Pickaxe => "pickaxe_run",
+            HeldItem::Pistol => "pistol_run",
+            HeldItem::Sword => "sword_run",
         }
     }
 
@@ -84,6 +101,8 @@ pub struct FirstPersonView {
     is_attacking: bool,
     /// Is walking
     is_walking: bool,
+    /// Is sprinting
+    is_sprinting: bool,
     /// Debug: detach from camera to view in third person
     pub debug_detached: bool,
     /// Debug: saved position when detached
@@ -110,6 +129,7 @@ impl FirstPersonView {
             camera_shake_rot: Quat::IDENTITY,
             is_attacking: false,
             is_walking: false,
+            is_sprinting: false,
             debug_detached: false,
             debug_position: Vec3::ZERO,
             debug_rotation: Quat::IDENTITY,
@@ -160,7 +180,8 @@ impl FirstPersonView {
 
     /// Update which meshes are hidden based on held item
     fn update_item_visibility(&mut self) {
-        self.hidden_meshes = self.held_item
+        self.hidden_meshes = self
+            .held_item
             .hidden_meshes()
             .iter()
             .map(|s| s.to_string())
@@ -175,10 +196,12 @@ impl FirstPersonView {
     /// Play idle animation for current item
     pub fn play_idle(&mut self) {
         // Try item-specific idle first, fallback to generic
-        if !self.animation_player.play_by_name(self.held_item.idle_animation()) {
+        if !self
+            .animation_player
+            .play_by_name(self.held_item.idle_animation())
+        {
             self.animation_player.play_by_name("idle");
         }
-        self.animation_player.looping = true;
         self.is_attacking = false;
     }
 
@@ -188,48 +211,82 @@ impl FirstPersonView {
             return; // Don't interrupt attack
         }
 
-        if !self.animation_player.play_by_name(self.held_item.walk_animation()) {
+        if !self
+            .animation_player
+            .play_by_name(self.held_item.walk_animation())
+        {
             self.animation_player.play_by_name("walk");
         }
-        self.animation_player.looping = true;
     }
 
-    /// Play attack animation for current item
+    /// Play run animation for current item
+    pub fn play_run(&mut self) {
+        if self.is_attacking {
+            return; // Don't interrupt attack
+        }
+
+        if !self
+            .animation_player
+            .play_by_name(self.held_item.run_animation())
+        {
+            self.animation_player.play_by_name("run");
+        }
+    }
+
+    /// Play attack animation for current item (restarts on each call)
     pub fn play_attack(&mut self) {
-        if !self.animation_player.play_by_name(self.held_item.attack_animation()) {
+        if !self
+            .animation_player
+            .play_by_name_restart(self.held_item.attack_animation())
+        {
             // Fallback animations
             match self.held_item {
-                HeldItem::None => { self.animation_player.play_by_name("punch"); }
-                HeldItem::Pickaxe => { self.animation_player.play_by_name("swing"); }
-                HeldItem::Pistol => { self.animation_player.play_by_name("fire"); }
-                HeldItem::Sword => { self.animation_player.play_by_name("slash"); }
+                HeldItem::None => {
+                    self.animation_player.play_by_name_restart("punch");
+                }
+                HeldItem::Pickaxe => {
+                    self.animation_player.play_by_name_restart("swing");
+                }
+                HeldItem::Pistol => {
+                    self.animation_player.play_by_name_restart("fire");
+                }
+                HeldItem::Sword => {
+                    self.animation_player.play_by_name_restart("slash");
+                }
             }
         }
-        self.animation_player.looping = false;
         self.is_attacking = true;
     }
 
     /// Update animations and effects
-    pub fn update(&mut self, dt: f32, is_walking: bool, _mouse_delta: Vec3) {
+    pub fn update(&mut self, dt: f32, is_walking: bool, is_sprinting: bool, _mouse_delta: Vec3) {
         let was_walking = self.is_walking;
+        let was_sprinting = self.is_sprinting;
         self.is_walking = is_walking;
+        self.is_sprinting = is_sprinting;
 
         // Check if attack animation finished
         if self.is_attacking && !self.animation_player.playing {
             self.is_attacking = false;
-            if is_walking {
-                self.play_walk();
+            if is_walking && is_sprinting {
+                self.play_run();
+            } else if is_walking {
+                self.play_idle();
             } else {
                 self.play_idle();
             }
         }
 
-        // Switch between walk/idle if not attacking
+        // Switch between idle/run if not attacking
+        // idle when standing still or walking, run when sprinting
         if !self.is_attacking {
-            if is_walking && !was_walking {
-                self.play_walk();
-            } else if !is_walking && was_walking {
-                self.play_idle();
+            let state_changed = is_walking != was_walking || is_sprinting != was_sprinting;
+            if state_changed {
+                if is_walking && is_sprinting {
+                    self.play_run();
+                } else {
+                    self.play_idle();
+                }
             }
         }
 

@@ -18,6 +18,20 @@ pub struct LoadedTexture {
     pub format: TextureFormat,
 }
 
+impl LoadedTexture {
+    /// Convert texture data to RGBA8 format
+    pub fn to_rgba(&self) -> Vec<u8> {
+        match self.format {
+            TextureFormat::Rgba8 => self.data.clone(),
+            TextureFormat::Rgb8 => self
+                .data
+                .chunks(3)
+                .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+                .collect(),
+        }
+    }
+}
+
 /// Vertex with skinning data for animated meshes
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]

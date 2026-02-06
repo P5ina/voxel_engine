@@ -1,18 +1,3 @@
-use serde::{Deserialize, Serialize};
-
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum BlockType {
-    #[default]
-    Air = 0,
-    Dirt = 1,
-    Stone = 2,
-    Grass = 3,
-    Light = 4,
-}
-
-impl BlockType {
-    pub fn is_solid(&self) -> bool {
-        !matches!(self, BlockType::Air)
-    }
-}
+/// Voxel type represented as a palette index (0-255).
+/// 0 = Air (empty), 1-254 = solid voxels with colors from palette, 255 = light.
+pub type Voxel = u8;

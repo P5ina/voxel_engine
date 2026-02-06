@@ -1,12 +1,15 @@
 use glam::Vec3;
 
+use super::chunk::VOXEL_SCALE;
+
 pub struct RaycastHit {
     pub block_pos: [i32; 3],
     pub normal: [i32; 3],
     pub distance: f32,
 }
 
-/// DDA raycasting algorithm to find the first solid block hit
+/// DDA raycasting algorithm to find the first solid voxel hit
+/// Works in world coordinates, returns voxel coordinates
 pub fn raycast<F>(
     origin: Vec3,
     direction: Vec3,
@@ -18,38 +21,65 @@ where
 {
     let dir = direction.normalize();
 
-    // Current block position
-    let mut x = origin.x.floor() as i32;
-    let mut y = origin.y.floor() as i32;
-    let mut z = origin.z.floor() as i32;
+    // Convert world origin to voxel coordinates
+    let voxel_origin = origin / VOXEL_SCALE;
+
+    // Current voxel position
+    let mut x = voxel_origin.x.floor() as i32;
+    let mut y = voxel_origin.y.floor() as i32;
+    let mut z = voxel_origin.z.floor() as i32;
 
     // Direction signs
     let step_x = if dir.x >= 0.0 { 1 } else { -1 };
     let step_y = if dir.y >= 0.0 { 1 } else { -1 };
     let step_z = if dir.z >= 0.0 { 1 } else { -1 };
 
-    // Distance to next block boundary for each axis
-    let t_delta_x = if dir.x != 0.0 { (1.0 / dir.x).abs() } else { f32::MAX };
-    let t_delta_y = if dir.y != 0.0 { (1.0 / dir.y).abs() } else { f32::MAX };
-    let t_delta_z = if dir.z != 0.0 { (1.0 / dir.z).abs() } else { f32::MAX };
+    // Distance to next voxel boundary for each axis (in world units)
+    let t_delta_x = if dir.x != 0.0 {
+        (VOXEL_SCALE / dir.x).abs()
+    } else {
+        f32::MAX
+    };
+    let t_delta_y = if dir.y != 0.0 {
+        (VOXEL_SCALE / dir.y).abs()
+    } else {
+        f32::MAX
+    };
+    let t_delta_z = if dir.z != 0.0 {
+        (VOXEL_SCALE / dir.z).abs()
+    } else {
+        f32::MAX
+    };
 
-    // Initial t values
+    // Initial t values (distance to first voxel boundary in world units)
     let mut t_max_x = if dir.x != 0.0 {
-        let boundary = if dir.x > 0.0 { (x + 1) as f32 } else { x as f32 };
+        let boundary = if dir.x > 0.0 {
+            (x + 1) as f32 * VOXEL_SCALE
+        } else {
+            x as f32 * VOXEL_SCALE
+        };
         (boundary - origin.x) / dir.x
     } else {
         f32::MAX
     };
 
     let mut t_max_y = if dir.y != 0.0 {
-        let boundary = if dir.y > 0.0 { (y + 1) as f32 } else { y as f32 };
+        let boundary = if dir.y > 0.0 {
+            (y + 1) as f32 * VOXEL_SCALE
+        } else {
+            y as f32 * VOXEL_SCALE
+        };
         (boundary - origin.y) / dir.y
     } else {
         f32::MAX
     };
 
     let mut t_max_z = if dir.z != 0.0 {
-        let boundary = if dir.z > 0.0 { (z + 1) as f32 } else { z as f32 };
+        let boundary = if dir.z > 0.0 {
+            (z + 1) as f32 * VOXEL_SCALE
+        } else {
+            z as f32 * VOXEL_SCALE
+        };
         (boundary - origin.z) / dir.z
     } else {
         f32::MAX

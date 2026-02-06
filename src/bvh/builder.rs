@@ -212,7 +212,8 @@ impl BvhBuilder {
         // Create index array - this gets reordered by build_recursive
         let mut indices: Vec<usize> = (0..self.triangles.len()).collect();
 
-        let Some(root) = self.build_recursive_with_indices(&mut indices, 0, self.triangles.len()) else {
+        let Some(root) = self.build_recursive_with_indices(&mut indices, 0, self.triangles.len())
+        else {
             return (Vec::new(), Vec::new());
         };
 
@@ -245,7 +246,12 @@ impl BvhBuilder {
         (gpu_nodes, gpu_triangles)
     }
 
-    fn build_recursive_with_indices(&self, indices: &mut [usize], start: usize, end: usize) -> Option<BvhNode> {
+    fn build_recursive_with_indices(
+        &self,
+        indices: &mut [usize],
+        start: usize,
+        end: usize,
+    ) -> Option<BvhNode> {
         let count = end - start;
         if count == 0 {
             return None;
@@ -261,7 +267,7 @@ impl BvhBuilder {
         if count <= MAX_LEAF_SIZE {
             return Some(BvhNode::Leaf {
                 bounds,
-                first_triangle: start as u32,  // Index into indices array
+                first_triangle: start as u32, // Index into indices array
                 triangle_count: count as u32,
             });
         }
@@ -353,7 +359,7 @@ impl BvhBuilder {
         node: &BvhNode,
         gpu_nodes: &mut Vec<GpuBvhNode>,
         triangle_order: &mut Vec<usize>,
-        indices: &[usize],  // The reordered indices array from build
+        indices: &[usize], // The reordered indices array from build
     ) -> u32 {
         let node_index = gpu_nodes.len() as u32;
 
@@ -393,8 +399,10 @@ impl BvhBuilder {
                 ));
 
                 // Build children
-                let left_index = self.flatten_to_gpu_with_indices(left, gpu_nodes, triangle_order, indices);
-                let right_index = self.flatten_to_gpu_with_indices(right, gpu_nodes, triangle_order, indices);
+                let left_index =
+                    self.flatten_to_gpu_with_indices(left, gpu_nodes, triangle_order, indices);
+                let right_index =
+                    self.flatten_to_gpu_with_indices(right, gpu_nodes, triangle_order, indices);
 
                 // Update this node with child indices
                 gpu_nodes[node_index as usize] = GpuBvhNode::interior(

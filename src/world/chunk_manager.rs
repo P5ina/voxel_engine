@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::position::ChunkPosition;
-use crate::voxel::block::BlockType;
-use crate::voxel::chunk::Chunk;
+use crate::voxel::Voxel;
+use crate::voxel::chunk::{AIR, Chunk};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WorldMetadata {
@@ -16,7 +16,7 @@ impl Default for WorldMetadata {
     fn default() -> Self {
         Self {
             name: "Untitled".to_string(),
-            spawn_position: [16.0, 20.0, 16.0],
+            spawn_position: [1.0, 1.25, 1.0], // In world coordinates (scaled by VOXEL_SCALE)
         }
     }
 }
@@ -53,53 +53,170 @@ impl ChunkManager {
         }
     }
 
-    /// Get a block at world coordinates. Returns Air if out of bounds or chunk doesn't exist.
-    pub fn get_block(&self, wx: i32, wy: i32, wz: i32) -> BlockType {
+    /// Get a voxel at world coordinates. Returns AIR if out of bounds or chunk doesn't exist.
+    #[inline]
+    pub fn get_voxel(&self, wx: i32, wy: i32, wz: i32) -> Voxel {
         let (chunk_pos, lx, ly, lz) = ChunkPosition::world_to_local(wx, wy, wz);
         self.chunks
             .get(&chunk_pos)
             .map(|chunk| chunk.get(lx, ly, lz))
-            .unwrap_or(BlockType::Air)
+            .unwrap_or(AIR)
     }
 
-    /// Set a block at world coordinates. Creates chunk if needed, marks it dirty.
-    pub fn set_block(&mut self, wx: i32, wy: i32, wz: i32, block: BlockType) {
+    /// Set a voxel at world coordinates. Creates chunk if needed, marks it dirty.
+    pub fn set_voxel(&mut self, wx: i32, wy: i32, wz: i32, voxel: Voxel) {
         let (chunk_pos, lx, ly, lz) = ChunkPosition::world_to_local(wx, wy, wz);
 
         let chunk = self.chunks.entry(chunk_pos).or_insert_with(Chunk::new);
-        chunk.set(lx, ly, lz, block);
+        chunk.set(lx, ly, lz, voxel);
         self.dirty_chunks.insert(chunk_pos);
 
         // Mark neighboring chunks dirty if at chunk boundary (for mesh updates)
         if lx == 0 {
-            self.dirty_chunks
-                .insert(ChunkPosition::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z));
+            self.dirty_chunks.insert(ChunkPosition::new(
+                chunk_pos.x - 1,
+                chunk_pos.y,
+                chunk_pos.z,
+            ));
         }
         if lx == 31 {
-            self.dirty_chunks
-                .insert(ChunkPosition::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z));
+            self.dirty_chunks.insert(ChunkPosition::new(
+                chunk_pos.x + 1,
+                chunk_pos.y,
+                chunk_pos.z,
+            ));
         }
         if ly == 0 {
-            self.dirty_chunks
-                .insert(ChunkPosition::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z));
+            self.dirty_chunks.insert(ChunkPosition::new(
+                chunk_pos.x,
+                chunk_pos.y - 1,
+                chunk_pos.z,
+            ));
         }
         if ly == 31 {
-            self.dirty_chunks
-                .insert(ChunkPosition::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z));
+            self.dirty_chunks.insert(ChunkPosition::new(
+                chunk_pos.x,
+                chunk_pos.y + 1,
+                chunk_pos.z,
+            ));
         }
         if lz == 0 {
-            self.dirty_chunks
-                .insert(ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1));
+            self.dirty_chunks.insert(ChunkPosition::new(
+                chunk_pos.x,
+                chunk_pos.y,
+                chunk_pos.z - 1,
+            ));
         }
         if lz == 31 {
-            self.dirty_chunks
-                .insert(ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1));
+            self.dirty_chunks.insert(ChunkPosition::new(
+                chunk_pos.x,
+                chunk_pos.y,
+                chunk_pos.z + 1,
+            ));
         }
     }
 
-    /// Check if a block is solid at world coordinates
+    /// Check if a voxel is solid at world coordinates
+    #[inline]
     pub fn is_solid(&self, wx: i32, wy: i32, wz: i32) -> bool {
-        self.get_block(wx, wy, wz).is_solid()
+        self.get_voxel(wx, wy, wz) != AIR
+    }
+
+    /// Set multiple voxels at once (batch operation, more efficient than individual set_voxel calls)
+    pub fn set_voxels_batch(&mut self, positions: &[(i32, i32, i32, Voxel)]) {
+        // Group positions by chunk
+        let mut chunk_updates: HashMap<ChunkPosition, Vec<(usize, usize, usize, Voxel)>> =
+            HashMap::new();
+
+        for &(wx, wy, wz, voxel) in positions {
+            let (chunk_pos, lx, ly, lz) = ChunkPosition::world_to_local(wx, wy, wz);
+            chunk_updates
+                .entry(chunk_pos)
+                .or_default()
+                .push((lx, ly, lz, voxel));
+        }
+
+        // Apply updates per chunk
+        for (chunk_pos, updates) in chunk_updates {
+            let chunk = self.chunks.entry(chunk_pos).or_insert_with(Chunk::new);
+
+            let mut has_boundary_x_low = false;
+            let mut has_boundary_x_high = false;
+            let mut has_boundary_y_low = false;
+            let mut has_boundary_y_high = false;
+            let mut has_boundary_z_low = false;
+            let mut has_boundary_z_high = false;
+
+            for (lx, ly, lz, voxel) in updates {
+                chunk.set(lx, ly, lz, voxel);
+
+                // Track boundary touches
+                if lx == 0 {
+                    has_boundary_x_low = true;
+                }
+                if lx == 31 {
+                    has_boundary_x_high = true;
+                }
+                if ly == 0 {
+                    has_boundary_y_low = true;
+                }
+                if ly == 31 {
+                    has_boundary_y_high = true;
+                }
+                if lz == 0 {
+                    has_boundary_z_low = true;
+                }
+                if lz == 31 {
+                    has_boundary_z_high = true;
+                }
+            }
+
+            self.dirty_chunks.insert(chunk_pos);
+
+            // Mark neighboring chunks dirty only once per boundary
+            if has_boundary_x_low {
+                self.dirty_chunks.insert(ChunkPosition::new(
+                    chunk_pos.x - 1,
+                    chunk_pos.y,
+                    chunk_pos.z,
+                ));
+            }
+            if has_boundary_x_high {
+                self.dirty_chunks.insert(ChunkPosition::new(
+                    chunk_pos.x + 1,
+                    chunk_pos.y,
+                    chunk_pos.z,
+                ));
+            }
+            if has_boundary_y_low {
+                self.dirty_chunks.insert(ChunkPosition::new(
+                    chunk_pos.x,
+                    chunk_pos.y - 1,
+                    chunk_pos.z,
+                ));
+            }
+            if has_boundary_y_high {
+                self.dirty_chunks.insert(ChunkPosition::new(
+                    chunk_pos.x,
+                    chunk_pos.y + 1,
+                    chunk_pos.z,
+                ));
+            }
+            if has_boundary_z_low {
+                self.dirty_chunks.insert(ChunkPosition::new(
+                    chunk_pos.x,
+                    chunk_pos.y,
+                    chunk_pos.z - 1,
+                ));
+            }
+            if has_boundary_z_high {
+                self.dirty_chunks.insert(ChunkPosition::new(
+                    chunk_pos.x,
+                    chunk_pos.y,
+                    chunk_pos.z + 1,
+                ));
+            }
+        }
     }
 
     /// Get a reference to a chunk at the given position

@@ -4,7 +4,9 @@ use std::path::Path;
 
 use glam::{Mat4, Quat, Vec3};
 
-use crate::model::animation::{AnimationChannel, AnimationClip, Interpolation, Keyframe, KeyframeValue};
+use crate::model::animation::{
+    AnimationChannel, AnimationClip, Interpolation, Keyframe, KeyframeValue,
+};
 use crate::model::mesh::{LoadedModel, LoadedTexture, MeshVertex, PolygonMesh, TextureFormat};
 use crate::model::skeleton::{Joint, JointTransform, Skeleton};
 
@@ -114,7 +116,10 @@ fn load_from_gltf(
         // Blockbench-style: create skeleton from node hierarchy
         let (skeleton, node_to_joint) = create_skeleton_from_nodes(&document);
         if !skeleton.joints.is_empty() {
-            log::info!("Created skeleton from node hierarchy with {} joints", skeleton.joints.len());
+            log::info!(
+                "Created skeleton from node hierarchy with {} joints",
+                skeleton.joints.len()
+            );
             skin_joint_map = node_to_joint.iter().map(|(&k, _)| k).collect();
             model.skeleton = Some(skeleton);
             use_node_skeleton = true;
@@ -127,7 +132,10 @@ fn load_from_gltf(
     // Load meshes by traversing nodes
     for node in document.nodes() {
         if let Some(mesh) = node.mesh() {
-            let world_transform = node_transforms.get(&node.index()).copied().unwrap_or(Mat4::IDENTITY);
+            let world_transform = node_transforms
+                .get(&node.index())
+                .copied()
+                .unwrap_or(Mat4::IDENTITY);
             let node_name = node.name().unwrap_or("").to_string();
 
             for primitive in mesh.primitives() {
@@ -136,7 +144,9 @@ fn load_from_gltf(
                 if use_node_skeleton {
                     // For Blockbench: find joint index for this node and assign to all vertices
                     if let Some(skeleton) = &model.skeleton {
-                        let joint_idx = skeleton.joints.iter()
+                        let joint_idx = skeleton
+                            .joints
+                            .iter()
                             .position(|j| j.name == node_name)
                             .unwrap_or(0) as u32;
 
@@ -162,12 +172,19 @@ fn load_from_gltf(
     }
 
     // Build node-to-joint map for animations
-    let node_to_joint_map: Vec<usize> = if use_node_skeleton {
-        document.nodes()
+    let _node_to_joint_map: Vec<usize> = if use_node_skeleton {
+        document
+            .nodes()
             .filter(|n| n.mesh().is_some())
             .map(|n| {
-                model.skeleton.as_ref()
-                    .and_then(|s| s.joints.iter().position(|j| j.name == n.name().unwrap_or("")))
+                model
+                    .skeleton
+                    .as_ref()
+                    .and_then(|s| {
+                        s.joints
+                            .iter()
+                            .position(|j| j.name == n.name().unwrap_or(""))
+                    })
                     .unwrap_or(0)
             })
             .collect()
@@ -177,7 +194,8 @@ fn load_from_gltf(
 
     // Load animations
     for animation in document.animations() {
-        let clip = load_animation_for_nodes(&animation, &buffers, &document, model.skeleton.as_ref())?;
+        let clip =
+            load_animation_for_nodes(&animation, &buffers, &document, model.skeleton.as_ref())?;
         model.animations.push(clip);
     }
 
@@ -185,15 +203,19 @@ fn load_from_gltf(
 }
 
 /// Compute world transforms for all nodes by traversing the hierarchy
-fn compute_node_world_transforms(document: &gltf::Document) -> std::collections::HashMap<usize, Mat4> {
+fn compute_node_world_transforms(
+    document: &gltf::Document,
+) -> std::collections::HashMap<usize, Mat4> {
     let mut transforms = std::collections::HashMap::new();
 
     // Find root nodes (nodes without parents)
-    let all_children: std::collections::HashSet<usize> = document.nodes()
+    let all_children: std::collections::HashSet<usize> = document
+        .nodes()
         .flat_map(|n| n.children().map(|c| c.index()))
         .collect();
 
-    let root_nodes: Vec<_> = document.nodes()
+    let root_nodes: Vec<_> = document
+        .nodes()
         .filter(|n| !all_children.contains(&n.index()))
         .collect();
 
@@ -230,9 +252,12 @@ fn node_to_mat4(node: &gltf::Node) -> Mat4 {
 }
 
 /// Create skeleton from node hierarchy (for Blockbench-style models without GLTF skin)
-fn create_skeleton_from_nodes(document: &gltf::Document) -> (Skeleton, std::collections::HashMap<usize, usize>) {
+fn create_skeleton_from_nodes(
+    document: &gltf::Document,
+) -> (Skeleton, std::collections::HashMap<usize, usize>) {
     let mut skeleton = Skeleton::new();
-    let mut node_to_joint: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut node_to_joint: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
 
     // Find parent relationships
     let mut parent_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -278,7 +303,8 @@ fn create_skeleton_from_nodes(document: &gltf::Document) -> (Skeleton, std::coll
     }
 
     // Find root nodes and start recursion
-    let all_children: std::collections::HashSet<usize> = document.nodes()
+    let all_children: std::collections::HashSet<usize> = document
+        .nodes()
         .flat_map(|n| n.children().map(|c| c.index()))
         .collect();
 
@@ -301,24 +327,44 @@ fn compute_node_world_transform(document: &gltf::Document, node_idx: usize) -> M
 fn load_animation_for_nodes(
     animation: &gltf::Animation,
     buffers: &[gltf::buffer::Data],
-    document: &gltf::Document,
+    _document: &gltf::Document,
     skeleton: Option<&Skeleton>,
 ) -> Result<AnimationClip, LoadError> {
     let name = animation.name().unwrap_or("animation").to_string();
     let mut clip = AnimationClip::new(name);
 
+    // Check extras for loop information (Blockbench exports this)
+    if let Some(extras) = animation.extras().as_ref() {
+        let extras_str = extras.get();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(extras_str) {
+            if let Some(loop_val) = json.get("loop") {
+                clip.looping = match loop_val {
+                    serde_json::Value::Bool(b) => *b,
+                    serde_json::Value::String(s) => s == "loop" || s == "true",
+                    _ => clip.looping,
+                };
+            }
+        }
+    }
+
     let Some(skeleton) = skeleton else {
         return Ok(clip);
     };
 
-    log::debug!("Loading animation '{}'", clip.name);
+    log::debug!(
+        "Loading animation '{}' (looping: {})",
+        clip.name,
+        clip.looping
+    );
 
     for channel in animation.channels() {
         let target = channel.target();
         let node_name = target.node().name().unwrap_or("");
 
         // Find joint by node name
-        let joint_index = skeleton.joints.iter()
+        let joint_index = skeleton
+            .joints
+            .iter()
             .position(|j| j.name == node_name)
             .unwrap_or(0);
 
@@ -340,9 +386,13 @@ fn load_animation_for_nodes(
 
         let keyframes: Vec<Keyframe> = match target.property() {
             gltf::animation::Property::Translation => {
-                let Some(outputs) = reader.read_outputs() else { continue };
+                let Some(outputs) = reader.read_outputs() else {
+                    continue;
+                };
                 if let gltf::animation::util::ReadOutputs::Translations(iter) = outputs {
-                    times.iter().zip(iter)
+                    times
+                        .iter()
+                        .zip(iter)
                         .map(|(&time, translation)| Keyframe {
                             time,
                             value: KeyframeValue::Translation(Vec3::from(translation)),
@@ -353,9 +403,13 @@ fn load_animation_for_nodes(
                 }
             }
             gltf::animation::Property::Rotation => {
-                let Some(outputs) = reader.read_outputs() else { continue };
+                let Some(outputs) = reader.read_outputs() else {
+                    continue;
+                };
                 if let gltf::animation::util::ReadOutputs::Rotations(iter) = outputs {
-                    times.iter().zip(iter.into_f32())
+                    times
+                        .iter()
+                        .zip(iter.into_f32())
                         .map(|(&time, rotation)| Keyframe {
                             time,
                             value: KeyframeValue::Rotation(Quat::from_array(rotation)),
@@ -366,9 +420,13 @@ fn load_animation_for_nodes(
                 }
             }
             gltf::animation::Property::Scale => {
-                let Some(outputs) = reader.read_outputs() else { continue };
+                let Some(outputs) = reader.read_outputs() else {
+                    continue;
+                };
                 if let gltf::animation::util::ReadOutputs::Scales(iter) = outputs {
-                    times.iter().zip(iter)
+                    times
+                        .iter()
+                        .zip(iter)
                         .map(|(&time, scale)| Keyframe {
                             time,
                             value: KeyframeValue::Scale(Vec3::from(scale)),
@@ -412,19 +470,17 @@ fn apply_transform_to_mesh(mesh: &mut PolygonMesh, transform: Mat4) {
 /// Convert image data to RGBA8 format
 fn convert_to_rgba(image: &gltf::image::Data) -> Vec<u8> {
     match image.format {
-        gltf::image::Format::R8 => {
-            image.pixels.iter().flat_map(|&r| [r, r, r, 255]).collect()
-        }
-        gltf::image::Format::R8G8 => {
-            image.pixels.chunks(2).flat_map(|rg| {
-                [rg[0], rg[0], rg[0], rg.get(1).copied().unwrap_or(255)]
-            }).collect()
-        }
-        gltf::image::Format::R8G8B8 => {
-            image.pixels.chunks(3).flat_map(|rgb| {
-                [rgb[0], rgb[1], rgb[2], 255]
-            }).collect()
-        }
+        gltf::image::Format::R8 => image.pixels.iter().flat_map(|&r| [r, r, r, 255]).collect(),
+        gltf::image::Format::R8G8 => image
+            .pixels
+            .chunks(2)
+            .flat_map(|rg| [rg[0], rg[0], rg[0], rg.get(1).copied().unwrap_or(255)])
+            .collect(),
+        gltf::image::Format::R8G8B8 => image
+            .pixels
+            .chunks(3)
+            .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+            .collect(),
         gltf::image::Format::R8G8B8A8 => image.pixels.clone(),
         _ => {
             // Fallback: just use as-is and hope for the best
@@ -434,10 +490,7 @@ fn convert_to_rgba(image: &gltf::image::Data) -> Vec<u8> {
 }
 
 /// Load skeleton from GLTF skin
-fn load_skeleton(
-    skin: &gltf::Skin,
-    buffers: &[gltf::buffer::Data],
-) -> Result<Skeleton, LoadError> {
+fn load_skeleton(skin: &gltf::Skin, buffers: &[gltf::buffer::Data]) -> Result<Skeleton, LoadError> {
     let mut skeleton = Skeleton::new();
 
     // Get inverse bind matrices
@@ -457,7 +510,10 @@ fn load_skeleton(
     for (i, joint_node) in joints.iter().enumerate() {
         for child in joint_node.children() {
             // Find if this child is in our joint list
-            if let Some(child_idx) = joint_node_indices.iter().position(|&idx| idx == child.index()) {
+            if let Some(child_idx) = joint_node_indices
+                .iter()
+                .position(|&idx| idx == child.index())
+            {
                 parent_map[child_idx] = Some(i);
             }
         }
@@ -554,7 +610,10 @@ fn load_primitive(
                 normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
                 uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                 joint_indices.get(i).copied().unwrap_or([0, 0, 0, 0]),
-                joint_weights.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]),
+                joint_weights
+                    .get(i)
+                    .copied()
+                    .unwrap_or([1.0, 0.0, 0.0, 0.0]),
             )
         })
         .collect();
@@ -612,9 +671,9 @@ fn load_animation(
 
         let keyframes: Vec<Keyframe> = match target.property() {
             gltf::animation::Property::Translation => {
-                let outputs = reader
-                    .read_outputs()
-                    .ok_or_else(|| LoadError::InvalidData("Missing translation outputs".to_string()))?;
+                let outputs = reader.read_outputs().ok_or_else(|| {
+                    LoadError::InvalidData("Missing translation outputs".to_string())
+                })?;
 
                 if let gltf::animation::util::ReadOutputs::Translations(iter) = outputs {
                     times
@@ -630,9 +689,9 @@ fn load_animation(
                 }
             }
             gltf::animation::Property::Rotation => {
-                let outputs = reader
-                    .read_outputs()
-                    .ok_or_else(|| LoadError::InvalidData("Missing rotation outputs".to_string()))?;
+                let outputs = reader.read_outputs().ok_or_else(|| {
+                    LoadError::InvalidData("Missing rotation outputs".to_string())
+                })?;
 
                 if let gltf::animation::util::ReadOutputs::Rotations(iter) = outputs {
                     times
@@ -703,7 +762,9 @@ fn read_accessor_mat4(
         let end = start + 64;
 
         if end > buffer.len() {
-            return Err(LoadError::InvalidData("Buffer overflow reading matrices".to_string()));
+            return Err(LoadError::InvalidData(
+                "Buffer overflow reading matrices".to_string(),
+            ));
         }
 
         let slice = &buffer[start..end];

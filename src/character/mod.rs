@@ -7,7 +7,4 @@ pub mod local_player;
 pub mod manager;
 pub mod remote_player;
 
-pub use first_person::FirstPersonView;
-pub use local_player::LocalPlayer;
 pub use manager::CharacterManager;
-pub use remote_player::RemotePlayer;

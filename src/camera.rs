@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 
 pub struct Camera {
     pub position: Vec3,
@@ -12,6 +12,10 @@ pub struct Camera {
     // Head bob
     bob_time: f32,
     bob_intensity: f32,
+
+    // Animation shake (from first-person model)
+    shake_offset: Vec3,
+    shake_rotation: Quat,
 }
 
 impl Camera {
@@ -38,7 +42,15 @@ impl Camera {
             far: 1000.0,
             bob_time: 0.0,
             bob_intensity: 0.0,
+            shake_offset: Vec3::ZERO,
+            shake_rotation: Quat::IDENTITY,
         }
+    }
+
+    /// Apply animation shake from first-person model
+    pub fn apply_shake(&mut self, offset: Vec3, rotation: Quat) {
+        self.shake_offset = offset;
+        self.shake_rotation = rotation;
     }
 
     /// Update head bob state
@@ -64,9 +76,9 @@ impl Camera {
         }
 
         // Vertical bob (up/down)
-        const BOB_HEIGHT: f32 = 0.04;
+        const BOB_HEIGHT: f32 = 0.08;
         // Horizontal bob (side-to-side)
-        const BOB_SIDE: f32 = 0.015;
+        const BOB_SIDE: f32 = 0.03;
 
         let vertical = self.bob_time.sin().abs() * BOB_HEIGHT * self.bob_intensity;
         let horizontal = (self.bob_time * 0.5).sin() * BOB_SIDE * self.bob_intensity;
@@ -89,11 +101,44 @@ impl Camera {
     }
 
     pub fn view_matrix(&self) -> Mat4 {
-        let forward = self.forward();
         let bob = self.bob_offset();
-        let pos = self.position + bob;
+        let pos = self.position + bob + self.shake_offset;
+
+        // Build base rotation from yaw/pitch
+        // Subtract 90 degrees to yaw to match forward() convention (yaw=0 looks at +X)
+        let yaw_quat = Quat::from_rotation_y(-self.yaw - std::f32::consts::FRAC_PI_2);
+        let pitch_quat = Quat::from_rotation_x(self.pitch);
+        let base_rotation = yaw_quat * pitch_quat;
+
+        // Apply animation shake rotation
+        let final_rotation = base_rotation * self.shake_rotation;
+
+        // Compute forward and up from final rotation
+        let forward = final_rotation * Vec3::NEG_Z;
+        let up = final_rotation * Vec3::Y;
+
         let target = pos + forward;
-        Mat4::look_at_rh(pos, target, Vec3::Y)
+        Mat4::look_at_rh(pos, target, up)
+    }
+
+    /// View matrix without shake/bob (for path tracing stability)
+    pub fn view_matrix_stable(&self) -> Mat4 {
+        let pos = self.position;
+
+        let yaw_quat = Quat::from_rotation_y(-self.yaw - std::f32::consts::FRAC_PI_2);
+        let pitch_quat = Quat::from_rotation_x(self.pitch);
+        let base_rotation = yaw_quat * pitch_quat;
+
+        let forward = base_rotation * Vec3::NEG_Z;
+        let up = base_rotation * Vec3::Y;
+
+        let target = pos + forward;
+        Mat4::look_at_rh(pos, target, up)
+    }
+
+    /// View-projection matrix without shake/bob (for path tracing)
+    pub fn view_projection_matrix_stable(&self) -> Mat4 {
+        self.projection_matrix() * self.view_matrix_stable()
     }
 
     pub fn projection_matrix(&self) -> Mat4 {

@@ -452,8 +452,11 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
     let inv_dir = 1.0 / ray.direction;
     let sign_dir = sign(ray.direction);
 
+    // Convert world position to local voxel space (accounting for volume_min offset)
+    let local_origin = ray.origin - params.volume_min;
+
     // Starting voxel position
-    var pos = vec3<i32>(floor(ray.origin / params.voxel_size));
+    var pos = vec3<i32>(floor(local_origin / params.voxel_size));
 
     // Step direction
     let step = vec3<i32>(sign_dir);
@@ -463,7 +466,7 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
 
     // Initial t_max (distance to first boundary in each dimension)
     var t_max: vec3<f32>;
-    let frac = fract(ray.origin / params.voxel_size);
+    let frac = fract(local_origin / params.voxel_size);
 
     if ray.direction.x > 0.0 {
         t_max.x = (1.0 - frac.x) * params.voxel_size * abs(inv_dir.x);
@@ -495,8 +498,8 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
         return result;
     }
 
-    // DDA traversal
-    for (var i = 0; i < 256; i++) {
+    // DDA traversal (reduced iterations for performance)
+    for (var i = 0; i < 128; i++) {
         // Find which dimension to step in
         if t_max.x < t_max.y && t_max.x < t_max.z {
             t = t_max.x;
@@ -537,10 +540,11 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
     return result;
 }
 
-// Trace shadow ray to sun (uses hybrid scene tracing)
+// Trace shadow ray to sun (voxels only for performance)
 fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
     let ray = Ray(origin + direction * 0.01, direction);
-    let hit = trace_scene(ray, 100.0);
+    // Only trace voxels for shadows (faster than full scene)
+    let hit = trace_ray_dda(ray, 32.0);
     if hit.hit {
         return 0.0;
     }
@@ -654,9 +658,9 @@ fn path_trace(start_pos: vec3<f32>, start_normal: vec3<f32>, start_albedo: vec3<
             bounce_color = albedo;
         }
 
-        // Trace ray
+        // Trace ray (reduced distance for performance)
         let ray = Ray(pos + normal * 0.01, new_dir);
-        let hit = trace_scene(ray, 50.0);
+        let hit = trace_scene(ray, 16.0);
 
         if !hit.hit {
             // Sky
@@ -681,9 +685,15 @@ fn path_trace(start_pos: vec3<f32>, start_normal: vec3<f32>, start_albedo: vec3<
         view_dir = -new_dir;
         material_id = hit.material_id;
         mat = materials[material_id];
-        albedo = mat.albedo;
         roughness = max(mat.roughness, 0.04);
         metallic = mat.metallic;
+
+        // Get albedo from texture for characters, material for voxels
+        if hit.is_character {
+            albedo = textureSampleLevel(char_textures, char_sampler, hit.uv, i32(hit.texture_id), 0.0).rgb;
+        } else {
+            albedo = mat.albedo;
+        }
 
         // Emission
         radiance += throughput * mat.emission;
@@ -752,8 +762,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             world_normal = -world_normal;
         }
 
-        // Use default color for now (no textures loaded)
-        albedo = vec3<f32>(0.85, 0.75, 0.65); // Default skin/arm color
+        // Sample texture for character
+        albedo = textureSampleLevel(char_textures, char_sampler, char_hit.uv, i32(char_hit.texture_id), 0.0).rgb;
     } else if gbuffer_hit {
         // Use G-buffer (voxel) hit
         world_pos = pos_data.xyz;
@@ -773,7 +783,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Path trace
-    let color = path_trace(world_pos, world_normal, albedo, material_id);
+    var color = path_trace(world_pos, world_normal, albedo, material_id);
+
+    // Distance fog — fade to sky color at world edge
+    let dist = length(world_pos - params.camera_position);
+    let fog_start = 150.0;
+    let fog_end = 350.0;
+    let fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+    let sky_uv_fog = vec2<f32>(f32(pixel.x), f32(pixel.y)) / vec2<f32>(f32(params.screen_width), f32(params.screen_height));
+    let sky_fog = mix(
+        vec3<f32>(0.4, 0.6, 0.9),
+        vec3<f32>(0.7, 0.85, 1.0),
+        1.0 - sky_uv_fog.y
+    );
+    color = mix(color, sky_fog, fog_factor);
 
     // Output
     textureStore(output, pixel, vec4<f32>(color, 1.0));

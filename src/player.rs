@@ -1,6 +1,18 @@
 use glam::Vec3;
 
+use crate::voxel::VOXEL_SCALE;
 use crate::world::ChunkManager;
+
+/// Trait for worlds that support collision checking
+pub trait CollisionWorld {
+    fn is_solid(&self, x: i32, y: i32, z: i32) -> bool;
+}
+
+impl CollisionWorld for ChunkManager {
+    fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        self.is_solid(x, y, z)
+    }
+}
 
 pub struct Player {
     pub position: Vec3,
@@ -18,8 +30,8 @@ impl Player {
             position,
             velocity: Vec3::ZERO,
             on_ground: false,
-            width: 0.3,   // 0.6 total width
-            height: 1.8,  // 1.8 blocks tall
+            width: 0.3,  // 0.6 total width
+            height: 1.8, // 1.8 blocks tall
         }
     }
 
@@ -27,7 +39,7 @@ impl Player {
         self.position + Vec3::new(0.0, self.height - 0.2, 0.0)
     }
 
-    pub fn update(&mut self, world: &ChunkManager, dt: f32) {
+    pub fn update<W: CollisionWorld>(&mut self, world: &W, dt: f32) {
         const GRAVITY: f32 = 28.0;
         const TERMINAL_VELOCITY: f32 = 50.0;
 
@@ -52,7 +64,7 @@ impl Player {
         self.velocity.z *= friction;
     }
 
-    fn move_axis(&mut self, world: &ChunkManager, axis: Vec3, delta: f32) {
+    fn move_axis<W: CollisionWorld>(&mut self, world: &W, axis: Vec3, delta: f32) {
         if delta.abs() < 0.0001 {
             return;
         }
@@ -83,20 +95,21 @@ impl Player {
         }
     }
 
-    fn check_collision(&self, world: &ChunkManager, pos: Vec3) -> bool {
-        // Check all blocks that the player AABB might intersect
-        let min_x = (pos.x - self.width).floor() as i32;
-        let max_x = (pos.x + self.width).floor() as i32;
-        let min_y = pos.y.floor() as i32;
-        let max_y = (pos.y + self.height).floor() as i32;
-        let min_z = (pos.z - self.width).floor() as i32;
-        let max_z = (pos.z + self.width).floor() as i32;
+    fn check_collision<W: CollisionWorld>(&self, world: &W, pos: Vec3) -> bool {
+        // Convert world position to voxel coordinates
+        // Check all voxels that the player AABB might intersect
+        let min_x = ((pos.x - self.width) / VOXEL_SCALE).floor() as i32;
+        let max_x = ((pos.x + self.width) / VOXEL_SCALE).floor() as i32;
+        let min_y = (pos.y / VOXEL_SCALE).floor() as i32;
+        let max_y = ((pos.y + self.height) / VOXEL_SCALE).floor() as i32;
+        let min_z = ((pos.z - self.width) / VOXEL_SCALE).floor() as i32;
+        let max_z = ((pos.z + self.width) / VOXEL_SCALE).floor() as i32;
 
         for bx in min_x..=max_x {
             for by in min_y..=max_y {
                 for bz in min_z..=max_z {
                     if world.is_solid(bx, by, bz) {
-                        // AABB vs block AABB test
+                        // AABB vs voxel AABB test
                         if self.aabb_intersects_block(pos, bx, by, bz) {
                             return true;
                         }
@@ -111,8 +124,13 @@ impl Player {
         let player_min = Vec3::new(pos.x - self.width, pos.y, pos.z - self.width);
         let player_max = Vec3::new(pos.x + self.width, pos.y + self.height, pos.z + self.width);
 
-        let block_min = Vec3::new(bx as f32, by as f32, bz as f32);
-        let block_max = block_min + Vec3::ONE;
+        // Voxel bounds in world coordinates
+        let block_min = Vec3::new(
+            bx as f32 * VOXEL_SCALE,
+            by as f32 * VOXEL_SCALE,
+            bz as f32 * VOXEL_SCALE,
+        );
+        let block_max = block_min + Vec3::splat(VOXEL_SCALE);
 
         player_min.x < block_max.x
             && player_max.x > block_min.x

@@ -327,23 +327,27 @@ fn trace_bvh_shadow(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> b
     return false;
 }
 
-// Simple shadow ray using DDA for voxels + BVH for characters
+// Convert world position to voxel texture coordinates
+fn world_to_voxel(world_pos: vec3<f32>) -> vec3<i32> {
+    let local_pos = world_pos - params.volume_min;
+    return vec3<i32>(floor(local_pos / params.voxel_size));
+}
+
+// Simple shadow ray using DDA for voxels only (skip BVH for performance)
 fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> f32 {
-    // First check BVH (characters)
-    if trace_bvh_shadow(origin, direction, max_dist) {
-        return 0.0;
-    }
 
     // Then check voxels with DDA
     let inv_dir = 1.0 / direction;
     let sign_dir = sign(direction);
 
-    var pos = vec3<i32>(floor(origin / params.voxel_size));
+    // Convert world position to voxel coordinates (accounting for volume_min offset)
+    let local_origin = origin - params.volume_min;
+    var pos = vec3<i32>(floor(local_origin / params.voxel_size));
     let step = vec3<i32>(sign_dir);
     let t_delta = abs(inv_dir) * params.voxel_size;
 
     var t_max_axis: vec3<f32>;
-    let frac = fract(origin / params.voxel_size);
+    let frac = fract(local_origin / params.voxel_size);
 
     if direction.x > 0.0 {
         t_max_axis.x = (1.0 - frac.x) * params.voxel_size * abs(inv_dir.x);
@@ -363,7 +367,7 @@ fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> f
 
     var t = 0.0;
 
-    for (var i = 0; i < 128; i++) {
+    for (var i = 0; i < 64; i++) {
         if t_max_axis.x < t_max_axis.y && t_max_axis.x < t_max_axis.z {
             t = t_max_axis.x;
             t_max_axis.x += t_delta.x;
@@ -438,8 +442,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             world_normal = -world_normal;
         }
 
-        // Use default color for now (no textures loaded)
-        albedo = vec3<f32>(0.85, 0.75, 0.65); // Default skin/arm color
+        // Sample texture for character
+        albedo = textureSampleLevel(char_textures, char_sampler, char_hit.uv, i32(char_hit.texture_id), 0.0).rgb;
     } else if gbuffer_hit {
         // Use G-buffer (voxel) hit
         world_pos = pos_data.xyz;
@@ -468,7 +472,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if n_dot_l > 0.0 {
         // Shadow ray
         let shadow_origin = world_pos + world_normal * 0.02;
-        let shadow = trace_shadow_ray(shadow_origin, sun_dir, 100.0);
+        let shadow = trace_shadow_ray(shadow_origin, sun_dir, 32.0);
         direct = params.sun_color * params.sun_intensity * n_dot_l * shadow;
     }
 
@@ -476,7 +480,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let ao = 0.5 + 0.5 * world_normal.y;
 
     // Final color
-    let color = albedo * (ambient * ao + direct);
+    var color = albedo * (ambient * ao + direct);
+
+    // Distance fog — fade to sky color at world edge
+    let dist = length(world_pos - params.camera_position);
+    let fog_start = 150.0;
+    let fog_end = 350.0;
+    let fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+    let sky_uv_fog = vec2<f32>(f32(pixel.x), f32(pixel.y)) / vec2<f32>(f32(params.screen_width), f32(params.screen_height));
+    let sky_fog = mix(
+        vec3<f32>(0.4, 0.6, 0.9),
+        vec3<f32>(0.7, 0.85, 1.0),
+        1.0 - sky_uv_fog.y
+    );
+    color = mix(color, sky_fog, fog_factor);
 
     textureStore(output, pixel, vec4<f32>(color, 1.0));
 }

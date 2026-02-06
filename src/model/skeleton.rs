@@ -132,11 +132,7 @@ impl SkeletonState {
     /// Create a new skeleton state from a skeleton (uses bind pose)
     pub fn from_skeleton(skeleton: &Skeleton) -> Self {
         let joint_count = skeleton.joints.len();
-        let local_transforms: Vec<_> = skeleton
-            .joints
-            .iter()
-            .map(|j| j.local_transform)
-            .collect();
+        let local_transforms: Vec<_> = skeleton.joints.iter().map(|j| j.local_transform).collect();
 
         let mut state = Self {
             local_transforms,
@@ -177,6 +173,13 @@ impl SkeletonState {
         }
     }
 
+    /// Reset to bind pose (default pose from skeleton)
+    pub fn reset_to_bind_pose(&mut self, skeleton: &Skeleton) {
+        for (i, joint) in skeleton.joints.iter().enumerate() {
+            self.local_transforms[i] = joint.local_transform;
+        }
+    }
+
     /// Apply a pose from local transforms
     pub fn set_local_transforms(&mut self, transforms: &[JointTransform], skeleton: &Skeleton) {
         if transforms.len() == self.local_transforms.len() {
@@ -194,7 +197,12 @@ impl SkeletonState {
     }
 
     /// Transform a vertex position using skinning
-    pub fn transform_vertex(&self, position: Vec3, joint_indices: [u32; 4], joint_weights: [f32; 4]) -> Vec3 {
+    pub fn transform_vertex(
+        &self,
+        position: Vec3,
+        joint_indices: [u32; 4],
+        joint_weights: [f32; 4],
+    ) -> Vec3 {
         let mut result = Vec3::ZERO;
 
         for i in 0..4 {
@@ -211,7 +219,12 @@ impl SkeletonState {
     }
 
     /// Transform a normal using skinning (no translation)
-    pub fn transform_normal(&self, normal: Vec3, joint_indices: [u32; 4], joint_weights: [f32; 4]) -> Vec3 {
+    pub fn transform_normal(
+        &self,
+        normal: Vec3,
+        joint_indices: [u32; 4],
+        joint_weights: [f32; 4],
+    ) -> Vec3 {
         let mut result = Vec3::ZERO;
 
         for i in 0..4 {

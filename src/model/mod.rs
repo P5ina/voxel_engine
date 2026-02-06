@@ -10,7 +10,7 @@ pub mod gltf_loader;
 pub mod mesh;
 pub mod skeleton;
 
-pub use animation::{AnimationClip, AnimationPlayer, Keyframe};
-pub use gltf_loader::{load_glb, load_gltf, LoadError};
-pub use mesh::{LoadedModel, LoadedTexture, MeshVertex, PolygonMesh, TextureFormat};
-pub use skeleton::{Joint, Skeleton, SkeletonState};
+pub use animation::AnimationPlayer;
+pub use gltf_loader::load_glb;
+pub use mesh::{LoadedModel, PolygonMesh};
+pub use skeleton::SkeletonState;

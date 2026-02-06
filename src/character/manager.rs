@@ -12,7 +12,7 @@ use crate::bvh::node::Triangle;
 use crate::character::first_person::FirstPersonView;
 use crate::character::local_player::LocalPlayer;
 use crate::character::remote_player::RemotePlayer;
-use crate::model::{LoadedModel, MeshVertex, SkeletonState};
+use crate::model::{LoadedModel, SkeletonState};
 
 /// Manages all characters and their GPU resources
 pub struct CharacterManager {
@@ -45,7 +45,7 @@ impl CharacterManager {
     /// Initial buffer sizes
     const INITIAL_MAX_NODES: usize = 4096;
     const INITIAL_MAX_TRIANGLES: usize = 8192;
-    const INITIAL_TEXTURE_SIZE: u32 = 256;
+    const INITIAL_TEXTURE_SIZE: u32 = 16;
     const INITIAL_TEXTURE_LAYERS: u32 = 16;
 
     pub fn new(device: &wgpu::Device) -> Self {
@@ -102,8 +102,8 @@ impl CharacterManager {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
@@ -278,6 +278,7 @@ impl CharacterManager {
         queue: &wgpu::Queue,
         dt: f32,
         is_walking: bool,
+        is_sprinting: bool,
         camera_position: Vec3,
         camera_rotation: glam::Quat,
     ) {
@@ -292,7 +293,8 @@ impl CharacterManager {
         }
 
         // Update first-person view
-        self.first_person.update(dt, is_walking, Vec3::ZERO);
+        self.first_person
+            .update(dt, is_walking, is_sprinting, Vec3::ZERO);
 
         // Rebuild BVH with all character triangles
         self.rebuild_bvh(device, queue, camera_position, camera_rotation);
@@ -333,8 +335,9 @@ impl CharacterManager {
         // Collect triangles from first-person view
         if let Some(model) = &self.first_person.model {
             // Use view_transform to get correct positioning
-            let fp_transform = self.first_person.view_transform(camera_position, camera_rotation);
-
+            let fp_transform = self
+                .first_person
+                .view_transform(camera_position, camera_rotation);
 
             // Get hidden meshes for current item
             let hidden = &self.first_person.hidden_meshes;
@@ -350,7 +353,6 @@ impl CharacterManager {
 
         // Build GPU data
         let (gpu_nodes, gpu_triangles) = builder.build_gpu();
-
 
         // Update params
         self.params.node_count = gpu_nodes.len() as u32;
@@ -382,11 +384,7 @@ impl CharacterManager {
 
         // Upload data
         if !gpu_nodes.is_empty() {
-            queue.write_buffer(
-                &self.bvh_nodes_buffer,
-                0,
-                bytemuck::cast_slice(&gpu_nodes),
-            );
+            queue.write_buffer(&self.bvh_nodes_buffer, 0, bytemuck::cast_slice(&gpu_nodes));
         }
 
         if !gpu_triangles.is_empty() {
@@ -537,10 +535,12 @@ impl CharacterManager {
                 view_formats: &[],
             });
 
-            self.texture_view = self.texture_array.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            });
+            self.texture_view = self
+                .texture_array
+                .create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
 
             self.texture_size = new_size;
             self.texture_layers = new_layers;

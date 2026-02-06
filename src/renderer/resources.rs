@@ -1,6 +1,7 @@
 use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraUniform};
+use crate::pathtracer::materials::{Material, Palette};
 
 /// Camera resources (buffer and bind group)
 pub struct CameraResources {
@@ -58,7 +59,72 @@ impl CameraResources {
     }
 }
 
-/// Texture atlas resources
+/// Palette resources (256-color palette as storage buffer)
+pub struct PaletteResources {
+    pub palette: Palette,
+    pub buffer: wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl PaletteResources {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let palette = Palette::new();
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Palette Buffer"),
+            contents: bytemuck::cast_slice(palette.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Palette Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: Some(
+                        std::num::NonZeroU64::new((256 * std::mem::size_of::<Material>()) as u64)
+                            .unwrap(),
+                    ),
+                },
+                count: None,
+            }],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Palette Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        });
+
+        Self {
+            palette,
+            buffer,
+            bind_group,
+            bind_group_layout,
+        }
+    }
+
+    pub fn update(&mut self, queue: &wgpu::Queue) {
+        queue.write_buffer(
+            &self.buffer,
+            0,
+            bytemuck::cast_slice(self.palette.as_slice()),
+        );
+    }
+
+    pub fn get_color(&self, index: u8) -> [f32; 3] {
+        self.palette.get(index).albedo
+    }
+}
+
+// Keep TextureResources for backward compatibility (character textures, etc.)
 pub struct TextureResources {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_layout: wgpu::BindGroupLayout,
@@ -66,16 +132,14 @@ pub struct TextureResources {
 
 impl TextureResources {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        // Load texture atlas
-        let atlas_bytes = include_bytes!("../../assets/textures/blocks/atlas_0.png");
-        let atlas_image = image::load_from_memory(atlas_bytes).unwrap().to_rgba8();
-        let (atlas_width, atlas_height) = atlas_image.dimensions();
+        // Create a dummy 1x1 white texture for compatibility
+        let white_pixel: [u8; 4] = [255, 255, 255, 255];
 
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Atlas Texture"),
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Dummy Texture"),
             size: wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
+                width: 1,
+                height: 1,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -88,26 +152,26 @@ impl TextureResources {
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &atlas_texture,
+                texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &atlas_image,
+            &white_pixel,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * atlas_width),
-                rows_per_image: Some(atlas_height),
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
             },
             wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
+                width: 1,
+                height: 1,
                 depth_or_array_layers: 1,
             },
         );
 
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -145,11 +209,11 @@ impl TextureResources {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                    resource: wgpu::BindingResource::TextureView(&view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
         });
