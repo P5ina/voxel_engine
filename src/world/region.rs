@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,69 +19,69 @@ use crate::voxel::chunk::Chunk;
 // ============================================================================
 
 const REGION_MAGIC: &[u8; 8] = b"VXREGION";
-const REGION_VERSION: u32 = 1;
+const REGION_VERSION: u32 = 2;
 
-/// RLE compressed chunk data (same format as bigworld_io::CompressedChunk)
+/// RLE compressed section within a column.
 #[derive(Serialize, Deserialize)]
-struct CompressedChunk {
-    pos: [i32; 3],
+struct CompressedSection {
+    section_y: u8,
     rle_data: Vec<(u16, u8)>,
 }
 
-impl CompressedChunk {
-    fn from_chunk(pos: ChunkPosition, chunk: &Chunk) -> Self {
-        let mut rle_data = Vec::new();
-        let mut current_voxel = chunk.get(0, 0, 0);
-        let mut count: u16 = 0;
+/// A compressed column: XZ position + per-section RLE data.
+#[derive(Serialize, Deserialize)]
+struct CompressedColumn {
+    col: [i32; 2],
+    sections: Vec<CompressedSection>,
+}
 
-        for z in 0..32 {
-            for y in 0..32 {
-                for x in 0..32 {
-                    let voxel = chunk.get(x, y, z);
-                    if voxel == current_voxel && count < u16::MAX {
-                        count += 1;
-                    } else {
-                        if count > 0 {
-                            rle_data.push((count, current_voxel));
-                        }
-                        current_voxel = voxel;
-                        count = 1;
+fn compress_section(chunk: &Chunk) -> Vec<(u16, u8)> {
+    let mut rle_data = Vec::new();
+    let mut current_voxel = chunk.get(0, 0, 0);
+    let mut count: u16 = 0;
+
+    for z in 0..32 {
+        for y in 0..32 {
+            for x in 0..32 {
+                let voxel = chunk.get(x, y, z);
+                if voxel == current_voxel && count < u16::MAX {
+                    count += 1;
+                } else {
+                    if count > 0 {
+                        rle_data.push((count, current_voxel));
                     }
+                    current_voxel = voxel;
+                    count = 1;
                 }
             }
         }
-        if count > 0 {
-            rle_data.push((count, current_voxel));
-        }
+    }
+    if count > 0 {
+        rle_data.push((count, current_voxel));
+    }
 
-        Self {
-            pos: [pos.x, pos.y, pos.z],
-            rle_data,
+    rle_data
+}
+
+fn decompress_section(rle_data: &[(u16, u8)]) -> Chunk {
+    let mut chunk = Chunk::new();
+    let mut idx = 0usize;
+
+    for &(count, voxel) in rle_data {
+        for _ in 0..count {
+            let x = idx % 32;
+            let y = (idx / 32) % 32;
+            let z = idx / 1024;
+            chunk.set(x, y, z, voxel);
+            idx += 1;
         }
     }
 
-    fn to_chunk(&self) -> (ChunkPosition, Chunk) {
-        let mut chunk = Chunk::new();
-        let mut idx = 0usize;
-
-        for &(count, voxel) in &self.rle_data {
-            for _ in 0..count {
-                let x = idx % 32;
-                let y = (idx / 32) % 32;
-                let z = idx / 1024;
-                chunk.set(x, y, z, voxel);
-                idx += 1;
-            }
-        }
-
-        (
-            ChunkPosition::new(self.pos[0], self.pos[1], self.pos[2]),
-            chunk,
-        )
-    }
+    chunk
 }
 
 /// Write a single region file to disk.
+/// Accepts flat (ChunkPosition, &Chunk) pairs and groups them into columns internally.
 pub fn write_region(
     world_dir: &Path,
     coord: RegionCoord,
@@ -90,10 +92,32 @@ pub fn write_region(
 
     let path = coord.file_path(world_dir);
 
-    // RLE compress all chunks (parallel)
-    let compressed: Vec<CompressedChunk> = chunks
+    // Group chunks by column (XZ)
+    let mut column_map: HashMap<[i32; 2], Vec<(u8, &Chunk)>> = HashMap::new();
+    for (pos, chunk) in chunks {
+        column_map
+            .entry([pos.x, pos.z])
+            .or_default()
+            .push((pos.y as u8, chunk));
+    }
+
+    // Compress columns (parallel over columns)
+    let column_entries: Vec<_> = column_map.into_iter().collect();
+    let compressed: Vec<CompressedColumn> = column_entries
         .par_iter()
-        .map(|(pos, chunk)| CompressedChunk::from_chunk(*pos, chunk))
+        .map(|(col, sections)| {
+            let compressed_sections: Vec<CompressedSection> = sections
+                .iter()
+                .map(|(sy, chunk)| CompressedSection {
+                    section_y: *sy,
+                    rle_data: compress_section(chunk),
+                })
+                .collect();
+            CompressedColumn {
+                col: *col,
+                sections: compressed_sections,
+            }
+        })
         .collect();
 
     let file = std::fs::File::create(&path)?;
@@ -113,6 +137,7 @@ pub fn write_region(
 }
 
 /// Read a single region file from disk.
+/// Returns flat (ChunkPosition, Chunk) pairs for compatibility with callers.
 pub fn read_region(
     world_dir: &Path,
     coord: RegionCoord,
@@ -135,17 +160,27 @@ pub fn read_region(
         return Err(BigWorldError::UnsupportedVersion(version));
     }
 
-    // Skip rx, rz, chunk_count (we already know coord)
+    // Skip rx, rz, column_count (we already know coord)
     let mut _buf = [0u8; 4];
     reader.read_exact(&mut _buf)?; // rx
     reader.read_exact(&mut _buf)?; // rz
-    reader.read_exact(&mut _buf)?; // chunk_count
+    reader.read_exact(&mut _buf)?; // column_count
 
     let decoder = lz4_flex::frame::FrameDecoder::new(reader);
-    let compressed: Vec<CompressedChunk> =
+    let compressed: Vec<CompressedColumn> =
         bincode::deserialize_from(decoder).map_err(BigWorldError::Bincode)?;
 
-    let chunks: Vec<_> = compressed.par_iter().map(|c| c.to_chunk()).collect();
+    // Flatten columns back to (ChunkPosition, Chunk) pairs
+    let chunks: Vec<_> = compressed
+        .par_iter()
+        .flat_map_iter(|col| {
+            col.sections.iter().map(move |sec| {
+                let pos = ChunkPosition::new(col.col[0], sec.section_y as i32, col.col[1]);
+                let chunk = decompress_section(&sec.rle_data);
+                (pos, chunk)
+            })
+        })
+        .collect();
     Ok(chunks)
 }
 
@@ -282,8 +317,8 @@ pub struct RegionManager {
 }
 
 /// Distances for proactive region loading (in world-space meters).
-const REGION_LOAD_DISTANCE: f32 = 87.0;
-const REGION_UNLOAD_DISTANCE: f32 = 113.0;
+const REGION_LOAD_DISTANCE: f32 = 720.0;
+const REGION_UNLOAD_DISTANCE: f32 = 900.0;
 
 impl RegionManager {
     pub fn new(world_dir: PathBuf) -> Self {
@@ -352,7 +387,7 @@ impl RegionManager {
                     },
                 }
             } else {
-                // No file on disk — region is empty (procedural will fill it)
+                // No file on disk — region is all air
                 RegionLoadResult {
                     coord,
                     chunks: Vec::new(),
@@ -441,7 +476,7 @@ impl RegionManager {
     /// Mark all regions that currently have chunks in the world as loaded.
     pub fn mark_existing_regions_loaded(&mut self, world: &ChunkManager) {
         for pos in world.chunk_positions() {
-            let coord = RegionCoord::from_chunk_pos(*pos);
+            let coord = RegionCoord::from_chunk_pos(pos);
             self.states.insert(coord, RegionState::Loaded);
         }
     }

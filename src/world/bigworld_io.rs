@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+
 //! Big World save/load with pre-computed meshes
 //!
 //! File format (.bigworld):
@@ -18,7 +20,7 @@ use super::octree::VoxelOctree;
 use crate::voxel::Chunk;
 
 /// Compute world size in chunks from ChunkManager bounds.
-fn world_size(world: &ChunkManager) -> (i32, i32, i32) {
+fn world_size(world: &mut ChunkManager) -> (i32, i32, i32) {
     match world.bounds() {
         Some((min, max)) => (max.x - min.x + 1, max.y - min.y + 1, max.z - min.z + 1),
         None => (0, 0, 0),
@@ -169,11 +171,11 @@ pub struct PreparedSaveData {
 
 /// Compress chunks from a ChunkManager for later saving.
 /// Fast (parallel RLE compression), designed to run on the main thread.
-pub fn prepare_save(world: &ChunkManager) -> PreparedSaveData {
+pub fn prepare_save(world: &mut ChunkManager) -> PreparedSaveData {
     let chunks: Vec<_> = world.chunks().collect();
     let compressed_chunks: Vec<CompressedChunk> = chunks
         .par_iter()
-        .map(|(pos, chunk)| CompressedChunk::from_chunk(**pos, chunk))
+        .map(|(pos, chunk)| CompressedChunk::from_chunk(*pos, chunk))
         .collect();
     PreparedSaveData {
         compressed_chunks,

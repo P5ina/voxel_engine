@@ -114,32 +114,53 @@ impl PaletteResources {
     }
 }
 
-/// Mesh resources (vertex buffer)
+/// Mesh resources (vertex buffer with capacity tracking for reuse)
 pub struct MeshResources {
     pub vertex_buffer: wgpu::Buffer,
     pub num_vertices: u32,
+    buffer_capacity: u64,
 }
 
 impl MeshResources {
     pub fn new(device: &wgpu::Device, vertices: &[super::Vertex]) -> Self {
+        let data = bytemuck::cast_slice(vertices);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(vertices),
+            contents: data,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
         Self {
             vertex_buffer,
             num_vertices: vertices.len() as u32,
+            buffer_capacity: data.len() as u64,
         }
     }
 
-    pub fn update(&mut self, device: &wgpu::Device, vertices: &[super::Vertex]) {
-        self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[super::Vertex],
+    ) {
+        let data = bytemuck::cast_slice(vertices);
+        let data_size = data.len() as u64;
+
+        if data_size <= self.buffer_capacity {
+            // Reuse existing buffer
+            queue.write_buffer(&self.vertex_buffer, 0, data);
+        } else {
+            // Grow with 2x strategy
+            let new_capacity = data_size.max(self.buffer_capacity * 2);
+            self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Vertex Buffer"),
+                size: new_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&self.vertex_buffer, 0, data);
+            self.buffer_capacity = new_capacity;
+        }
         self.num_vertices = vertices.len() as u32;
     }
 }

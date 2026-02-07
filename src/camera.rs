@@ -1,4 +1,4 @@
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3, Vec4};
 
 pub struct Camera {
     pub position: Vec3,
@@ -114,6 +114,54 @@ impl Camera {
             self.aspect = width as f32 / height as f32;
         }
     }
+
+    /// Extract 6 frustum planes from the view-projection matrix.
+    /// Each plane is (normal.x, normal.y, normal.z, distance) with inward-pointing normals.
+    pub fn frustum_planes(&self) -> [Vec4; 6] {
+        let vp = self.view_projection_matrix();
+        let r0 = vp.row(0);
+        let r1 = vp.row(1);
+        let r2 = vp.row(2);
+        let r3 = vp.row(3);
+
+        let mut planes = [
+            r3 + r0, // left
+            r3 - r0, // right
+            r3 + r1, // bottom
+            r3 - r1, // top
+            r3 + r2, // near
+            r3 - r2, // far
+        ];
+
+        // Normalize each plane
+        for p in &mut planes {
+            let len = Vec3::new(p.x, p.y, p.z).length();
+            if len > 0.0 {
+                *p /= len;
+            }
+        }
+
+        planes
+    }
+}
+
+/// Test if an AABB is at least partially inside the frustum.
+/// Returns true if visible, false if fully outside.
+pub fn aabb_in_frustum(min: Vec3, max: Vec3, planes: &[Vec4; 6]) -> bool {
+    for plane in planes {
+        let n = Vec3::new(plane.x, plane.y, plane.z);
+        // Find the "positive vertex" — the corner most in the direction of the normal
+        let pv = Vec3::new(
+            if n.x >= 0.0 { max.x } else { min.x },
+            if n.y >= 0.0 { max.y } else { min.y },
+            if n.z >= 0.0 { max.z } else { min.z },
+        );
+        // If the positive vertex is behind the plane, the AABB is fully outside
+        if n.dot(pv) + plane.w < 0.0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[repr(C)]

@@ -1,3 +1,6 @@
+#![cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use glam::Vec3;
@@ -7,12 +10,15 @@ use crate::renderer::MeshResources;
 use crate::ui::{LoadingState, UiScreen};
 use crate::voxel::{self, generate_chunk_mesh, generate_octree_lod_mesh};
 use crate::world::{
-    ChunkManager, ChunkPosition, ChunkStreamer, LodNodeKey, RegionCoord, RegionManager,
+    ChunkManager, ChunkPosition, ChunkStreamer, ColumnPos, RegionCoord, RegionManager,
     StreamingConfig, VoxelOctree,
 };
-use crate::{AppState, BigWorldGenMessage, BigWorldGenResult, ChunkSource, MeshKey};
+use crate::{AppState, BigWorldGenMessage, BigWorldGenResult, MeshKey};
 
 impl AppState {
+    pub(crate) const WORLD_SIZE_CHUNKS: i32 = 64;
+    pub(crate) const WORLD_SIZE_METERS: u32 = 1024;
+
     /// Start generating a big world with loading screen
     pub(crate) fn start_big_world_generation(&mut self) {
         // Clear pending chunks queue
@@ -55,11 +61,12 @@ impl AppState {
     /// Region-first: generates chunks and writes region files directly,
     /// never storing all chunk data in memory simultaneously.
     fn generate_big_world_background(tx: mpsc::Sender<BigWorldGenMessage>, level_name: String) {
-        const WORLD_SIZE_CHUNKS: i32 = 512;
-        const WORLD_SIZE_METERS: u32 = (WORLD_SIZE_CHUNKS as u32 * 32) / 16;
+        let world_size_chunks = Self::WORLD_SIZE_CHUNKS;
+        let world_size_meters = Self::WORLD_SIZE_METERS;
 
         // Spawn at center, compute terrain height for spawn Y
-        let center = (WORLD_SIZE_CHUNKS as f32 * 32.0 * voxel::VOXEL_SCALE) / 2.0;
+        let center =
+            (world_size_chunks as f32 * voxel::CHUNK_SIZE as f32 * voxel::VOXEL_SCALE) / 2.0;
         let center_voxel_x = (center / voxel::VOXEL_SCALE) as i32;
         let center_voxel_z = (center / voxel::VOXEL_SCALE) as i32;
         let spawn_terrain_height = Self::terrain_height(center_voxel_x, center_voxel_z);
@@ -68,10 +75,10 @@ impl AppState {
 
         log::info!(
             "[BigWorld] Generating {}x{} meter world ({}x{} chunks, terrain height at center: {} voxels = {:.1}m)...",
-            WORLD_SIZE_METERS,
-            WORLD_SIZE_METERS,
-            WORLD_SIZE_CHUNKS,
-            WORLD_SIZE_CHUNKS,
+            world_size_meters,
+            world_size_meters,
+            world_size_chunks,
+            world_size_chunks,
             spawn_terrain_height,
             spawn_terrain_height as f32 * voxel::VOXEL_SCALE
         );
@@ -83,11 +90,11 @@ impl AppState {
         }
 
         let region_size = crate::world::position::REGION_SIZE;
-        let num_regions_x = (WORLD_SIZE_CHUNKS + region_size - 1) / region_size;
-        let num_regions_z = (WORLD_SIZE_CHUNKS + region_size - 1) / region_size;
+        let num_regions_x = (world_size_chunks + region_size - 1) / region_size;
+        let num_regions_z = (world_size_chunks + region_size - 1) / region_size;
         let total_regions = (num_regions_x * num_regions_z) as usize;
-        let mut regions_written = 0usize;
-        let mut total_chunks_written = 0usize;
+        let regions_written = AtomicUsize::new(0);
+        let total_chunks_written = AtomicUsize::new(0);
 
         let _ = tx.send(BigWorldGenMessage::Progress(
             "Generating terrain & writing regions...".into(),
@@ -95,65 +102,60 @@ impl AppState {
             total_regions,
         ));
 
+        let mut region_coords = Vec::with_capacity(total_regions);
         for rrx in 0..num_regions_x {
             for rrz in 0..num_regions_z {
-                let coord = RegionCoord::new(rrx, rrz);
-
-                // Generate all non-empty chunks for this region in parallel
-                let mut positions = Vec::new();
-                for dx in 0..region_size {
-                    for dz in 0..region_size {
-                        let cx = rrx * region_size + dx;
-                        let cz = rrz * region_size + dz;
-                        if cx >= WORLD_SIZE_CHUNKS || cz >= WORLD_SIZE_CHUNKS {
-                            continue;
-                        }
-                        for cy in 0..Self::WORLD_HEIGHT_CHUNKS {
-                            let chunk_bottom_voxel = cy * voxel::CHUNK_SIZE as i32;
-                            if chunk_bottom_voxel > Self::MAX_TERRAIN_VOXEL_HEIGHT || cy < 0 {
-                                continue;
-                            }
-                            positions.push(ChunkPosition::new(cx, cy, cz));
-                        }
-                    }
-                }
-
-                let region_chunks: Vec<(ChunkPosition, voxel::Chunk)> = positions
-                    .par_iter()
-                    .filter_map(|&pos| {
-                        let chunk = Self::generate_chunk_data_static(pos);
-                        if chunk.is_empty() {
-                            None
-                        } else {
-                            Some((pos, chunk))
-                        }
-                    })
-                    .collect();
-
-                if !region_chunks.is_empty() {
-                    total_chunks_written += region_chunks.len();
-                    let refs: Vec<(ChunkPosition, &voxel::Chunk)> =
-                        region_chunks.iter().map(|(p, c)| (*p, c)).collect();
-                    if let Err(e) = crate::world::region::write_region(&world_dir, coord, &refs) {
-                        log::error!("[BigWorld] Failed to write region {:?}: {}", coord, e);
-                    }
-                }
-                // region_chunks dropped here — memory freed
-
-                regions_written += 1;
-                if regions_written.is_multiple_of(20) || regions_written == total_regions {
-                    let _ = tx.send(BigWorldGenMessage::Progress(
-                        "Generating terrain & writing regions...".into(),
-                        regions_written,
-                        total_regions,
-                    ));
-                }
+                region_coords.push(RegionCoord::new(rrx, rrz));
             }
         }
+
+        region_coords.into_par_iter().for_each(|coord| {
+            let tx = tx.clone();
+
+            // Collect column XZ positions in this region
+            let mut col_positions = Vec::new();
+            for dx in 0..region_size {
+                for dz in 0..region_size {
+                    let cx = coord.rx * region_size + dx;
+                    let cz = coord.rz * region_size + dz;
+                    if cx >= world_size_chunks || cz >= world_size_chunks {
+                        continue;
+                    }
+                    col_positions.push(ColumnPos::new(cx, cz));
+                }
+            }
+
+            // Generate columns and flatten to (ChunkPosition, Chunk) pairs
+            let mut region_chunks: Vec<(ChunkPosition, voxel::Chunk)> = Vec::new();
+            for col in col_positions {
+                let column = Self::generate_column_data_static(col);
+                for (sy, section) in column.sections_iter() {
+                    region_chunks.push((col.to_chunk_pos(sy), section.clone()));
+                }
+            }
+
+            if !region_chunks.is_empty() {
+                total_chunks_written.fetch_add(region_chunks.len(), Ordering::Relaxed);
+                let refs: Vec<(ChunkPosition, &voxel::Chunk)> =
+                    region_chunks.iter().map(|(p, c)| (*p, c)).collect();
+                if let Err(e) = crate::world::region::write_region(&world_dir, coord, &refs) {
+                    log::error!("[BigWorld] Failed to write region {:?}: {}", coord, e);
+                }
+            }
+
+            let written = regions_written.fetch_add(1, Ordering::Relaxed) + 1;
+            if written.is_multiple_of(20) || written == total_regions {
+                let _ = tx.send(BigWorldGenMessage::Progress(
+                    "Generating terrain & writing regions...".into(),
+                    written,
+                    total_regions,
+                ));
+            }
+        });
         log::info!(
             "[BigWorld] Wrote {} region files ({} non-empty chunks)",
-            regions_written,
-            total_chunks_written,
+            regions_written.load(Ordering::Relaxed),
+            total_chunks_written.load(Ordering::Relaxed),
         );
 
         // Phase 2: Create minimal octree (empty, no chunk data) + save world.meta
@@ -162,15 +164,73 @@ impl AppState {
             0,
             1,
         ));
-        let octree = VoxelOctree::for_world_size_meters(WORLD_SIZE_METERS);
+        let octree = VoxelOctree::for_world_size_meters(Self::WORLD_SIZE_METERS);
         if let Err(e) =
             crate::world::region::save_world_meta(&world_dir, &octree, [center, spawn_y, center])
         {
             log::error!("[BigWorld] Failed to write world.meta: {}", e);
         }
 
-        // Phase 3: Compute LOD mesh tasks and return
-        let world = ChunkManager::new();
+        // Phase 3: Load all regions back into memory
+        let regions_dir = world_dir.join("regions");
+        let mut region_files: Vec<(RegionCoord, std::path::PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&regions_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname_str = fname.to_string_lossy();
+                if let Some(rest) = fname_str.strip_prefix("r_") {
+                    if let Some(rest) = rest.strip_suffix(".region") {
+                        let parts: Vec<&str> = rest.splitn(2, '_').collect();
+                        if parts.len() == 2 {
+                            if let (Ok(rx), Ok(rz)) =
+                                (parts[0].parse::<i32>(), parts[1].parse::<i32>())
+                            {
+                                region_files.push((RegionCoord::new(rx, rz), entry.path()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_to_load = region_files.len();
+        let _ = tx.send(BigWorldGenMessage::Progress(
+            "Loading regions into memory...".into(),
+            0,
+            total_to_load,
+        ));
+
+        let mut world = ChunkManager::new();
+        let mut loaded_chunks = 0usize;
+        for (i, (coord, _path)) in region_files.iter().enumerate() {
+            match crate::world::region::read_region(&world_dir, *coord) {
+                Ok(chunks) => {
+                    loaded_chunks += chunks.len();
+                    for (pos, chunk) in chunks {
+                        if !chunk.is_empty() {
+                            world.insert_chunk(pos, chunk);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("[BigWorld] Failed to read region {:?}: {}", coord, e);
+                }
+            }
+            if (i + 1) % 4 == 0 || i + 1 == total_to_load {
+                let _ = tx.send(BigWorldGenMessage::Progress(
+                    "Loading regions into memory...".into(),
+                    i + 1,
+                    total_to_load,
+                ));
+            }
+        }
+        log::info!(
+            "[BigWorld] Loaded {} regions ({} chunks) into memory",
+            total_to_load,
+            loaded_chunks,
+        );
+
+        // Phase 4: Compute mesh tasks and return
         let _ = tx.send(BigWorldGenMessage::Progress(
             "Computing mesh tasks...".into(),
             0,
@@ -187,99 +247,33 @@ impl AppState {
         })));
     }
 
-    /// Compute LOD-aware mesh tasks from an existing octree, sorted by distance from spawn
+    /// Compute mesh tasks: LOD0 for all loaded chunks (world is fully preloaded).
+    /// No LOD node tasks — LOD0 covers the entire world.
     pub(crate) fn compute_mesh_tasks(
         world: &ChunkManager,
         _octree: &VoxelOctree,
         spawn_pos: Vec3,
     ) -> (Vec<MeshKey>, usize) {
-        let all_positions: Vec<_> = world.chunk_positions().cloned().collect();
-
-        let lod_config = crate::world::LodConfig::default();
-        let chunk_world_size = voxel::CHUNK_SIZE as f32 * voxel::VOXEL_SCALE;
-        let mut mesh_tasks: Vec<MeshKey> = Vec::new();
-
-        let spawn_chunk = ChunkPosition::from_world_pos(spawn_pos.x, spawn_pos.y, spawn_pos.z);
-
-        // LOD0: individual chunk meshes within LOD0 distance
-        let lod0_distance = lod_config.distances[0];
+        let all_positions: Vec<_> = world.chunk_positions().collect();
+        let mut mesh_tasks: Vec<MeshKey> = Vec::with_capacity(all_positions.len());
 
         for pos in &all_positions {
-            let chunk_center = pos.center_world_pos();
-            let dist = Vec3::new(
-                chunk_center.0 - spawn_pos.x,
-                chunk_center.1 - spawn_pos.y,
-                chunk_center.2 - spawn_pos.z,
-            )
-            .length();
-            if dist <= lod0_distance {
-                mesh_tasks.push(MeshKey::Chunk(*pos));
-            }
+            mesh_tasks.push(MeshKey::Chunk(*pos));
         }
 
         let lod0_count = mesh_tasks.len();
 
-        // LOD1-3: LOD node meshes for areas beyond LOD0
-        // Iterate around spawn position rather than the full world
-        for lod in 1..lod_config.levels {
-            let lod_distance_min = lod_config.distances[(lod - 1) as usize];
-            let lod_distance_max = lod_config.distances[lod as usize];
-
-            let chunks_per_node = 1i32 << lod;
-            let node_world_size = chunks_per_node as f32 * chunk_world_size;
-            let max_node_radius = (lod_distance_max / node_world_size).ceil() as i32 + 1;
-
-            let player_node_x = spawn_chunk.x >> lod;
-            let player_node_y = spawn_chunk.y >> lod;
-            let player_node_z = spawn_chunk.z >> lod;
-
-            let vertical_range = (Self::WORLD_HEIGHT_CHUNKS >> lod).max(1);
-            for dx in -max_node_radius..=max_node_radius {
-                for dz in -max_node_radius..=max_node_radius {
-                    for dy in -vertical_range..=vertical_range {
-                        let key = LodNodeKey::new(
-                            player_node_x + dx,
-                            player_node_y + dy,
-                            player_node_z + dz,
-                            lod,
-                        );
-                        let center = key.center_world_pos();
-                        let dist = Vec3::new(
-                            center.0 - spawn_pos.x,
-                            center.1 - spawn_pos.y,
-                            center.2 - spawn_pos.z,
-                        )
-                        .length();
-
-                        if dist >= lod_distance_min && dist < lod_distance_max {
-                            mesh_tasks.push(MeshKey::LodNode(key));
-                        }
-                    }
-                }
-            }
-        }
-
         // Sort by distance from spawn (closer first)
         mesh_tasks.sort_by(|a, b| {
-            let dist_a = match a {
-                MeshKey::Chunk(pos) => {
-                    let c = pos.center_world_pos();
-                    Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
-                }
-                MeshKey::LodNode(key) => {
-                    let c = key.center_world_pos();
-                    Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
-                }
+            let dist_a = {
+                let MeshKey::Chunk(pos) = a else { unreachable!() };
+                let c = pos.center_world_pos();
+                Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
             };
-            let dist_b = match b {
-                MeshKey::Chunk(pos) => {
-                    let c = pos.center_world_pos();
-                    Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
-                }
-                MeshKey::LodNode(key) => {
-                    let c = key.center_world_pos();
-                    Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
-                }
+            let dist_b = {
+                let MeshKey::Chunk(pos) = b else { unreachable!() };
+                let c = pos.center_world_pos();
+                Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
             };
             dist_a
                 .partial_cmp(&dist_b)
@@ -287,10 +281,8 @@ impl AppState {
         });
 
         log::info!(
-            "[BigWorld] {} mesh tasks ({} LOD0 chunks + {} LOD nodes)",
+            "[BigWorld] {} mesh tasks (all LOD0 chunks)",
             mesh_tasks.len(),
-            lod0_count,
-            mesh_tasks.len() - lod0_count,
         );
 
         (mesh_tasks, lod0_count)
@@ -401,7 +393,7 @@ impl AppState {
         let tasks_to_process: Vec<_> = tasks_to_process.into_iter().map(|(_, t)| t).collect();
         let remaining: Vec<_> = remaining.into_iter().map(|(_, t)| t).collect();
 
-        // Generate meshes based on task type
+        // Generate meshes based on task type — build ALL meshes (no caps)
         for task in &tasks_to_process {
             match task {
                 MeshKey::Chunk(pos) => {
@@ -461,14 +453,6 @@ impl AppState {
     pub(crate) fn finish_big_world_loading(&mut self) {
         log::info!("[BigWorld] Initial loading complete! Setting up streaming...");
 
-        // Update path tracer
-        self.path_tracer.update_world_voxels(
-            &self.render_ctx.device,
-            &self.render_ctx.queue,
-            &self.world,
-        );
-        self.path_tracer.reset_accumulation();
-
         // Create streaming system with world bounds
         let mut config = StreamingConfig::default();
         if let Some(ref octree) = self.octree {
@@ -484,12 +468,41 @@ impl AppState {
             } else {
                 // Empty octree (region-first gen) — use world constants
                 config.world_min = glam::IVec3::new(0, 0, 0);
-                config.world_max = glam::IVec3::new(512, Self::WORLD_HEIGHT_CHUNKS, 512);
+                config.world_max = glam::IVec3::new(
+                    Self::WORLD_SIZE_CHUNKS,
+                    Self::WORLD_HEIGHT_CHUNKS,
+                    Self::WORLD_SIZE_CHUNKS,
+                );
             }
         } else {
             config.world_min = glam::IVec3::new(0, 0, 0);
-            config.world_max = glam::IVec3::new(512, Self::WORLD_HEIGHT_CHUNKS, 512);
+            config.world_max = glam::IVec3::new(
+                Self::WORLD_SIZE_CHUNKS,
+                Self::WORLD_HEIGHT_CHUNKS,
+                Self::WORLD_SIZE_CHUNKS,
+            );
         }
+
+        // Clamp to configured playable bounds so stale metadata from older scales
+        // cannot expand streaming/LOD far beyond the intended world.
+        let clamp_min = glam::IVec3::new(0, 0, 0);
+        let clamp_max = glam::IVec3::new(
+            Self::WORLD_SIZE_CHUNKS,
+            Self::WORLD_HEIGHT_CHUNKS,
+            Self::WORLD_SIZE_CHUNKS,
+        );
+        config.world_min = glam::IVec3::new(
+            config.world_min.x.max(clamp_min.x),
+            config.world_min.y.max(clamp_min.y),
+            config.world_min.z.max(clamp_min.z),
+        );
+        config.world_max = glam::IVec3::new(
+            config.world_max.x.min(clamp_max.x),
+            config.world_max.y.min(clamp_max.y),
+            config.world_max.z.min(clamp_max.z),
+        );
+
+        self.path_tracer.reset_accumulation();
         let mut streamer = ChunkStreamer::new(config);
         streamer.set_player_position(self.player.position);
 
@@ -531,29 +544,37 @@ impl AppState {
                 .count(),
         );
 
-        // Set chunk source based on mode
-        self.chunk_source = if self.enter_editor_after_gen {
-            ChunkSource::Octree
-        } else {
-            ChunkSource::Procedural
-        };
-
         // Set up region manager if world directory exists
         let world_dir = std::path::PathBuf::from(format!("maps/{}", self.editor_state.level_name));
         if world_dir.join("world.meta").exists() {
             let mut region_mgr = RegionManager::new(world_dir);
-            region_mgr.mark_existing_regions_loaded(&self.world);
+            // Mark ALL potential region coordinates as loaded (world is fully preloaded)
+            // This prevents spurious background region load requests for empty regions.
+            let num_regions = (Self::WORLD_SIZE_CHUNKS + crate::world::position::REGION_SIZE - 1)
+                / crate::world::position::REGION_SIZE;
+            for rx in 0..num_regions {
+                for rz in 0..num_regions {
+                    region_mgr.mark_loaded(RegionCoord::new(rx, rz));
+                }
+            }
             self.region_manager = Some(region_mgr);
-            log::info!("[BigWorld] Region manager initialized");
+            log::info!("[BigWorld] Region manager initialized (all regions marked loaded)");
         }
 
         // Seed the streamer: run one update so mesh requests are dispatched immediately
         // on the first frame instead of waiting one frame for the pipeline to start.
         self.update_streaming();
 
-        if self.enter_editor_after_gen {
-            self.ui_screen = UiScreen::Editor;
-        } else {
+        #[cfg(feature = "dev-tools")]
+        {
+            if self.enter_editor_after_gen {
+                self.ui_screen = UiScreen::Editor;
+            } else {
+                self.ui_screen = UiScreen::InGame;
+            }
+        }
+        #[cfg(not(feature = "dev-tools"))]
+        {
             self.ui_screen = UiScreen::InGame;
         }
         self.grab_mouse(true);

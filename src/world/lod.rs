@@ -21,12 +21,12 @@ impl Default for LodConfig {
         Self {
             levels: 6,
             distances: [
-                32.0,   // LOD0 -> LOD1 at 32m
-                64.0,   // LOD1 -> LOD2 at 64m
-                160.0,  // LOD2 -> LOD3 at 160m
-                384.0,  // LOD3 -> LOD4 at 384m
-                768.0,  // LOD4 -> LOD5 at 768m
-                1024.0, // LOD5 -> cull beyond 1024m
+                160.0,  // LOD0 -> LOD1
+                640.0,  // LOD1 -> LOD2
+                960.0,  // LOD2 -> LOD3
+                1280.0, // LOD3 -> LOD4
+                1600.0, // LOD4 -> LOD5
+                2048.0, // LOD5 -> cull beyond
             ],
         }
     }
@@ -122,7 +122,7 @@ impl<'de> Deserialize<'de> for VoxelData {
                         let bytes: Vec<u8> = seq
                             .next_element()?
                             .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                        let mut data = Box::new([[[0u8; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]);
+                        let mut data = crate::voxel::chunk::boxed_zero_chunk_data();
                         let dst = unsafe {
                             std::slice::from_raw_parts_mut(
                                 data.as_mut_ptr() as *mut u8,
@@ -228,7 +228,33 @@ impl VoxelData {
                     .all(|&v| v == first);
                 if all_same { Some(first) } else { None }
             }
-            _ => None,
+            Self::Lod1(data) => {
+                let first = data[0][0][0];
+                let all_same = data
+                    .iter()
+                    .flat_map(|plane| plane.iter())
+                    .flat_map(|row| row.iter())
+                    .all(|&v| v == first);
+                if all_same { Some(first) } else { None }
+            }
+            Self::Lod2(data) => {
+                let first = data[0][0][0];
+                let all_same = data
+                    .iter()
+                    .flat_map(|plane| plane.iter())
+                    .flat_map(|row| row.iter())
+                    .all(|&v| v == first);
+                if all_same { Some(first) } else { None }
+            }
+            Self::Lod3(data) => {
+                let first = data[0][0][0];
+                let all_same = data
+                    .iter()
+                    .flat_map(|plane| plane.iter())
+                    .flat_map(|row| row.iter())
+                    .all(|&v| v == first);
+                if all_same { Some(first) } else { None }
+            }
         }
     }
 
@@ -284,6 +310,7 @@ fn sample_region_2x2x2<const N: usize>(
     sz: usize,
 ) -> Voxel {
     let mut counts = [0u8; 256];
+    let mut top_y = [0u8; 256];
     let mut solid_count = 0u32;
 
     for dx in 0..2 {
@@ -295,6 +322,7 @@ fn sample_region_2x2x2<const N: usize>(
                 if x < N && y < N && z < N {
                     let v = data[x][y][z];
                     counts[v as usize] += 1;
+                    top_y[v as usize] = top_y[v as usize].max(y as u8);
                     if v != 0 {
                         solid_count += 1;
                     }
@@ -308,7 +336,7 @@ fn sample_region_2x2x2<const N: usize>(
         let mut best = 1u8;
         let mut best_count = 0u8;
         for (i, &count) in counts.iter().enumerate().skip(1) {
-            if count > best_count {
+            if count > best_count || (count == best_count && top_y[i] > top_y[best as usize]) {
                 best_count = count;
                 best = i as u8;
             }
@@ -327,6 +355,7 @@ fn sample_region_4x4x4<const N: usize>(
     sz: usize,
 ) -> Voxel {
     let mut counts = [0u16; 256];
+    let mut top_y = [0u8; 256];
     let mut solid_count = 0u32;
 
     for dx in 0..4 {
@@ -338,6 +367,7 @@ fn sample_region_4x4x4<const N: usize>(
                 if x < N && y < N && z < N {
                     let v = data[x][y][z];
                     counts[v as usize] += 1;
+                    top_y[v as usize] = top_y[v as usize].max(y as u8);
                     if v != 0 {
                         solid_count += 1;
                     }
@@ -351,7 +381,7 @@ fn sample_region_4x4x4<const N: usize>(
         let mut best = 1u8;
         let mut best_count = 0u16;
         for (i, &count) in counts.iter().enumerate().skip(1) {
-            if count > best_count {
+            if count > best_count || (count == best_count && top_y[i] > top_y[best as usize]) {
                 best_count = count;
                 best = i as u8;
             }
@@ -370,6 +400,7 @@ fn sample_region_8x8x8(
     sz: usize,
 ) -> Voxel {
     let mut counts = [0u16; 256];
+    let mut top_y = [0u8; 256];
     let mut solid_count = 0u32;
 
     for dx in 0..8 {
@@ -381,6 +412,7 @@ fn sample_region_8x8x8(
                 if x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE {
                     let v = data[x][y][z];
                     counts[v as usize] += 1;
+                    top_y[v as usize] = top_y[v as usize].max(y as u8);
                     if v != 0 {
                         solid_count += 1;
                     }
@@ -394,7 +426,7 @@ fn sample_region_8x8x8(
         let mut best = 1u8;
         let mut best_count = 0u16;
         for (i, &count) in counts.iter().enumerate().skip(1) {
-            if count > best_count {
+            if count > best_count || (count == best_count && top_y[i] > top_y[best as usize]) {
                 best_count = count;
                 best = i as u8;
             }
@@ -536,7 +568,7 @@ pub fn build_lod_from_children(children: &[Option<&VoxelData>; 8]) -> VoxelData 
     }
 
     // Build Full(32^3) by sampling 2x2x2 from each child
-    let mut result = Box::new([[[0u8; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]);
+    let mut result = crate::voxel::chunk::boxed_zero_chunk_data();
 
     for ox in 0..CHUNK_SIZE {
         for oy in 0..CHUNK_SIZE {

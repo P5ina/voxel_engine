@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+
 use std::sync::mpsc;
 
 use glam::Vec3;
@@ -179,7 +181,7 @@ impl AppState {
             let octree = self.octree.take().unwrap();
 
             log::info!("[BigWorld] Compressing chunks for legacy save...");
-            let prepared = prepare_save(&self.world);
+            let prepared = prepare_save(&mut self.world);
 
             self.loading_state = LoadingState::new("Saving world...", 0);
             self.prev_screen = self.ui_screen;
@@ -293,9 +295,11 @@ impl AppState {
         })));
     }
 
-    /// Background thread: load world.meta (octree only, no chunks) for region-based worlds.
-    /// Chunks will stream from region files on demand.
+    /// Background thread: load world.meta + ALL region files for region-based worlds.
+    /// The entire world is loaded into memory before entering the map.
     fn load_region_world_background(path: String, tx: mpsc::Sender<BigWorldGenMessage>) {
+        use crate::world::RegionCoord;
+
         let world_dir = std::path::PathBuf::from(&path);
 
         let _ = tx.send(BigWorldGenMessage::Progress(
@@ -316,12 +320,67 @@ impl AppState {
         let octree = loaded_meta.octree;
 
         log::info!(
-            "[Region] world.meta loaded: octree {} nodes. Computing LOD mesh tasks...",
+            "[Region] world.meta loaded: octree {} nodes.",
             octree.node_count(),
         );
 
-        // No chunks loaded — empty ChunkManager. Chunks stream from region files.
-        let world = ChunkManager::new();
+        // Scan regions/ directory and load ALL region files
+        let regions_dir = world_dir.join("regions");
+        let mut region_files: Vec<(RegionCoord, std::path::PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&regions_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname_str = fname.to_string_lossy();
+                // Parse filenames like "r_X_Z.region"
+                if let Some(rest) = fname_str.strip_prefix("r_") {
+                    if let Some(rest) = rest.strip_suffix(".region") {
+                        let parts: Vec<&str> = rest.splitn(2, '_').collect();
+                        if parts.len() == 2 {
+                            if let (Ok(rx), Ok(rz)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                                region_files.push((RegionCoord::new(rx, rz), entry.path()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_regions = region_files.len();
+        let _ = tx.send(BigWorldGenMessage::Progress(
+            "Loading all regions...".into(),
+            0,
+            total_regions,
+        ));
+
+        let mut world = ChunkManager::new();
+        let mut total_chunks = 0usize;
+        for (i, (coord, _path)) in region_files.iter().enumerate() {
+            match world::region::read_region(&world_dir, *coord) {
+                Ok(chunks) => {
+                    total_chunks += chunks.len();
+                    for (pos, chunk) in chunks {
+                        if !chunk.is_empty() {
+                            world.insert_chunk(pos, chunk);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("[Region] Failed to read region {:?}: {}", coord, e);
+                }
+            }
+            if (i + 1) % 4 == 0 || i + 1 == total_regions {
+                let _ = tx.send(BigWorldGenMessage::Progress(
+                    "Loading all regions...".into(),
+                    i + 1,
+                    total_regions,
+                ));
+            }
+        }
+        log::info!(
+            "[Region] Loaded {} regions ({} chunks from disk)",
+            total_regions,
+            total_chunks,
+        );
 
         let _ = tx.send(BigWorldGenMessage::Progress(
             "Computing mesh tasks...".into(),
@@ -329,7 +388,6 @@ impl AppState {
             1,
         ));
 
-        // Only compute LOD mesh tasks (no LOD0 chunks loaded yet)
         let (mesh_tasks, lod0_count) = Self::compute_mesh_tasks(&world, &octree, spawn_pos);
 
         let _ = tx.send(BigWorldGenMessage::Done(Box::new(BigWorldGenResult {

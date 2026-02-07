@@ -6,10 +6,14 @@ pub mod position;
 pub mod region;
 pub mod streaming;
 
+#[cfg(feature = "dev-tools")]
 pub use bigworld_io::{BigWorldError, load_big_world_fast, prepare_save, write_prepared_save};
 pub use chunk_manager::ChunkManager;
+#[cfg(feature = "dev-tools")]
 pub use lod::LodConfig;
 pub use octree::VoxelOctree;
-pub use position::{ChunkPosition, LodNodeKey, RegionCoord};
+pub use position::{ChunkPosition, ColumnPos, LodNodeKey, RegionCoord};
 pub use region::RegionManager;
-pub use streaming::{ChunkStreamer, StreamingConfig};
+pub use streaming::ChunkStreamer;
+#[cfg(feature = "dev-tools")]
+pub use streaming::StreamingConfig;

@@ -69,6 +69,11 @@ impl Player {
             return;
         }
 
+        // Auto-step small voxel stairs when moving horizontally.
+        if axis != Vec3::Y && self.try_step_up(world, axis, delta) {
+            return;
+        }
+
         let new_pos = self.position + axis * delta;
 
         if self.check_collision(world, new_pos) {
@@ -93,6 +98,50 @@ impl Player {
         } else {
             self.position = new_pos;
         }
+    }
+
+    fn try_step_up<W: CollisionWorld>(&mut self, world: &W, axis: Vec3, delta: f32) -> bool {
+        let step_height = VOXEL_SCALE + 0.06;
+        let steps = (delta.abs().ceil() as i32).max(1) * 4;
+        let step_delta = delta / steps as f32;
+
+        let mut moved = false;
+
+        for _ in 0..steps {
+            let horiz_test = self.position + axis * step_delta;
+            if !self.check_collision(world, horiz_test) {
+                self.position = horiz_test;
+                moved = true;
+                continue;
+            }
+
+            let up_test = self.position + Vec3::Y * step_height;
+            if self.check_collision(world, up_test) {
+                return moved;
+            }
+
+            let stepped_test = up_test + axis * step_delta;
+            if self.check_collision(world, stepped_test) {
+                return moved;
+            }
+
+            self.position = stepped_test;
+            moved = true;
+
+            // Settle down onto the stair top so movement stays grounded.
+            let drop_steps = 4;
+            let drop_step = step_height / drop_steps as f32;
+            for _ in 0..drop_steps {
+                let down_test = self.position - Vec3::Y * drop_step;
+                if self.check_collision(world, down_test) {
+                    self.on_ground = true;
+                    break;
+                }
+                self.position = down_test;
+            }
+        }
+
+        moved
     }
 
     fn check_collision<W: CollisionWorld>(&self, world: &W, pos: Vec3) -> bool {

@@ -1,3 +1,6 @@
+#![cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+
+#[cfg(feature = "dev-tools")]
 use glam::Vec3;
 
 use crate::ui::DebugInfo;
@@ -21,6 +24,55 @@ impl AppState {
             }
         }
 
+        let mut surface_total = 0usize;
+        let mut surface_requested = 0usize;
+        let mut surface_queued = 0usize;
+        let mut surface_meshed = 0usize;
+
+        if let Some(streamer) = &self.chunk_streamer {
+            let lod0_distance = crate::world::lod::LodConfig::default().distances[0];
+            let chunk_world_size = crate::voxel::CHUNK_SIZE as f32 * crate::voxel::VOXEL_SCALE;
+            let max_chunk_radius = (lod0_distance / chunk_world_size).ceil() as i32 + 1;
+
+            for dx in -max_chunk_radius..=max_chunk_radius {
+                for dz in -max_chunk_radius..=max_chunk_radius {
+                    let cx = player_chunk.x + dx;
+                    let cz = player_chunk.z + dz;
+                    let center_vx =
+                        cx * crate::voxel::CHUNK_SIZE as i32 + crate::voxel::CHUNK_SIZE as i32 / 2;
+                    let center_vz =
+                        cz * crate::voxel::CHUNK_SIZE as i32 + crate::voxel::CHUNK_SIZE as i32 / 2;
+                    let surface_chunk_y = Self::terrain_height(center_vx, center_vz)
+                        / crate::voxel::CHUNK_SIZE as i32;
+
+                    for dy in -1..=1 {
+                        let pos = ChunkPosition::new(cx, surface_chunk_y + dy, cz);
+                        let center = pos.center_world_pos();
+                        let dist = glam::Vec3::new(
+                            center.0 - self.player.position.x,
+                            center.1 - self.player.position.y,
+                            center.2 - self.player.position.z,
+                        )
+                        .length();
+                        if dist > lod0_distance {
+                            continue;
+                        }
+
+                        surface_total += 1;
+
+                        if streamer.has_mesh(pos) {
+                            surface_meshed += 1;
+                        } else if streamer.is_queued_lod0(pos) {
+                            surface_queued += 1;
+                        } else if streamer.needs_mesh(pos) || self.streaming_inflight.contains(&pos)
+                        {
+                            surface_requested += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         DebugInfo {
             player_pos: self.player.position.to_array(),
             player_chunk: [player_chunk.x, player_chunk.y, player_chunk.z],
@@ -39,6 +91,10 @@ impl AppState {
                 .chunk_streamer
                 .as_ref()
                 .map_or(0, |s| s.loaded_lod_count()),
+            surface_total,
+            surface_requested,
+            surface_queued,
+            surface_meshed,
             octree_active: self.octree.is_some(),
             octree_nodes: self.octree.as_ref().map_or(0, |o| o.node_count()),
             octree_data_blocks: self.octree.as_ref().map_or(0, |o| o.data_count()),
@@ -47,6 +103,7 @@ impl AppState {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     pub(crate) fn update_editor(&mut self) {
         let now = std::time::Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
@@ -100,6 +157,10 @@ impl AppState {
         self.camera_resources
             .update(&self.render_ctx.queue, &self.camera);
         self.lighting.update_time(0.1);
+
+        if self.use_streaming {
+            self.update_streaming();
+        }
 
         if !self.world.dirty_chunks().is_empty() || !self.pending_chunks.is_empty() {
             self.rebuild_dirty_meshes();

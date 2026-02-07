@@ -38,6 +38,11 @@ pub struct CharacterManager {
     max_triangles: usize,
     texture_size: u32,
     texture_layers: u32,
+
+    // BVH dirty tracking
+    bvh_dirty: bool,
+    last_camera_position: Vec3,
+    last_camera_rotation: glam::Quat,
 }
 
 impl CharacterManager {
@@ -138,6 +143,9 @@ impl CharacterManager {
             max_triangles,
             texture_size,
             texture_layers,
+            bvh_dirty: true,
+            last_camera_position: Vec3::ZERO,
+            last_camera_rotation: glam::Quat::IDENTITY,
         }
     }
 
@@ -262,19 +270,40 @@ impl CharacterManager {
         // Update local player animation
         if let Some(player) = &mut self.local_player {
             player.update(dt);
+            self.bvh_dirty = true;
         }
 
         // Update remote players
         for player in self.remote_players.values_mut() {
             player.update(dt);
+            self.bvh_dirty = true;
         }
 
         // Update first-person view
         self.first_person
             .update(dt, is_walking, is_sprinting, Vec3::ZERO);
+        if is_walking || is_sprinting {
+            self.bvh_dirty = true;
+        }
 
-        // Rebuild BVH with all character triangles
-        self.rebuild_bvh(device, queue, camera_position, camera_rotation);
+        // Check if camera moved/rotated significantly
+        const POS_THRESHOLD: f32 = 0.001;
+        const ROT_THRESHOLD: f32 = 0.0001;
+        let pos_diff = (camera_position - self.last_camera_position).length_squared();
+        let rot_diff = (camera_rotation.conjugate() * self.last_camera_rotation)
+            .w
+            .abs();
+        if pos_diff > POS_THRESHOLD * POS_THRESHOLD || rot_diff < 1.0 - ROT_THRESHOLD {
+            self.bvh_dirty = true;
+            self.last_camera_position = camera_position;
+            self.last_camera_rotation = camera_rotation;
+        }
+
+        // Rebuild BVH with all character triangles only if something changed
+        if self.bvh_dirty {
+            self.rebuild_bvh(device, queue, camera_position, camera_rotation);
+            self.bvh_dirty = false;
+        }
     }
 
     /// Rebuild BVH from all visible characters

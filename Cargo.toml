@@ -3,6 +3,10 @@ name = "voxel_engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+dev-tools = []
+
 [dependencies]
 anyhow = "1.0"
 winit = { version = "0.30", features = ["android-native-activity"] }
@@ -22,3 +26,7 @@ serde_json = "1.0"
 gltf = { version = "1.4", features = ["extras"] }
 rayon = "1.10"
 lz4_flex = "0.11"
+
+[profile.release]
+lto = true
+codegen-units = 1

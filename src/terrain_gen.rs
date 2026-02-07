@@ -1,6 +1,6 @@
 use crate::AppState;
-use crate::voxel::{CHUNK_SIZE, Chunk};
-use crate::world::{self, LodNodeKey};
+use crate::voxel::{CHUNK_SIZE, Chunk, Column, NUM_SECTIONS};
+use crate::world::{self, ColumnPos, LodNodeKey};
 
 impl AppState {
     /// Height of big world terrain in Y chunks
@@ -111,6 +111,29 @@ impl AppState {
         chunk
     }
 
+    /// Generate an entire column of sections at a given XZ position.
+    /// Populates all sections that contain terrain; empty sections are left as None.
+    pub(crate) fn generate_column_data_static(col: ColumnPos) -> Column {
+        let mut column = Column::new();
+
+        for sy in 0..NUM_SECTIONS as i32 {
+            let pos = col.to_chunk_pos(sy as u8);
+            let chunk_bottom_voxel = pos.y * CHUNK_SIZE as i32;
+
+            // Quick reject: above max terrain or below ground
+            if chunk_bottom_voxel > Self::MAX_TERRAIN_VOXEL_HEIGHT || pos.y < 0 {
+                continue;
+            }
+
+            let chunk = Self::generate_chunk_data_static(pos);
+            if !chunk.is_empty() {
+                column.set_section(sy as u8, chunk);
+            }
+        }
+
+        column
+    }
+
     /// Compute terrain height in voxels at world voxel coordinates (wx, wz)
     pub(crate) fn terrain_height(wx: i32, wz: i32) -> i32 {
         let x = wx as f32;
@@ -208,7 +231,13 @@ impl AppState {
             return None;
         }
 
-        let mut result = Box::new([[[0u8; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE]);
+        // Quick reject: if entire node is below Y=0, it's all air (no terrain below ground)
+        let node_top_vy = origin_vy + (CHUNK_SIZE as i32) * real_voxels_per_cell;
+        if node_top_vy <= 0 {
+            return None;
+        }
+
+        let mut result = crate::voxel::chunk::boxed_zero_chunk_data();
         let mut has_solid = false;
 
         for lx in 0..CHUNK_SIZE {
@@ -226,20 +255,48 @@ impl AppState {
                         break; // Rest of column is air
                     }
 
-                    // Assign material based on depth below surface (same logic as generate_chunk_data_static)
+                    // Assign material with hash-based variation (matches generate_chunk_data_static)
                     let depth = height - wy;
                     let v = if height > 700 && depth <= 2 {
-                        15 // Snow
+                        let snow_noise =
+                            Self::hash_2d(wx.wrapping_add(5000), wz.wrapping_add(6000));
+                        if snow_noise < 0.7 { 15 } else { 42 }
                     } else if height > 500 && depth <= 1 {
-                        42 // Mountain rock
+                        let rock_noise =
+                            Self::hash_2d(wx.wrapping_add(3000), wz.wrapping_add(4000));
+                        if rock_noise < 0.5 {
+                            42
+                        } else if rock_noise < 0.8 {
+                            43
+                        } else {
+                            44
+                        }
                     } else if depth <= 1 {
-                        49 // Grass
+                        let grass_noise =
+                            Self::hash_2d(wx.wrapping_add(1000), wz.wrapping_add(2000));
+                        if grass_noise < 0.33 {
+                            49
+                        } else if grass_noise < 0.66 {
+                            50
+                        } else {
+                            51
+                        }
                     } else if depth <= 5 {
                         33 // Dirt
                     } else if depth <= 20 {
-                        42 // Stone
+                        let stone_noise =
+                            Self::hash_2d(wx.wrapping_add(3000), wz.wrapping_add(4000));
+                        if stone_noise < 0.4 {
+                            42
+                        } else if stone_noise < 0.7 {
+                            43
+                        } else {
+                            44
+                        }
                     } else {
-                        44 // Dark stone
+                        let deep_noise =
+                            Self::hash_2d(wx.wrapping_add(7000), wz.wrapping_add(8000));
+                        if deep_noise < 0.5 { 44 } else { 42 }
                     };
                     result[lx][ly][lz] = v;
                     has_solid = true;
@@ -251,6 +308,15 @@ impl AppState {
             return None;
         }
 
-        Some(world::lod::VoxelData::Full(result))
+        let full = world::lod::VoxelData::Full(result);
+        // Downsample to save memory at higher LOD levels.
+        // LOD 1: keep Full(32^3), LOD 2: Lod1(16^3), LOD 3: Lod2(8^3), LOD 4+: Lod3(4^3).
+        let data = match key.lod_level {
+            0 | 1 => full,
+            2 => full.downsample(1),
+            3 => full.downsample(2),
+            _ => full.downsample(3),
+        };
+        Some(data)
     }
 }

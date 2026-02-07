@@ -203,11 +203,12 @@ impl VoxelOctree {
     }
 
     /// Create octree for a specific world size in meters, origin at (0,0,0)
-    /// 1 meter = 16 voxels, 1 chunk = 32 voxels = 2 meters
+    /// Uses current voxel/chunk scale to convert meters to chunk count.
     pub fn for_world_size_meters(meters: u32) -> Self {
-        // Convert meters to chunks (32 voxels per chunk, 16 voxels per meter)
-        // meters * 16 voxels/meter / 32 voxels/chunk = meters / 2 chunks
-        let chunks = (meters / 2).next_power_of_two();
+        let chunk_world_meters = crate::voxel::CHUNK_SIZE as f32 * crate::voxel::VOXEL_SCALE;
+        let chunks = ((meters as f32 / chunk_world_meters).ceil() as u32)
+            .max(1)
+            .next_power_of_two();
         Self::new_at_origin(chunks, IVec3::ZERO)
     }
 
@@ -232,12 +233,13 @@ impl VoxelOctree {
 
         // Check if chunk is homogeneous
         if let Some(value) = data.is_homogeneous() {
-            node.flags.set_homogeneous(true);
-            node.homogeneous_value = value;
-            // Free old data if any
-            if node.data_index != 0 {
+            // Free old data if the node previously held non-homogeneous data.
+            // Use flags instead of data_index != 0 to correctly handle data at index 0.
+            if !node.flags.is_homogeneous() && node.flags.is_loaded() {
                 self.free_data_indices.push(node.data_index);
             }
+            node.flags.set_homogeneous(true);
+            node.homogeneous_value = value;
             node.data_index = 0;
         } else {
             node.flags.set_homogeneous(false);
@@ -458,13 +460,9 @@ impl VoxelOctree {
                 continue;
             }
 
-            // Parallel compute: read from voxel_data (immutable), produce LOD results
-            // SAFETY: voxel_data is only read during par_iter; all writes happen after collect().
-            // Children data at level L-1 was written in the previous iteration and is stable.
-            // We fabricate a shared slice to avoid borrow checker conflicts with &mut self.
-            let vd_slice: &[VoxelData] = unsafe {
-                std::slice::from_raw_parts(self.voxel_data.as_ptr(), self.voxel_data.len())
-            };
+            // Temporarily take voxel_data out for safe parallel read access.
+            // This avoids unsafe: the parallel phase reads immutably, then we put it back.
+            let vd_snapshot = std::mem::take(&mut self.voxel_data);
 
             let results: Vec<(u32, IVec3, VoxelData)> = dirty_items
                 .par_iter()
@@ -487,14 +485,25 @@ impl VoxelOctree {
                         } else if is_homo {
                             Some(&homo_storage[i])
                         } else {
-                            vd_slice.get(data_idx as usize)
+                            vd_snapshot.get(data_idx as usize)
                         }
                     });
 
-                    let lod_data = build_lod_from_children(&refs);
+                    let full_data = build_lod_from_children(&refs);
+                    // Downsample to save memory at higher LOD levels.
+                    // Level 1: keep Full(32^3), 2: Lod1(16^3), 3: Lod2(8^3), 4+: Lod3(4^3).
+                    let lod_data = match level {
+                        0 | 1 => full_data,
+                        2 => full_data.downsample(1),
+                        3 => full_data.downsample(2),
+                        _ => full_data.downsample(3),
+                    };
                     (node_idx, offset, lod_data)
                 })
                 .collect();
+
+            // Put voxel_data back before modifying
+            self.voxel_data = vd_snapshot;
 
             // Sequential store: write LOD results back into the octree
             let world_min = self.world_min;

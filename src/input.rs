@@ -51,34 +51,20 @@ impl AppState {
 
         // Handle Escape for all screens
         if code == KeyCode::Escape {
-            match self.ui_screen {
-                UiScreen::InGame => {
-                    self.ui_screen = UiScreen::PauseMenu;
-                    self.grab_mouse(false);
-                }
-                UiScreen::PauseMenu => {
-                    self.ui_screen = UiScreen::InGame;
-                    self.grab_mouse(true);
-                }
-                UiScreen::Editor => {
-                    self.prev_screen = UiScreen::Editor;
-                    self.ui_screen = UiScreen::EditorPause;
-                    self.grab_mouse(false);
-                }
-                UiScreen::EditorPause => {
-                    self.ui_screen = UiScreen::Editor;
-                    self.grab_mouse(true);
-                }
-                UiScreen::Settings => {
-                    self.ui_screen = self.prev_screen;
-                }
-                UiScreen::WorldSelect => {
-                    self.ui_screen = UiScreen::MainMenu;
-                }
-                UiScreen::MainMenu => {}
-                UiScreen::Loading => {
-                    // Can't escape during loading
-                }
+            if self.ui_screen == UiScreen::InGame {
+                self.ui_screen = UiScreen::PauseMenu;
+                self.grab_mouse(false);
+            } else if self.ui_screen == UiScreen::PauseMenu {
+                self.ui_screen = UiScreen::InGame;
+                self.grab_mouse(true);
+            } else if self.ui_screen == UiScreen::Matchmaking {
+                self.ui_screen = UiScreen::MainMenu;
+            } else if self.ui_screen == UiScreen::MapSelect {
+                self.ui_screen = UiScreen::MainMenu;
+            } else if self.ui_screen == UiScreen::Settings {
+                self.ui_screen = self.prev_screen;
+            } else if self.ui_screen != UiScreen::MainMenu {
+                self.handle_dev_escape();
             }
             return;
         }
@@ -90,13 +76,13 @@ impl AppState {
         }
 
         // Handle Ctrl+S for save in editor
-        if self.ui_screen == UiScreen::Editor && self.input.ctrl && code == KeyCode::KeyS {
-            self.save_big_world_to_file();
+        if self.handle_dev_key(code) {
             return;
         }
 
         // Movement keys for InGame and Editor
-        if self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::Editor {
+        let can_move = self.ui_screen == UiScreen::InGame || self.can_move_editor();
+        if can_move {
             match code {
                 KeyCode::KeyW => self.input.forward = true,
                 KeyCode::KeyS => self.input.backward = true,
@@ -131,9 +117,9 @@ impl AppState {
     }
 
     pub(crate) fn handle_mouse_motion(&mut self, delta: (f64, f64)) {
-        if self.mouse_grabbed
-            && (self.ui_screen == UiScreen::InGame || self.ui_screen == UiScreen::Editor)
-        {
+        let allow_look = self.ui_screen == UiScreen::InGame || self.can_move_editor();
+
+        if self.mouse_grabbed && allow_look {
             let sensitivity = self.game_settings.sensitivity;
             self.camera
                 .process_mouse(delta.0 as f32, delta.1 as f32, sensitivity);
@@ -152,8 +138,10 @@ impl AppState {
             return;
         }
 
-        // Only handle block interaction in game or editor mode
-        if self.ui_screen != UiScreen::InGame && self.ui_screen != UiScreen::Editor {
+        let can_interact = self.ui_screen == UiScreen::InGame || self.can_move_editor();
+
+        // Only handle block interaction in active gameplay modes
+        if !can_interact {
             return;
         }
 
@@ -165,24 +153,18 @@ impl AppState {
             self.world.is_solid(x, y, z)
         });
 
-        let is_editor = self.ui_screen == UiScreen::Editor;
-        // Get color to place from editor or default
+        let is_editor = self.editor_active();
         let color_to_place = if is_editor {
             self.editor_state.selected_color
         } else {
             33 // Default dirt color
         };
 
-        // Get brush settings
-        let (brush_shape, brush_size) = if is_editor {
-            (
-                self.editor_state.brush_shape,
-                self.editor_state.brush_size as i32,
-            )
-        } else {
-            // In game mode: sphere destruction with radius 8
-            (BrushShape::Sphere, 8)
-        };
+        // Get brush settings (editor only)
+        let (brush_shape, brush_size) = (
+            self.editor_state.brush_shape,
+            self.editor_state.brush_size as i32,
+        );
 
         match button {
             MouseButton::Left => {
@@ -192,8 +174,12 @@ impl AppState {
                 if let Some(hit) = hit {
                     let [cx, cy, cz] = hit.block_pos;
 
-                    // Apply brush pattern for destruction using batch operation
-                    let positions = Self::get_brush_positions(brush_shape, brush_size, cx, cy, cz);
+                    // In game mode, punch destroys an exact 2x2x2 voxel block.
+                    let positions = if is_editor {
+                        Self::get_brush_positions(brush_shape, brush_size, cx, cy, cz)
+                    } else {
+                        Self::get_punch_positions_2x2(cx, cy, cz)
+                    };
                     let batch: Vec<_> = positions
                         .into_iter()
                         .filter(|&(x, y, z)| self.world.is_solid(x, y, z))
@@ -201,6 +187,7 @@ impl AppState {
                         .collect();
                     self.mark_regions_dirty_for_edits(&batch);
                     self.world.set_voxels_batch(&batch);
+                    self.update_octree_for_edits(&batch);
                 }
             }
             MouseButton::Right => {
@@ -231,9 +218,29 @@ impl AppState {
                         .collect();
                     self.mark_regions_dirty_for_edits(&batch);
                     self.world.set_voxels_batch(&batch);
+                    self.update_octree_for_edits(&batch);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Update octree LOD data for chunks affected by voxel edits.
+    /// This triggers LOD dirty propagation so LOD meshes rebuild.
+    pub(crate) fn update_octree_for_edits(&mut self, batch: &[(i32, i32, i32, u8)]) {
+        let Some(ref mut octree) = self.octree else {
+            return;
+        };
+        let mut seen = HashSet::new();
+        for &(wx, wy, wz, _) in batch {
+            let (chunk_pos, _, _, _) = ChunkPosition::world_to_local(wx, wy, wz);
+            if !seen.insert(chunk_pos) {
+                continue;
+            }
+            if let Some(chunk) = self.world.get_chunk(chunk_pos) {
+                let data = crate::world::lod::VoxelData::from_full(*chunk.data());
+                octree.insert_chunk(chunk_pos, data);
+            }
         }
     }
 
@@ -294,5 +301,21 @@ impl AppState {
                 positions
             }
         }
+    }
+
+    /// Generate a 2x2x2 voxel block around the hit voxel, aligned to even voxel coordinates.
+    pub(crate) fn get_punch_positions_2x2(cx: i32, cy: i32, cz: i32) -> Vec<(i32, i32, i32)> {
+        let start_x = cx & !1;
+        let start_y = cy & !1;
+        let start_z = cz & !1;
+        let mut positions = Vec::with_capacity(8);
+        for dx in 0..=1 {
+            for dy in 0..=1 {
+                for dz in 0..=1 {
+                    positions.push((start_x + dx, start_y + dy, start_z + dz));
+                }
+            }
+        }
+        positions
     }
 }

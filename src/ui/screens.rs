@@ -1,9 +1,12 @@
 use egui::{Align, Align2, Area, Color32, FontId, RichText, Vec2};
 
-use super::{
-    BrushShape, DebugInfo, EditorState, GameSettings, LightingMode, LoadingState, UiMessage,
-    WorldSelectState,
-};
+#[cfg(feature = "dev-tools")]
+use super::LoadingState;
+use super::MapSelectState;
+#[cfg(feature = "dev-tools")]
+use super::{BrushShape, EditorState, WorldSelectState};
+use super::{DebugInfo, GameSettings, LightingMode, PerformancePreset, UiMessage};
+#[cfg(feature = "dev-tools")]
 use crate::pathtracer::Palette;
 
 pub fn main_menu(ctx: &egui::Context) -> Option<UiMessage> {
@@ -23,10 +26,18 @@ pub fn main_menu(ctx: &egui::Context) -> Option<UiMessage> {
 
                 ui.add_space(40.0);
 
-                if menu_button(ui, "Worlds") {
-                    msg = Some(UiMessage::OpenWorldSelect);
+                if menu_button(ui, "Play") {
+                    msg = Some(UiMessage::OpenMapSelect);
                 }
 
+                ui.add_space(10.0);
+
+                #[cfg(feature = "dev-tools")]
+                if menu_button(ui, "Developer Tools") {
+                    msg = Some(UiMessage::OpenDevTools);
+                }
+
+                #[cfg(feature = "dev-tools")]
                 ui.add_space(10.0);
 
                 if menu_button(ui, "Settings") {
@@ -44,6 +55,156 @@ pub fn main_menu(ctx: &egui::Context) -> Option<UiMessage> {
     msg
 }
 
+pub fn matchmaking(ctx: &egui::Context) -> Option<UiMessage> {
+    let mut msg = None;
+
+    Area::new(egui::Id::new("matchmaking"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+
+                ui.label(
+                    RichText::new("MATCHMAKING")
+                        .font(FontId::proportional(48.0))
+                        .color(Color32::WHITE),
+                );
+
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("Prototype flow: queue starts after map selection.")
+                        .font(FontId::proportional(16.0))
+                        .color(Color32::GRAY),
+                );
+
+                ui.add_space(25.0);
+
+                if menu_button(ui, "Find Match") {
+                    msg = Some(UiMessage::FindMatch);
+                }
+
+                ui.add_space(10.0);
+
+                if menu_button(ui, "Back") {
+                    msg = Some(UiMessage::CancelMatchmaking);
+                }
+            });
+        });
+
+    msg
+}
+
+pub fn map_select(ctx: &egui::Context, state: &MapSelectState) -> Option<UiMessage> {
+    let mut msg = None;
+
+    Area::new(egui::Id::new("map_select"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+
+                ui.label(
+                    RichText::new("SELECT MAP")
+                        .font(FontId::proportional(48.0))
+                        .color(Color32::WHITE),
+                );
+
+                ui.add_space(20.0);
+
+                egui::Frame::new()
+                    .fill(Color32::from_black_alpha(100))
+                    .inner_margin(12.0)
+                    .corner_radius(8.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(500.0);
+                        ui.set_max_height(360.0);
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if state.worlds.is_empty() {
+                                ui.add_space(20.0);
+                                ui.label(
+                                    RichText::new("No playable maps found in maps/")
+                                        .font(FontId::proportional(16.0))
+                                        .color(Color32::GRAY),
+                                );
+                                ui.add_space(20.0);
+                            }
+
+                            for world in &state.worlds {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(&world.name)
+                                            .font(FontId::proportional(20.0))
+                                            .color(Color32::WHITE),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(Align::Center),
+                                        |ui| {
+                                            let play_btn = egui::Button::new(
+                                                RichText::new("Queue")
+                                                    .font(FontId::proportional(16.0))
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .fill(Color32::from_rgb(50, 70, 100))
+                                            .corner_radius(4.0)
+                                            .min_size(Vec2::new(90.0, 32.0));
+
+                                            if ui.add(play_btn).clicked() {
+                                                msg =
+                                                    Some(UiMessage::SelectMap(world.path.clone()));
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
+                            }
+                        });
+                    });
+
+                ui.add_space(12.0);
+                if menu_button(ui, "Back") {
+                    msg = Some(UiMessage::Back);
+                }
+            });
+        });
+
+    msg
+}
+
+#[cfg(feature = "dev-tools")]
+pub fn dev_tools(ctx: &egui::Context) -> Option<UiMessage> {
+    let mut msg = None;
+
+    Area::new(egui::Id::new("dev_tools"))
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+
+                ui.label(
+                    RichText::new("DEVELOPER TOOLS")
+                        .font(FontId::proportional(48.0))
+                        .color(Color32::WHITE),
+                );
+
+                ui.add_space(30.0);
+
+                if menu_button(ui, "World Browser") {
+                    msg = Some(UiMessage::OpenWorldSelect);
+                }
+
+                ui.add_space(10.0);
+
+                if menu_button(ui, "Back") {
+                    msg = Some(UiMessage::Back);
+                }
+            });
+        });
+
+    msg
+}
+
+#[cfg(feature = "dev-tools")]
 pub fn world_select(ctx: &egui::Context, state: &mut WorldSelectState) -> Option<UiMessage> {
     let mut msg = None;
 
@@ -259,11 +420,14 @@ pub fn pause_menu(ctx: &egui::Context) -> Option<UiMessage> {
 
                 ui.add_space(10.0);
 
-                if menu_button(ui, "Save World") {
-                    msg = Some(UiMessage::SaveBigWorld);
-                }
+                #[cfg(feature = "dev-tools")]
+                {
+                    if menu_button(ui, "Save World") {
+                        msg = Some(UiMessage::SaveBigWorld);
+                    }
 
-                ui.add_space(10.0);
+                    ui.add_space(10.0);
+                }
 
                 if menu_button(ui, "Settings") {
                     msg = Some(UiMessage::Settings);
@@ -322,6 +486,33 @@ pub fn settings(ctx: &egui::Context, settings: &mut GameSettings) -> Option<UiMe
                                     egui::Slider::new(&mut settings.sensitivity, 0.001..=0.01)
                                         .show_value(true),
                                 );
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Performance").color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                egui::ComboBox::from_id_salt("performance_preset")
+                                    .selected_text(settings.performance_preset.name())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut settings.performance_preset,
+                                            PerformancePreset::Potato,
+                                            "Potato",
+                                        );
+                                        ui.selectable_value(
+                                            &mut settings.performance_preset,
+                                            PerformancePreset::Balanced,
+                                            "Balanced",
+                                        );
+                                        ui.selectable_value(
+                                            &mut settings.performance_preset,
+                                            PerformancePreset::High,
+                                            "High",
+                                        );
+                                    });
                             });
                         });
 
@@ -479,6 +670,17 @@ fn debug_overlay(ctx: &egui::Context, fps: f32, dbg: &DebugInfo) {
                             .font(mono.clone())
                             .color(white),
                         );
+                        ui.label(
+                            RichText::new(format!(
+                                "Surface LOD0: total {}  meshed {}  requested {}  queued {}",
+                                dbg.surface_total,
+                                dbg.surface_meshed,
+                                dbg.surface_requested,
+                                dbg.surface_queued
+                            ))
+                            .font(mono.clone())
+                            .color(white),
+                        );
                     }
 
                     // Octree info
@@ -522,6 +724,7 @@ fn menu_button(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(button).clicked()
 }
 
+#[cfg(feature = "dev-tools")]
 pub fn editor_hud(ctx: &egui::Context, editor: &mut EditorState, fps: f32) -> Option<UiMessage> {
     // Crosshair - draw directly with painter to avoid capturing input
     let screen_rect = ctx.input(|i| i.viewport_rect());
@@ -705,6 +908,7 @@ pub fn editor_hud(ctx: &egui::Context, editor: &mut EditorState, fps: f32) -> Op
     None
 }
 
+#[cfg(feature = "dev-tools")]
 pub fn editor_pause(ctx: &egui::Context) -> Option<UiMessage> {
     let mut msg = None;
 
@@ -750,6 +954,7 @@ pub fn editor_pause(ctx: &egui::Context) -> Option<UiMessage> {
     msg
 }
 
+#[cfg(feature = "dev-tools")]
 pub fn loading_screen(ctx: &egui::Context, state: &LoadingState) {
     // Dark background
     egui::Area::new(egui::Id::new("loading_bg"))

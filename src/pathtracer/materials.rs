@@ -251,6 +251,7 @@ impl Palette {
         Self { materials }
     }
 
+    #[cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
     pub fn get(&self, index: u8) -> &Material {
         &self.materials[index as usize]
     }

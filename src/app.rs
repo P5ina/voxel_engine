@@ -4,12 +4,15 @@ use winit::{
     application::ApplicationHandler,
     event::*,
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::PhysicalKey,
     window::Window,
 };
 
 use crate::AppState;
+#[cfg(feature = "dev-tools")]
 use crate::ui::UiScreen;
+#[cfg(feature = "dev-tools")]
+use winit::keyboard::KeyCode;
 
 pub struct App {
     state: Option<AppState>,
@@ -78,6 +81,7 @@ impl ApplicationHandler<AppState> for App {
         }
 
         // Handle Tab for editor mouse toggle BEFORE egui consumes it
+        #[cfg(feature = "dev-tools")]
         if let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {
@@ -133,6 +137,14 @@ impl ApplicationHandler<AppState> for App {
 
 pub fn run() -> Result<(), winit::error::EventLoopError> {
     env_logger::init();
+
+    // Rayon workers need generous stacks for 32KB Chunk allocations (Chunk::new,
+    // chunk.clone, Box::new for VoxelData) that accumulate across call frames.
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(8 * 1024 * 1024)
+        .build_global()
+        .ok();
+
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = App::new();
     event_loop.run_app(&mut app)?;

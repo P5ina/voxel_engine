@@ -61,9 +61,68 @@ impl ChunkPosition {
     }
 }
 
+impl ChunkPosition {
+    /// Get the column position (XZ) for this chunk
+    pub fn column_pos(&self) -> ColumnPos {
+        ColumnPos {
+            x: self.x,
+            z: self.z,
+        }
+    }
+
+    /// Get the section Y index within a column (0..NUM_SECTIONS)
+    pub fn section_y(&self) -> Option<u8> {
+        if self.y >= 0 && self.y < crate::voxel::chunk::NUM_SECTIONS as i32 {
+            Some(self.y as u8)
+        } else {
+            None
+        }
+    }
+}
+
 impl Default for ChunkPosition {
     fn default() -> Self {
         Self::new(0, 0, 0)
+    }
+}
+
+/// Identifies a vertical column of sections at (x, z) in chunk coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ColumnPos {
+    pub x: i32,
+    pub z: i32,
+}
+
+impl ColumnPos {
+    pub fn new(x: i32, z: i32) -> Self {
+        Self { x, z }
+    }
+
+    /// Derive column position from a chunk position (drops Y).
+    pub fn from_chunk_pos(pos: ChunkPosition) -> Self {
+        Self { x: pos.x, z: pos.z }
+    }
+
+    /// Derive column position from world-space position (f32).
+    pub fn from_world_pos(wx: f32, wz: f32) -> Self {
+        let cp = ChunkPosition::from_world_pos(wx, 0.0, wz);
+        Self { x: cp.x, z: cp.z }
+    }
+
+    /// Center of this column in world coordinates (XZ only).
+    pub fn center_world_pos(&self) -> (f32, f32) {
+        use crate::voxel::chunk::VOXEL_SCALE;
+        let chunk_size = CHUNK_SIZE as f32;
+        let half_chunk = chunk_size / 2.0;
+        (
+            (self.x as f32 * chunk_size + half_chunk) * VOXEL_SCALE,
+            (self.z as f32 * chunk_size + half_chunk) * VOXEL_SCALE,
+        )
+    }
+
+    /// Convert to a ChunkPosition at the given section Y.
+    pub fn to_chunk_pos(self, section_y: u8) -> ChunkPosition {
+        ChunkPosition::new(self.x, section_y as i32, self.z)
     }
 }
 

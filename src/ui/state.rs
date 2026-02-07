@@ -1,17 +1,28 @@
+#![cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiScreen {
     #[default]
     MainMenu,
+    MapSelect,
+    Matchmaking,
+    #[cfg(feature = "dev-tools")]
+    DevTools,
+    #[cfg(feature = "dev-tools")]
     WorldSelect,
     Settings,
     InGame,
     PauseMenu,
+    #[cfg(feature = "dev-tools")]
     Editor,
+    #[cfg(feature = "dev-tools")]
     EditorPause,
+    #[cfg(feature = "dev-tools")]
     Loading,
 }
 
 /// Info about a saved world file
+#[cfg(feature = "dev-tools")]
 #[derive(Clone)]
 pub struct WorldInfo {
     pub name: String,
@@ -21,6 +32,7 @@ pub struct WorldInfo {
 }
 
 /// State for the world select screen
+#[cfg(feature = "dev-tools")]
 #[derive(Clone, Default)]
 pub struct WorldSelectState {
     pub worlds: Vec<WorldInfo>,
@@ -29,6 +41,7 @@ pub struct WorldSelectState {
 }
 
 /// Loading screen state
+#[cfg(feature = "dev-tools")]
 #[derive(Clone)]
 pub struct LoadingState {
     pub message: String,
@@ -37,6 +50,7 @@ pub struct LoadingState {
     pub chunks_total: usize,
 }
 
+#[cfg(feature = "dev-tools")]
 impl Default for LoadingState {
     fn default() -> Self {
         Self {
@@ -48,6 +62,7 @@ impl Default for LoadingState {
     }
 }
 
+#[cfg(feature = "dev-tools")]
 impl LoadingState {
     pub fn new(message: &str, total: usize) -> Self {
         Self {
@@ -68,20 +83,43 @@ impl LoadingState {
 
 #[derive(Debug, Clone)]
 pub enum UiMessage {
+    OpenMapSelect,
+    SelectMap(String),
+    FindMatch,
+    CancelMatchmaking,
     Settings,
     Exit,
     Back,
     Resume,
     QuitToMenu,
     // Editor
+    #[cfg(feature = "dev-tools")]
     EditorQuitToMenu,
+    #[cfg(feature = "dev-tools")]
+    OpenDevTools,
     // World select
+    #[cfg(feature = "dev-tools")]
     OpenWorldSelect,
+    #[cfg(feature = "dev-tools")]
     PlayWorld(String),
+    #[cfg(feature = "dev-tools")]
     EditWorld(String),
+    #[cfg(feature = "dev-tools")]
     CreateNewMap(String),
     // Save
+    #[cfg(feature = "dev-tools")]
     SaveBigWorld,
+}
+
+#[derive(Clone, Default)]
+pub struct MapSelectState {
+    pub worlds: Vec<PlayableWorld>,
+}
+
+#[derive(Clone)]
+pub struct PlayableWorld {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +127,24 @@ pub enum LightingMode {
     #[default]
     Simple,
     PathTracing,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum PerformancePreset {
+    #[default]
+    Potato,
+    Balanced,
+    High,
+}
+
+impl PerformancePreset {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PerformancePreset::Potato => "Potato",
+            PerformancePreset::Balanced => "Balanced",
+            PerformancePreset::High => "High",
+        }
+    }
 }
 
 impl LightingMode {
@@ -127,6 +183,7 @@ pub struct GameSettings {
     pub fov: f32,
     pub sensitivity: f32,
     pub lighting_mode: LightingMode,
+    pub performance_preset: PerformancePreset,
     pub show_debug: bool,
 }
 
@@ -136,6 +193,7 @@ impl Default for GameSettings {
             fov: 70.0,
             sensitivity: 0.003,
             lighting_mode: LightingMode::Simple,
+            performance_preset: PerformancePreset::Balanced,
             show_debug: false,
         }
     }
@@ -155,6 +213,10 @@ pub struct DebugInfo {
     pub streaming_loaded: usize,
     pub streaming_queue: usize,
     pub streaming_lod_nodes: usize,
+    pub surface_total: usize,
+    pub surface_requested: usize,
+    pub surface_queued: usize,
+    pub surface_meshed: usize,
     // Octree
     pub octree_active: bool,
     pub octree_nodes: usize,

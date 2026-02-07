@@ -8,7 +8,6 @@ use wgpu::util::DeviceExt;
 use crate::camera::Camera;
 use crate::ui::LightingMode;
 use crate::voxel::{CHUNK_SIZE, VOXEL_SCALE};
-use crate::world::ChunkManager;
 
 pub use gbuffer::GBuffer;
 pub use materials::Palette;
@@ -72,6 +71,7 @@ impl Default for PathTracerParams {
 
 /// Accumulation buffer for temporal accumulation
 /// Uses 3 textures: current (path trace output), history (prev accumulated), output (new accumulated)
+#[allow(dead_code)]
 pub struct AccumulationBuffer {
     pub current_texture: wgpu::Texture,
     pub current_view: wgpu::TextureView,
@@ -146,6 +146,7 @@ impl AccumulationBuffer {
 }
 
 /// Main path tracer structure
+#[allow(dead_code)]
 pub struct PathTracer {
     pub gbuffer: GBuffer,
     pub accumulation: AccumulationBuffer,
@@ -190,7 +191,12 @@ pub struct PathTracer {
     pub tonemap_pipeline: wgpu::RenderPipeline,
     pub tonemap_bind_group_layout: wgpu::BindGroupLayout,
     pub tonemap_bind_group: wgpu::BindGroup,
+    pub tonemap_bind_group_simple: wgpu::BindGroup,
     pub tonemap_sampler: wgpu::Sampler,
+
+    // Internal depth buffer (at internal resolution for G-buffer pass)
+    pub depth_texture: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
 
     // State
     pub frame_index: u32,
@@ -198,6 +204,9 @@ pub struct PathTracer {
     pub prev_view_proj: Mat4,
     pub width: u32,
     pub height: u32,
+    pub render_scale: f32,
+    pub internal_width: u32,
+    pub internal_height: u32,
 }
 
 impl PathTracer {
@@ -212,11 +221,15 @@ impl PathTracer {
         texture_bind_group_layout: &wgpu::BindGroupLayout,
         character_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
-        // Create G-buffer
-        let gbuffer = GBuffer::new(device, width, height);
+        let render_scale: f32 = 1.0;
+        let internal_width = ((width as f32 * render_scale) as u32).max(1);
+        let internal_height = ((height as f32 * render_scale) as u32).max(1);
 
-        // Create accumulation buffers
-        let accumulation = AccumulationBuffer::new(device, width, height);
+        // Create G-buffer at internal resolution
+        let gbuffer = GBuffer::new(device, internal_width, internal_height);
+
+        // Create accumulation buffers at internal resolution
+        let accumulation = AccumulationBuffer::new(device, internal_width, internal_height);
 
         // Create params buffer
         let params = PathTracerParams::default();
@@ -291,8 +304,8 @@ impl PathTracer {
         let step_sizes: [u32; 3] = [1, 2, 4];
         let denoise_params_buffers: [wgpu::Buffer; 3] = std::array::from_fn(|i| {
             let params = DenoiseParams {
-                screen_width: width,
-                screen_height: height,
+                screen_width: internal_width,
+                screen_height: internal_height,
                 step_size: step_sizes[i],
                 _padding: 0,
             };
@@ -304,7 +317,11 @@ impl PathTracer {
         });
 
         let (denoise_ping_texture, denoise_ping_view, denoise_pong_texture, denoise_pong_view) =
-            Self::create_denoise_textures(device, width, height);
+            Self::create_denoise_textures(device, internal_width, internal_height);
+
+        // Create internal depth buffer at internal resolution
+        let (depth_texture, depth_view) =
+            Self::create_depth_texture(device, internal_width, internal_height);
 
         // Create bind groups
         let pathtrace_bind_group = Self::create_pathtrace_bind_group(
@@ -339,6 +356,15 @@ impl PathTracer {
             device,
             &tonemap_bind_group_layout,
             &accumulation.output_view,
+            &tonemap_sampler,
+            &params_buffer,
+        );
+
+        // Simple mode tonemap reads current_texture directly (no copy needed)
+        let tonemap_bind_group_simple = Self::create_tonemap_bind_group(
+            device,
+            &tonemap_bind_group_layout,
+            &accumulation.current_view,
             &tonemap_sampler,
             &params_buffer,
         );
@@ -382,12 +408,18 @@ impl PathTracer {
             tonemap_pipeline,
             tonemap_bind_group_layout,
             tonemap_bind_group,
+            tonemap_bind_group_simple,
             tonemap_sampler,
+            depth_texture,
+            depth_view,
             frame_index: 0,
             accumulated_frames: 0,
             prev_view_proj: Mat4::IDENTITY,
             width,
             height,
+            render_scale,
+            internal_width,
+            internal_height,
             world_size: (CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE),
             world_origin: (0, 0, 0),
         }
@@ -800,6 +832,29 @@ impl PathTracer {
         (ping, ping_view, pong, pong_view)
     }
 
+    fn create_depth_texture(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("PT Internal Depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
     fn create_denoise_bind_groups_multipass(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -1056,12 +1111,22 @@ impl PathTracer {
 
         self.width = width;
         self.height = height;
+        self.internal_width = ((width as f32 * self.render_scale) as u32).max(1);
+        self.internal_height = ((height as f32 * self.render_scale) as u32).max(1);
 
-        // Recreate G-buffer
-        self.gbuffer = GBuffer::new(device, width, height);
+        let iw = self.internal_width;
+        let ih = self.internal_height;
 
-        // Recreate accumulation buffers
-        self.accumulation = AccumulationBuffer::new(device, width, height);
+        // Recreate G-buffer at internal resolution
+        self.gbuffer = GBuffer::new(device, iw, ih);
+
+        // Recreate accumulation buffers at internal resolution
+        self.accumulation = AccumulationBuffer::new(device, iw, ih);
+
+        // Recreate internal depth buffer
+        let (dt, dv) = Self::create_depth_texture(device, iw, ih);
+        self.depth_texture = dt;
+        self.depth_view = dv;
 
         // Recreate bind groups
         self.pathtrace_bind_group = Self::create_pathtrace_bind_group(
@@ -1099,9 +1164,16 @@ impl PathTracer {
             &self.params_buffer,
         );
 
-        // Recreate denoise buffers
-        let (ping, ping_view, pong, pong_view) =
-            Self::create_denoise_textures(device, width, height);
+        self.tonemap_bind_group_simple = Self::create_tonemap_bind_group(
+            device,
+            &self.tonemap_bind_group_layout,
+            &self.accumulation.current_view,
+            &self.tonemap_sampler,
+            &self.params_buffer,
+        );
+
+        // Recreate denoise buffers at internal resolution
+        let (ping, ping_view, pong, pong_view) = Self::create_denoise_textures(device, iw, ih);
         self.denoise_ping_texture = ping;
         self.denoise_ping_view = ping_view;
         self.denoise_pong_texture = pong;
@@ -1111,8 +1183,8 @@ impl PathTracer {
         let step_sizes: [u32; 3] = [1, 2, 4];
         self.denoise_params_buffers = std::array::from_fn(|i| {
             let params = DenoiseParams {
-                screen_width: width,
-                screen_height: height,
+                screen_width: iw,
+                screen_height: ih,
                 step_size: step_sizes[i],
                 _padding: 0,
             };
@@ -1123,7 +1195,7 @@ impl PathTracer {
             })
         });
 
-        // Recreate denoise bind groups for 5 passes
+        // Recreate denoise bind groups
         self.denoise_bind_groups = Self::create_denoise_bind_groups_multipass(
             device,
             &self.denoise_bind_group_layout,
@@ -1138,219 +1210,13 @@ impl PathTracer {
         self.accumulated_frames = 0;
     }
 
-    /// Update voxels from a multi-chunk world
-    pub fn update_world_voxels(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        world: &ChunkManager,
-    ) {
-        // Get world bounds
-        let Some((min, max)) = world.bounds() else {
-            return;
-        };
-
-        // Calculate world size in blocks
-        let chunks_x = (max.x - min.x + 1) as usize;
-        let chunks_y = (max.y - min.y + 1) as usize;
-        let chunks_z = (max.z - min.z + 1) as usize;
-
-        let size_x = chunks_x * CHUNK_SIZE;
-        let size_y = chunks_y * CHUNK_SIZE;
-        let size_z = chunks_z * CHUNK_SIZE;
-
-        // GPU texture size limit (most GPUs support at least 2048)
-        const MAX_TEXTURE_SIZE: usize = 2048;
-
-        // Skip path tracer voxel texture update if world is too large
-        if size_x > MAX_TEXTURE_SIZE || size_y > MAX_TEXTURE_SIZE || size_z > MAX_TEXTURE_SIZE {
-            log::warn!(
-                "[PathTracer] World too large for voxel texture ({}x{}x{}), max is {}. Path tracing disabled for this world.",
-                size_x,
-                size_y,
-                size_z,
-                MAX_TEXTURE_SIZE
-            );
+    pub fn set_render_scale(&mut self, device: &wgpu::Device, width: u32, height: u32, scale: f32) {
+        let scale = scale.clamp(0.5, 1.0);
+        if (self.render_scale - scale).abs() < f32::EPSILON {
             return;
         }
-
-        // Check if we need to resize the voxel texture
-        let needs_resize = size_x != self.world_size.0
-            || size_y != self.world_size.1
-            || size_z != self.world_size.2;
-
-        if needs_resize {
-            // Create new voxel texture with appropriate size
-            self.voxel_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Voxel Texture"),
-                size: wgpu::Extent3d {
-                    width: size_x as u32,
-                    height: size_y as u32,
-                    depth_or_array_layers: size_z as u32,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D3,
-                format: wgpu::TextureFormat::R8Uint,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            self.voxel_view = self
-                .voxel_texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.world_size = (size_x, size_y, size_z);
-            self.world_origin = (
-                min.x * CHUNK_SIZE as i32,
-                min.y * CHUNK_SIZE as i32,
-                min.z * CHUNK_SIZE as i32,
-            );
-
-            // Recreate bind groups with new voxel view
-            self.pathtrace_bind_group = Self::create_pathtrace_bind_group(
-                device,
-                &self.pathtrace_bind_group_layout,
-                &self.gbuffer,
-                &self.params_buffer,
-                &self.materials_buffer,
-                &self.voxel_view,
-                &self.accumulation.current_view,
-            );
-
-            self.direct_bind_group = Self::create_pathtrace_bind_group(
-                device,
-                &self.pathtrace_bind_group_layout,
-                &self.gbuffer,
-                &self.params_buffer,
-                &self.materials_buffer,
-                &self.voxel_view,
-                &self.accumulation.current_view,
-            );
-        }
-
-        // Create voxel data from all chunks
-        let mut data = vec![0u8; size_x * size_y * size_z];
-
-        for (chunk_pos, chunk) in world.chunks() {
-            // Calculate chunk offset in the combined voxel array
-            let chunk_offset_x = ((chunk_pos.x - min.x) as usize) * CHUNK_SIZE;
-            let chunk_offset_y = ((chunk_pos.y - min.y) as usize) * CHUNK_SIZE;
-            let chunk_offset_z = ((chunk_pos.z - min.z) as usize) * CHUNK_SIZE;
-
-            for x in 0..CHUNK_SIZE {
-                for y in 0..CHUNK_SIZE {
-                    for z in 0..CHUNK_SIZE {
-                        let block = chunk.get(x, y, z);
-                        let world_x = chunk_offset_x + x;
-                        let world_y = chunk_offset_y + y;
-                        let world_z = chunk_offset_z + z;
-
-                        let idx = world_x + world_y * size_x + world_z * size_x * size_y;
-                        data[idx] = block;
-                    }
-                }
-            }
-        }
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.voxel_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size_x as u32),
-                rows_per_image: Some(size_y as u32),
-            },
-            wgpu::Extent3d {
-                width: size_x as u32,
-                height: size_y as u32,
-                depth_or_array_layers: size_z as u32,
-            },
-        );
-    }
-
-    /// Update only specific chunks (incremental update - much faster)
-    pub fn update_chunks(
-        &mut self,
-        queue: &wgpu::Queue,
-        world: &ChunkManager,
-        dirty_chunks: &std::collections::HashSet<super::world::ChunkPosition>,
-    ) {
-        let Some((min, _max)) = world.bounds() else {
-            return;
-        };
-
-        let (_size_x, _size_y, _size_z) = self.world_size;
-
-        for chunk_pos in dirty_chunks {
-            let Some(chunk) = world.get_chunk(*chunk_pos) else {
-                continue;
-            };
-
-            // Calculate chunk offset in the voxel texture
-            let chunk_offset_x = ((chunk_pos.x - min.x) as usize) * CHUNK_SIZE;
-            let chunk_offset_y = ((chunk_pos.y - min.y) as usize) * CHUNK_SIZE;
-            let chunk_offset_z = ((chunk_pos.z - min.z) as usize) * CHUNK_SIZE;
-
-            // Create chunk data
-            let mut data = vec![0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
-            for x in 0..CHUNK_SIZE {
-                for y in 0..CHUNK_SIZE {
-                    for z in 0..CHUNK_SIZE {
-                        let block = chunk.get(x, y, z);
-                        // Layout: x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE
-                        let idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE;
-                        data[idx] = block;
-                    }
-                }
-            }
-
-            // Upload only this chunk's region
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.voxel_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: chunk_offset_x as u32,
-                        y: chunk_offset_y as u32,
-                        z: chunk_offset_z as u32,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(CHUNK_SIZE as u32),
-                    rows_per_image: Some(CHUNK_SIZE as u32),
-                },
-                wgpu::Extent3d {
-                    width: CHUNK_SIZE as u32,
-                    height: CHUNK_SIZE as u32,
-                    depth_or_array_layers: CHUNK_SIZE as u32,
-                },
-            );
-        }
-    }
-
-    /// Check if world bounds changed (need full rebuild)
-    pub fn needs_resize(&self, world: &ChunkManager) -> bool {
-        let Some((min, max)) = world.bounds() else {
-            return false;
-        };
-
-        let chunks_x = (max.x - min.x + 1) as usize;
-        let chunks_y = (max.y - min.y + 1) as usize;
-        let chunks_z = (max.z - min.z + 1) as usize;
-
-        let size_x = chunks_x * CHUNK_SIZE;
-        let size_y = chunks_y * CHUNK_SIZE;
-        let size_z = chunks_z * CHUNK_SIZE;
-
-        size_x != self.world_size.0 || size_y != self.world_size.1 || size_z != self.world_size.2
+        self.render_scale = scale;
+        self.resize(device, width, height);
     }
 
     pub fn update_params(
@@ -1397,13 +1263,13 @@ impl PathTracer {
                 self.world_origin.1 as f32 * VOXEL_SCALE,
                 self.world_origin.2 as f32 * VOXEL_SCALE,
             ],
-            screen_width: self.width,
+            screen_width: self.internal_width,
             volume_max: [
                 (self.world_origin.0 + self.world_size.0 as i32) as f32 * VOXEL_SCALE,
                 (self.world_origin.1 + self.world_size.1 as i32) as f32 * VOXEL_SCALE,
                 (self.world_origin.2 + self.world_size.2 as i32) as f32 * VOXEL_SCALE,
             ],
-            screen_height: self.height,
+            screen_height: self.internal_height,
             sun_direction,
             sun_intensity,
             sun_color,
@@ -1421,14 +1287,16 @@ impl PathTracer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         output_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
         camera_bind_group: &wgpu::BindGroup,
         texture_bind_group: &wgpu::BindGroup,
         character_bind_group: &wgpu::BindGroup,
         meshes: impl Iterator<Item = (&'a wgpu::Buffer, u32, u32)>,
         lighting_mode: LightingMode,
     ) {
-        // Pass 1: G-buffer
+        let iw = self.internal_width;
+        let ih = self.internal_height;
+
+        // Pass 1: G-buffer (at internal resolution)
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("GBuffer Pass"),
@@ -1477,7 +1345,7 @@ impl PathTracer {
                     }),
                 ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
+                    view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -1497,15 +1365,15 @@ impl PathTracer {
             }
         }
 
-        // Pass 2: Lighting (compute) - either path tracing or direct
+        // Pass 2: Lighting (compute at internal resolution)
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Lighting Pass"),
                 timestamp_writes: None,
             });
 
-            let workgroups_x = self.width.div_ceil(8);
-            let workgroups_y = self.height.div_ceil(8);
+            let workgroups_x = iw.div_ceil(8);
+            let workgroups_y = ih.div_ceil(8);
 
             match lighting_mode {
                 LightingMode::PathTracing => {
@@ -1524,53 +1392,27 @@ impl PathTracer {
         }
 
         // Pass 3: Accumulation (compute) - only for path tracing
-        match lighting_mode {
-            LightingMode::PathTracing => {
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Accumulate Pass"),
-                            timestamp_writes: None,
-                        });
+        // Simple mode skips accumulation and copy — tonemap reads current_texture directly
+        if matches!(lighting_mode, LightingMode::PathTracing) {
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Accumulate Pass"),
+                    timestamp_writes: None,
+                });
 
-                    compute_pass.set_pipeline(&self.accumulate_pipeline);
-                    compute_pass.set_bind_group(0, &self.accumulate_bind_group, &[]);
+                compute_pass.set_pipeline(&self.accumulate_pipeline);
+                compute_pass.set_bind_group(0, &self.accumulate_bind_group, &[]);
 
-                    let workgroups_x = self.width.div_ceil(8);
-                    let workgroups_y = self.height.div_ceil(8);
-                    compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
-                }
-
-                // Swap accumulation buffers for next frame
-                self.accumulation.swap(encoder, self.width, self.height);
+                let workgroups_x = iw.div_ceil(8);
+                let workgroups_y = ih.div_ceil(8);
+                compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
             }
-            LightingMode::Simple => {
-                // Copy current to output for tonemap (no accumulation needed)
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.accumulation.current_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.accumulation.output_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: self.width,
-                        height: self.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
+
+            // Swap accumulation buffers for next frame
+            self.accumulation.swap(encoder, iw, ih);
         }
 
-        // Denoise pass disabled - temporal accumulation handles noise reduction
-
-        // Pass 5: Tonemap to screen
+        // Tonemap to screen (full resolution output)
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Tonemap Pass"),
@@ -1588,7 +1430,11 @@ impl PathTracer {
             });
 
             render_pass.set_pipeline(&self.tonemap_pipeline);
-            render_pass.set_bind_group(0, &self.tonemap_bind_group, &[]);
+            let bind_group = match lighting_mode {
+                LightingMode::PathTracing => &self.tonemap_bind_group,
+                LightingMode::Simple => &self.tonemap_bind_group_simple,
+            };
+            render_pass.set_bind_group(0, bind_group, &[]);
             render_pass.draw(0..3, 0..1); // Full-screen triangle
         }
     }

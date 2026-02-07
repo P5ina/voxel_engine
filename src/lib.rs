@@ -17,11 +17,15 @@ mod voxel;
 mod world;
 
 mod app;
+mod dev_tools;
 mod editor;
 mod input;
+mod map_browser;
+#[cfg(feature = "dev-tools")]
 mod save_load;
 mod streaming_system;
 mod terrain_gen;
+#[cfg(feature = "dev-tools")]
 mod world_gen;
 
 pub use app::{App, run};
@@ -30,27 +34,16 @@ use camera::Camera;
 use model::load_glb;
 use pathtracer::PathTracer;
 use player::Player;
-use renderer::{
-    CameraResources, DepthBuffer, LightingParams, MeshResources, PaletteResources, RenderContext,
-};
-use ui::{
-    EditorState, EguiRenderer, GameSettings, LoadingState, UiMessage, UiScreen, WorldSelectState,
-};
-use voxel::{Chunk, generate_chunk_mesh};
+use renderer::{CameraResources, LightingParams, MeshResources, PaletteResources, RenderContext};
+use ui::{EditorState, EguiRenderer, GameSettings, MapSelectState, UiMessage, UiScreen};
+#[cfg(feature = "dev-tools")]
+use ui::{LoadingState, WorldSelectState};
+use voxel::{Chunk, VOXEL_SCALE, generate_chunk_mesh};
 use world::{ChunkManager, ChunkPosition, ChunkStreamer, LodNodeKey, RegionManager, VoxelOctree};
 
 /// Result sent back from background save thread
+#[cfg(feature = "dev-tools")]
 pub(crate) type SaveWorldResult = (Option<VoxelOctree>, Result<(), world::BigWorldError>);
-
-/// How chunks are sourced when not in ChunkManager
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum ChunkSource {
-    /// Regenerate terrain procedurally (play mode, unedited worlds)
-    #[default]
-    Procedural,
-    /// Read from octree (editor mode — octree not stripped)
-    Octree,
-}
 
 /// Unified mesh key for both chunk meshes and LOD node meshes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -60,6 +53,7 @@ pub(crate) enum MeshKey {
 }
 
 /// Messages from background world generation thread
+#[cfg(feature = "dev-tools")]
 pub(crate) enum BigWorldGenMessage {
     /// Progress update: (message, loaded, total)
     Progress(String, usize, usize),
@@ -68,6 +62,7 @@ pub(crate) enum BigWorldGenMessage {
 }
 
 /// Result from background world generation thread
+#[cfg(feature = "dev-tools")]
 pub(crate) struct BigWorldGenResult {
     pub(crate) world: ChunkManager,
     pub(crate) octree: VoxelOctree,
@@ -80,8 +75,6 @@ pub(crate) struct BigWorldGenResult {
 pub(crate) struct StreamingMeshResult {
     pub(crate) pos: ChunkPosition,
     pub(crate) vertices: Vec<Vertex>,
-    /// Newly generated chunk data (None if chunk already existed in world)
-    pub(crate) new_chunk: Option<Chunk>,
 }
 
 /// Result from background LOD mesh generation
@@ -110,7 +103,6 @@ pub struct AppState {
 
     // Rendering
     pub(crate) render_ctx: RenderContext,
-    pub(crate) depth_buffer: DepthBuffer,
     pub(crate) camera_resources: CameraResources,
     pub(crate) palette_resources: PaletteResources,
     pub(crate) chunk_meshes: HashMap<MeshKey, MeshResources>,
@@ -134,12 +126,16 @@ pub struct AppState {
     pub(crate) ui_screen: UiScreen,
     pub(crate) game_settings: GameSettings,
     pub(crate) prev_screen: UiScreen,
+    pub(crate) map_select_state: MapSelectState,
+    pub(crate) selected_map_path: Option<String>,
 
     // Editor
     pub(crate) editor_state: EditorState,
+    #[cfg(feature = "dev-tools")]
     pub(crate) enter_editor_after_gen: bool,
 
     // World select
+    #[cfg(feature = "dev-tools")]
     pub(crate) world_select_state: WorldSelectState,
 
     // Chunk loading queue
@@ -150,7 +146,6 @@ pub struct AppState {
     pub(crate) chunk_streamer: Option<ChunkStreamer>,
     pub(crate) octree: Option<VoxelOctree>,
     pub(crate) use_streaming: bool,
-    pub(crate) chunk_source: ChunkSource,
     pub(crate) region_manager: Option<RegionManager>,
 
     // Background streaming mesh generation
@@ -166,9 +161,13 @@ pub struct AppState {
     pub(crate) chunks_ready: bool,
 
     // Loading screen
+    #[cfg(feature = "dev-tools")]
     pub(crate) loading_state: LoadingState,
+    #[cfg(feature = "dev-tools")]
     pub(crate) big_world_lod_tasks: Option<Vec<MeshKey>>,
+    #[cfg(feature = "dev-tools")]
     pub(crate) big_world_gen_receiver: Option<mpsc::Receiver<BigWorldGenMessage>>,
+    #[cfg(feature = "dev-tools")]
     pub(crate) save_world_receiver: Option<mpsc::Receiver<SaveWorldResult>>,
 
     // Timing
@@ -193,8 +192,6 @@ impl AppState {
         // Create resources
         let camera_resources = CameraResources::new(&render_ctx.device, &camera);
         let palette_resources = PaletteResources::new(&render_ctx.device);
-        let depth_buffer = DepthBuffer::new(&render_ctx.device, size.width, size.height);
-
         // Create world with 8x8 chunks platform (256x256 voxels)
         // Spawn at center: 128 voxels * VOXEL_SCALE = 8.0 world units
         let mut world = ChunkManager::with_metadata("Default World", [8.0, 1.25, 8.0]);
@@ -208,7 +205,7 @@ impl AppState {
 
         // Generate meshes for all chunks
         let mut chunk_meshes = HashMap::new();
-        for chunk_pos in world.chunk_positions().cloned().collect::<Vec<_>>() {
+        for chunk_pos in world.chunk_positions().collect::<Vec<_>>() {
             let vertices = generate_chunk_mesh(&world, chunk_pos);
             if !vertices.is_empty() {
                 chunk_meshes.insert(
@@ -283,7 +280,7 @@ impl AppState {
         }
 
         // Path Tracer
-        let mut path_tracer = PathTracer::new(
+        let path_tracer = PathTracer::new(
             &render_ctx.device,
             &render_ctx.queue,
             size.width,
@@ -293,12 +290,9 @@ impl AppState {
             &palette_resources.bind_group_layout,
             character_manager.bind_group_layout(),
         );
-        path_tracer.update_world_voxels(&render_ctx.device, &render_ctx.queue, &world);
-
         Ok(Self {
             window,
             render_ctx,
-            depth_buffer,
             camera_resources,
             palette_resources,
             chunk_meshes,
@@ -316,15 +310,18 @@ impl AppState {
             ui_screen: UiScreen::default(),
             game_settings: GameSettings::default(),
             prev_screen: UiScreen::MainMenu,
+            map_select_state: MapSelectState::default(),
+            selected_map_path: None,
             editor_state: EditorState::default(),
+            #[cfg(feature = "dev-tools")]
             enter_editor_after_gen: false,
+            #[cfg(feature = "dev-tools")]
             world_select_state: WorldSelectState::default(),
             pending_chunks: VecDeque::new(),
             pending_set: HashSet::new(),
             chunk_streamer: None,
             octree: None,
             use_streaming: false,
-            chunk_source: ChunkSource::default(),
             region_manager: None,
             streaming_mesh_rx: None,
             streaming_mesh_tx: None,
@@ -332,9 +329,13 @@ impl AppState {
             lod_mesh_rx: None,
             lod_mesh_tx: None,
             chunks_ready: true, // default world is always fully loaded
+            #[cfg(feature = "dev-tools")]
             loading_state: LoadingState::default(),
+            #[cfg(feature = "dev-tools")]
             big_world_lod_tasks: None,
+            #[cfg(feature = "dev-tools")]
             big_world_gen_receiver: None,
+            #[cfg(feature = "dev-tools")]
             save_world_receiver: None,
             last_frame: std::time::Instant::now(),
             fps: 0.0,
@@ -346,8 +347,6 @@ impl AppState {
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.render_ctx.resize(width, height);
-            self.depth_buffer
-                .resize(&self.render_ctx.device, width, height);
             self.camera.resize(width, height);
             self.path_tracer
                 .resize(&self.render_ctx.device, width, height);
@@ -359,6 +358,42 @@ impl AppState {
 
     /// Maximum number of inflight background mesh tasks to prevent memory explosion
     pub(crate) const MAX_INFLIGHT: usize = 128;
+
+    /// Conservative terrain occlusion check for far chunks.
+    /// Returns true when a terrain ridge is higher than the line from camera
+    /// to the top of the chunk AABB, so the chunk is very likely hidden.
+    fn occluded_by_terrain_heightfield(camera_pos: Vec3, min: Vec3, max: Vec3) -> bool {
+        let target_center = (min + max) * 0.5;
+        let to_target = target_center - camera_pos;
+        let dist_xz = glam::Vec2::new(to_target.x, to_target.z).length();
+
+        // Never cull nearby chunks to avoid popping in close range.
+        if dist_xz < 96.0 {
+            return false;
+        }
+
+        // Trace to chunk top for conservative all-hidden test.
+        let target_y = max.y;
+        let steps = ((dist_xz / 16.0).ceil() as i32).clamp(12, 160);
+        let height_margin = 2.0;
+
+        for i in 1..steps {
+            let t = i as f32 / steps as f32;
+            let sx = camera_pos.x + to_target.x * t;
+            let sz = camera_pos.z + to_target.z * t;
+            let ray_top_y = camera_pos.y + (target_y - camera_pos.y) * t;
+
+            let vx = (sx / VOXEL_SCALE).floor() as i32;
+            let vz = (sz / VOXEL_SCALE).floor() as i32;
+            let terrain_y = Self::terrain_height(vx, vz) as f32 * VOXEL_SCALE;
+
+            if terrain_y > ray_top_y + height_margin {
+                return true;
+            }
+        }
+
+        false
+    }
 
     fn update(&mut self) {
         let now = std::time::Instant::now();
@@ -493,13 +528,10 @@ impl AppState {
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        match self.ui_screen {
-            UiScreen::InGame => self.update(),
-            UiScreen::Editor => self.update_editor(),
-            UiScreen::Loading => self.update_loading(),
-            _ => {
-                self.last_frame = std::time::Instant::now();
-            }
+        if self.ui_screen == UiScreen::InGame {
+            self.update();
+        } else if !self.update_dev_screen() {
+            self.last_frame = std::time::Instant::now();
         }
         self.window.request_redraw();
 
@@ -511,25 +543,26 @@ impl AppState {
         self.egui.begin_frame(&self.window);
 
         // Build UI
-        let msg = match self.ui_screen {
-            UiScreen::MainMenu => ui::main_menu(&self.egui.ctx),
-            UiScreen::WorldSelect => ui::world_select(&self.egui.ctx, &mut self.world_select_state),
-            UiScreen::Settings => ui::settings(&self.egui.ctx, &mut self.game_settings),
-            UiScreen::PauseMenu => ui::pause_menu(&self.egui.ctx),
-            UiScreen::InGame => {
-                let debug = if self.game_settings.show_debug {
-                    Some(self.build_debug_info())
-                } else {
+        let msg = if let Some(msg) = self.build_dev_ui() {
+            msg
+        } else {
+            match self.ui_screen {
+                UiScreen::MainMenu => ui::main_menu(&self.egui.ctx),
+                UiScreen::MapSelect => ui::map_select(&self.egui.ctx, &self.map_select_state),
+                UiScreen::Matchmaking => ui::matchmaking(&self.egui.ctx),
+                UiScreen::Settings => ui::settings(&self.egui.ctx, &mut self.game_settings),
+                UiScreen::PauseMenu => ui::pause_menu(&self.egui.ctx),
+                UiScreen::InGame => {
+                    let debug = if self.game_settings.show_debug {
+                        Some(self.build_debug_info())
+                    } else {
+                        None
+                    };
+                    ui::hud(&self.egui.ctx, self.fps, debug.as_ref());
                     None
-                };
-                ui::hud(&self.egui.ctx, self.fps, debug.as_ref());
-                None
-            }
-            UiScreen::Editor => ui::editor_hud(&self.egui.ctx, &mut self.editor_state, self.fps),
-            UiScreen::EditorPause => ui::editor_pause(&self.egui.ctx),
-            UiScreen::Loading => {
-                ui::loading_screen(&self.egui.ctx, &self.loading_state);
-                None
+                }
+                #[cfg(feature = "dev-tools")]
+                _ => None,
             }
         };
 
@@ -550,10 +583,8 @@ impl AppState {
                 });
 
         // Render 3D scene
-        let should_render_3d = matches!(
-            self.ui_screen,
-            UiScreen::InGame | UiScreen::PauseMenu | UiScreen::Editor | UiScreen::EditorPause
-        );
+        let should_render_3d = matches!(self.ui_screen, UiScreen::InGame | UiScreen::PauseMenu)
+            || self.render_dev_3d();
 
         if should_render_3d {
             self.camera.fov = self.game_settings.fov.to_radians();
@@ -570,7 +601,43 @@ impl AppState {
             );
 
             let show_debug = self.game_settings.show_debug;
-            let meshes = self.chunk_meshes.iter().map(move |(key, m)| {
+            let frustum_planes = self.camera.frustum_planes();
+            let chunk_world_size = voxel::CHUNK_SIZE as f32 * VOXEL_SCALE;
+            let camera_pos = self.camera.position;
+            let enable_terrain_occlusion = self.use_streaming
+                && matches!(
+                    self.game_settings.performance_preset,
+                    ui::PerformancePreset::Potato
+                );
+            let meshes = self.chunk_meshes.iter().filter_map(move |(key, m)| {
+                let (min, max) = match key {
+                    MeshKey::Chunk(pos) => {
+                        let min = glam::Vec3::new(
+                            pos.x as f32 * chunk_world_size,
+                            pos.y as f32 * chunk_world_size,
+                            pos.z as f32 * chunk_world_size,
+                        );
+                        (min, min + glam::Vec3::splat(chunk_world_size))
+                    }
+                    MeshKey::LodNode(key) => {
+                        let side = (1 << key.lod_level) as f32 * chunk_world_size;
+                        let min = glam::Vec3::new(
+                            key.x as f32 * side,
+                            key.y as f32 * side,
+                            key.z as f32 * side,
+                        );
+                        (min, min + glam::Vec3::splat(side))
+                    }
+                };
+                if !camera::aabb_in_frustum(min, max, &frustum_planes) {
+                    return None;
+                }
+                if enable_terrain_occlusion
+                    && matches!(key, MeshKey::Chunk(_))
+                    && Self::occluded_by_terrain_heightfield(camera_pos, min, max)
+                {
+                    return None;
+                }
                 let lod = if show_debug {
                     match key {
                         MeshKey::Chunk(_) => 0u32,
@@ -579,13 +646,12 @@ impl AppState {
                 } else {
                     0u32
                 };
-                (&m.vertex_buffer, m.num_vertices, lod)
+                Some((&m.vertex_buffer, m.num_vertices, lod))
             });
 
             self.path_tracer.render(
                 &mut encoder,
                 &view,
-                &self.depth_buffer.view,
                 &self.camera_resources.bind_group,
                 &self.palette_resources.bind_group,
                 self.character_manager.bind_group(),
@@ -639,7 +705,29 @@ impl AppState {
     }
 
     fn handle_ui_message(&mut self, msg: UiMessage) {
+        if self.handle_dev_ui_message(&msg) {
+            return;
+        }
+
         match msg {
+            UiMessage::OpenMapSelect => {
+                self.prev_screen = UiScreen::MainMenu;
+                self.map_select_state.worlds = self.scan_playable_worlds();
+                self.ui_screen = UiScreen::MapSelect;
+            }
+            UiMessage::SelectMap(path) => {
+                self.selected_map_path = Some(path);
+                self.prev_screen = UiScreen::MapSelect;
+                self.ui_screen = UiScreen::Matchmaking;
+            }
+            UiMessage::FindMatch => {
+                if let Some(path) = self.selected_map_path.take() {
+                    self.load_big_world_from_file(&path);
+                }
+            }
+            UiMessage::CancelMatchmaking => {
+                self.ui_screen = UiScreen::MapSelect;
+            }
             UiMessage::Settings => {
                 self.prev_screen = self.ui_screen;
                 self.ui_screen = UiScreen::Settings;
@@ -652,11 +740,7 @@ impl AppState {
             }
             UiMessage::Resume => {
                 // Resume to appropriate mode
-                if self.prev_screen == UiScreen::Editor || self.ui_screen == UiScreen::EditorPause {
-                    self.ui_screen = UiScreen::Editor;
-                } else {
-                    self.ui_screen = UiScreen::InGame;
-                }
+                self.ui_screen = self.dev_resume_target().unwrap_or(UiScreen::InGame);
                 self.grab_mouse(true);
             }
             UiMessage::QuitToMenu => {
@@ -664,34 +748,8 @@ impl AppState {
                 self.ui_screen = UiScreen::MainMenu;
                 self.grab_mouse(false);
             }
-            UiMessage::EditorQuitToMenu => {
-                self.region_manager = None;
-                self.ui_screen = UiScreen::MainMenu;
-                self.grab_mouse(false);
-            }
-            UiMessage::OpenWorldSelect => {
-                self.world_select_state.worlds = self.scan_worlds();
-                self.world_select_state.creating = false;
-                self.world_select_state.new_map_name.clear();
-                self.prev_screen = UiScreen::MainMenu;
-                self.ui_screen = UiScreen::WorldSelect;
-            }
-            UiMessage::PlayWorld(path) => {
-                self.enter_editor_after_gen = false;
-                self.load_big_world_from_file(&path);
-            }
-            UiMessage::EditWorld(path) => {
-                self.enter_editor_after_gen = true;
-                self.load_big_world_from_file(&path);
-            }
-            UiMessage::CreateNewMap(name) => {
-                self.editor_state.level_name = name;
-                self.enter_editor_after_gen = true;
-                self.start_big_world_generation();
-            }
-            UiMessage::SaveBigWorld => {
-                self.save_big_world_to_file();
-            }
+            #[cfg(feature = "dev-tools")]
+            _ => {}
         }
     }
 }
