@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use specs::WorldExt;
 use winit::{event::*, event_loop::ActiveEventLoop, keyboard::KeyCode, window::CursorGrabMode};
 
 use crate::AppState;
@@ -29,21 +30,24 @@ impl AppState {
         code: KeyCode,
         is_pressed: bool,
     ) {
-        // Handle key releases
+        // Handle key releases — write to InputResource
         if !is_pressed {
+            let mut input = self
+                .ecs_world
+                .write_resource::<crate::ecs::resources::InputResource>();
             match code {
-                KeyCode::KeyW => self.input.forward = false,
-                KeyCode::KeyS => self.input.backward = false,
-                KeyCode::KeyA => self.input.left = false,
-                KeyCode::KeyD => self.input.right = false,
-                KeyCode::Space => self.input.jump = false,
+                KeyCode::KeyW => input.forward = false,
+                KeyCode::KeyS => input.backward = false,
+                KeyCode::KeyA => input.left = false,
+                KeyCode::KeyD => input.right = false,
+                KeyCode::Space => input.jump = false,
                 KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                    self.input.down = false;
-                    self.input.sprint = false;
+                    input.down = false;
+                    input.sprint = false;
                 }
-                KeyCode::KeyQ => self.input.up = false,
-                KeyCode::KeyE => self.input.down = false,
-                KeyCode::ControlLeft | KeyCode::ControlRight => self.input.ctrl = false,
+                KeyCode::KeyQ => input.up = false,
+                KeyCode::KeyE => input.down = false,
+                KeyCode::ControlLeft | KeyCode::ControlRight => input.ctrl = false,
                 _ => {}
             }
             return;
@@ -71,7 +75,9 @@ impl AppState {
 
         // Handle Ctrl modifier
         if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
-            self.input.ctrl = true;
+            self.ecs_world
+                .write_resource::<crate::ecs::resources::InputResource>()
+                .ctrl = true;
             return;
         }
 
@@ -83,18 +89,28 @@ impl AppState {
         // Movement keys for InGame and Editor
         let can_move = self.ui_screen == UiScreen::InGame || self.can_move_editor();
         if can_move {
-            match code {
-                KeyCode::KeyW => self.input.forward = true,
-                KeyCode::KeyS => self.input.backward = true,
-                KeyCode::KeyA => self.input.left = true,
-                KeyCode::KeyD => self.input.right = true,
-                KeyCode::Space => self.input.jump = true,
-                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                    self.input.down = true;
-                    self.input.sprint = true;
+            // Movement input → InputResource
+            {
+                let mut input = self
+                    .ecs_world
+                    .write_resource::<crate::ecs::resources::InputResource>();
+                match code {
+                    KeyCode::KeyW => input.forward = true,
+                    KeyCode::KeyS => input.backward = true,
+                    KeyCode::KeyA => input.left = true,
+                    KeyCode::KeyD => input.right = true,
+                    KeyCode::Space => input.jump = true,
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                        input.down = true;
+                        input.sprint = true;
+                    }
+                    KeyCode::KeyQ => input.up = true,
+                    KeyCode::KeyE => input.down = true,
+                    _ => {}
                 }
-                KeyCode::KeyQ => self.input.up = true,
-                KeyCode::KeyE => self.input.down = true,
+            }
+            // Special keys (not input)
+            match code {
                 KeyCode::F3 => {
                     self.game_settings.show_debug = !self.game_settings.show_debug;
                 }
@@ -104,14 +120,53 @@ impl AppState {
                         // Enter free cam: freeze player orientation for frustum culling vis
                         self.player_yaw = self.camera.yaw;
                         self.player_pitch = self.camera.pitch;
+
+                        // Create free cam entity at current camera position
+                        crate::ecs::FreeCameraBuilder::new()
+                            .position(self.camera.position)
+                            .rotation(self.camera.yaw, self.camera.pitch)
+                            .aspect_ratio(self.camera.aspect)
+                            .build(&mut self.ecs_world);
                         log::info!(
                             "[FreeCam] Enabled — frustum culls from player perspective"
                         );
                     } else {
-                        // Exit free cam: snap camera back to player
+                        // Destroy free cam entity and restore player camera
+                        let lookup =
+                            self.ecs_world.read_resource::<crate::ecs::resources::EntityLookup>();
+                        let cam_entity = lookup.active_camera;
+                        let local_player = lookup.local_player;
+                        drop(lookup);
+
+                        // Delete the free cam entity (if it's not the player)
+                        if let Some(cam) = cam_entity {
+                            if Some(cam) != local_player {
+                                self.ecs_world.delete_entity(cam).ok();
+                            }
+                        }
+
+                        // Restore active camera to local player
+                        let mut lookup = self
+                            .ecs_world
+                            .write_resource::<crate::ecs::resources::EntityLookup>();
+                        lookup.active_camera = local_player;
+                        drop(lookup);
+
+                        // Restore camera from frozen player orientation
                         self.camera.position = self.player.eye_position();
                         self.camera.yaw = self.player_yaw;
                         self.camera.pitch = self.player_pitch;
+
+                        // Sync back to ECS camera
+                        if let Some(player) = local_player {
+                            let mut cameras =
+                                self.ecs_world.write_storage::<crate::ecs::components::Camera>();
+                            if let Some(ecs_cam) = cameras.get_mut(player) {
+                                ecs_cam.yaw = self.player_yaw;
+                                ecs_cam.pitch = self.player_pitch;
+                            }
+                        }
+
                         log::info!("[FreeCam] Disabled — camera follows player");
                     }
                 }
@@ -124,9 +179,12 @@ impl AppState {
         let allow_look = self.ui_screen == UiScreen::InGame || self.can_move_editor();
 
         if self.mouse_grabbed && allow_look {
-            let sensitivity = self.game_settings.sensitivity;
-            self.camera
-                .process_mouse(delta.0 as f32, delta.1 as f32, sensitivity);
+            // Accumulate mouse deltas in InputResource; processed by CameraUpdateSystem
+            let mut input = self
+                .ecs_world
+                .write_resource::<crate::ecs::resources::InputResource>();
+            input.mouse_delta_x += delta.0 as f32;
+            input.mouse_delta_y += delta.1 as f32;
         }
     }
 

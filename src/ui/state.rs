@@ -174,6 +174,7 @@ impl BrushShape {
     }
 }
 
+#[derive(Clone)]
 pub struct GameSettings {
     pub fov: f32,
     pub sensitivity: f32,

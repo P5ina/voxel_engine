@@ -21,12 +21,19 @@ pub use systems::*;
 
 use specs::{Dispatcher, DispatcherBuilder, World, WorldExt};
 
-/// Build a minimal Phase 1 dispatcher (timing + lighting only).
-/// Other systems are added in later migration phases.
-pub fn build_phase1_dispatcher() -> Dispatcher<'static, 'static> {
+/// Build the active dispatcher for the current migration phase.
+/// Phase 2: timing, lighting, input, camera, free cam movement.
+pub fn build_active_dispatcher() -> Dispatcher<'static, 'static> {
     DispatcherBuilder::new()
         .with(systems::time_system(), "time", &[])
         .with(systems::lighting_system(), "lighting", &[])
+        .with(systems::input_system(), "input", &["time"])
+        .with(systems::free_camera_system(), "free_cam", &["input"])
+        .with(
+            systems::camera_update_system(),
+            "camera",
+            &["input", "free_cam"],
+        )
         .build()
 }
 

@@ -107,7 +107,11 @@ impl AppState {
 
     #[cfg(feature = "dev-tools")]
     pub(crate) fn update_editor(&mut self) {
-        // Run ECS systems (timing + lighting)
+        // Sync GameSettings to ECS before dispatch
+        *self.ecs_world.write_resource::<crate::ui::GameSettings>() =
+            self.game_settings.clone();
+
+        // Run ECS systems (timing, lighting, input, camera)
         self.ecs_dispatcher.dispatch(&self.ecs_world);
 
         let game_time = self.ecs_world.read_resource::<crate::ecs::resources::GameTime>();
@@ -122,7 +126,24 @@ impl AppState {
             self.lighting.sun_color = ecs_lighting.sun_color.to_array();
         }
 
-        // Free camera movement
+        // Sync ECS Camera → render camera (yaw/pitch from mouse input)
+        {
+            let lookup = self.ecs_world.read_resource::<crate::ecs::resources::EntityLookup>();
+            if let Some(cam_entity) = lookup.active_camera {
+                let cameras = self.ecs_world.read_storage::<crate::ecs::components::Camera>();
+                if let Some(ecs_cam) = cameras.get(cam_entity) {
+                    self.camera.yaw = ecs_cam.yaw;
+                    self.camera.pitch = ecs_cam.pitch;
+                }
+            }
+        }
+
+        // Reset mouse deltas after dispatch consumed them
+        self.ecs_world
+            .write_resource::<crate::ecs::resources::InputResource>()
+            .reset_mouse();
+
+        // Free camera movement (editor uses its own fly speed, not ECS FreeCam)
         let speed = self.editor_state.fly_speed * dt;
         let forward = self.camera.forward();
         let right = self.camera.right();
@@ -130,23 +151,28 @@ impl AppState {
 
         let mut move_dir = Vec3::ZERO;
 
-        if self.input.forward {
-            move_dir += forward;
-        }
-        if self.input.backward {
-            move_dir -= forward;
-        }
-        if self.input.right {
-            move_dir += right;
-        }
-        if self.input.left {
-            move_dir -= right;
-        }
-        if self.input.jump || self.input.up {
-            move_dir += up;
-        }
-        if self.input.down {
-            move_dir -= up;
+        {
+            let input = self
+                .ecs_world
+                .read_resource::<crate::ecs::resources::InputResource>();
+            if input.forward {
+                move_dir += forward;
+            }
+            if input.backward {
+                move_dir -= forward;
+            }
+            if input.right {
+                move_dir += right;
+            }
+            if input.left {
+                move_dir -= right;
+            }
+            if input.jump || input.up {
+                move_dir += up;
+            }
+            if input.down {
+                move_dir -= up;
+            }
         }
 
         if move_dir.length_squared() > 0.0 {

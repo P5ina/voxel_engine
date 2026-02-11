@@ -87,19 +87,6 @@ pub(crate) struct LodMeshResult {
 
 pub(crate) use renderer::Vertex;
 
-#[derive(Default)]
-pub(crate) struct InputState {
-    pub(crate) forward: bool,
-    pub(crate) backward: bool,
-    pub(crate) left: bool,
-    pub(crate) right: bool,
-    pub(crate) jump: bool,
-    pub(crate) up: bool,
-    pub(crate) down: bool,
-    pub(crate) ctrl: bool,
-    pub(crate) sprint: bool,
-}
-
 pub struct AppState {
     pub(crate) window: Arc<Window>,
 
@@ -118,7 +105,6 @@ pub struct AppState {
     pub(crate) world: ChunkManager,
 
     // Input
-    pub(crate) input: InputState,
     pub(crate) mouse_grabbed: bool,
     pub(crate) is_walking: bool,
     pub(crate) free_cam: bool,
@@ -301,7 +287,6 @@ impl AppState {
             camera,
             player,
             world,
-            input: InputState::default(),
             mouse_grabbed: false,
             is_walking: false,
             free_cam: false,
@@ -339,9 +324,18 @@ impl AppState {
                 ecs::setup_world(&mut w);
                 w.insert(ecs::resources::GameTime::default());
                 w.insert(ecs::resources::Lighting::default());
+                w.insert(ecs::resources::InputResource::default());
+                w.insert(ecs::resources::EntityLookup::default());
+                w.insert(GameSettings::default());
+                w.insert(ecs::resources::WindowDimensions {
+                    width: size.width,
+                    height: size.height,
+                    scale_factor: 1.0,
+                });
+                ecs::create_local_player(&mut w, aspect);
                 w
             },
-            ecs_dispatcher: ecs::build_phase1_dispatcher(),
+            ecs_dispatcher: ecs::build_active_dispatcher(),
         })
     }
 
@@ -351,6 +345,9 @@ impl AppState {
             self.camera.resize(width, height);
             self.path_tracer
                 .resize(&self.render_ctx.device, width, height);
+            let mut dims = self.ecs_world.write_resource::<ecs::resources::WindowDimensions>();
+            dims.width = width;
+            dims.height = height;
         }
     }
 
@@ -397,7 +394,10 @@ impl AppState {
     }
 
     fn update(&mut self) {
-        // Run ECS systems (timing + lighting)
+        // Sync GameSettings to ECS before dispatch
+        *self.ecs_world.write_resource::<GameSettings>() = self.game_settings.clone();
+
+        // Run ECS systems (timing, lighting, input, camera, free cam movement)
         self.ecs_dispatcher.dispatch(&self.ecs_world);
 
         let game_time = self.ecs_world.read_resource::<ecs::resources::GameTime>();
@@ -412,52 +412,34 @@ impl AppState {
             self.lighting.sun_color = ecs_lighting.sun_color.to_array();
         }
 
-        // Movement input
-        const WALK_SPEED: f32 = 45.0;
-        const SPRINT_SPEED: f32 = 90.0;
-        const FREECAM_SPEED: f32 = 60.0;
-        const FREECAM_FAST_SPEED: f32 = 200.0;
+        // Sync ECS Camera → render camera (yaw/pitch from mouse input)
+        {
+            let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+            if let Some(cam_entity) = lookup.active_camera {
+                let cameras = self.ecs_world.read_storage::<ecs::components::Camera>();
+                if let Some(ecs_cam) = cameras.get(cam_entity) {
+                    self.camera.yaw = ecs_cam.yaw;
+                    self.camera.pitch = ecs_cam.pitch;
+                }
 
-        let move_speed = if self.input.sprint {
-            if self.free_cam {
-                FREECAM_FAST_SPEED
-            } else {
-                SPRINT_SPEED
+                // For free cam, position comes from ECS Position component
+                if self.free_cam {
+                    let positions = self.ecs_world.read_storage::<ecs::components::Position>();
+                    if let Some(pos) = positions.get(cam_entity) {
+                        self.camera.position = pos.0;
+                    }
+                }
             }
-        } else if self.free_cam {
-            FREECAM_SPEED
-        } else {
-            WALK_SPEED
-        };
+        }
 
+        // Reset mouse deltas after dispatch consumed them
+        self.ecs_world
+            .write_resource::<ecs::resources::InputResource>()
+            .reset_mouse();
+
+        // Player movement (still on AppState until Phase 3)
         if self.free_cam {
-            // Free cam: fly camera freely, player stays put
-            let forward = self.camera.forward();
-            let right = self.camera.right();
-            let mut move_dir = Vec3::ZERO;
-            if self.input.forward {
-                move_dir += forward;
-            }
-            if self.input.backward {
-                move_dir -= forward;
-            }
-            if self.input.right {
-                move_dir += right;
-            }
-            if self.input.left {
-                move_dir -= right;
-            }
-            if self.input.jump {
-                move_dir += Vec3::Y;
-            }
-            if self.input.down {
-                move_dir -= Vec3::Y;
-            }
-
-            if move_dir.length_squared() > 0.0 {
-                move_dir = move_dir.normalize();
-            }
-            self.camera.position += move_dir * move_speed * dt;
+            // Free cam movement handled by FreeCameraMovementSystem
             self.is_walking = false;
         } else if !self.chunks_ready && self.use_streaming {
             // Freeze player until nearby chunks are loaded (prevents fall-through)
@@ -465,24 +447,34 @@ impl AppState {
             self.is_walking = false;
         } else {
             // Normal mode: player movement with physics
-            let input = Vec3::new(
-                (self.input.right as i32 - self.input.left as i32) as f32,
+            let input_res = self
+                .ecs_world
+                .read_resource::<ecs::resources::InputResource>();
+            let move_input = Vec3::new(
+                (input_res.right as i32 - input_res.left as i32) as f32,
                 0.0,
-                (self.input.forward as i32 - self.input.backward as i32) as f32,
+                (input_res.forward as i32 - input_res.backward as i32) as f32,
             );
+            let wants_jump = input_res.jump;
+            let is_sprinting = input_res.sprint;
+            drop(input_res);
+
+            const WALK_SPEED: f32 = 45.0;
+            const SPRINT_SPEED: f32 = 90.0;
+            let move_speed = if is_sprinting { SPRINT_SPEED } else { WALK_SPEED };
 
             let forward = self.camera.forward().with_y(0.0).normalize_or_zero();
             let right = self.camera.right();
             self.player
-                .apply_movement(forward, right, input, move_speed * dt);
+                .apply_movement(forward, right, move_input, move_speed * dt);
 
-            if self.input.jump {
+            if wants_jump {
                 self.player.jump();
             }
 
             self.player.update(&self.world, dt);
             self.camera.position = self.player.eye_position();
-            self.is_walking = input.length_squared() > 0.0;
+            self.is_walking = move_input.length_squared() > 0.0;
         }
 
         self.camera.fov = self.game_settings.fov.to_radians();
@@ -494,7 +486,12 @@ impl AppState {
 
         // Update character manager (builds BVH for path tracing) — skip in free cam
         if !self.free_cam {
-            let is_sprinting = self.input.sprint && self.is_walking;
+            let input_res = self
+                .ecs_world
+                .read_resource::<ecs::resources::InputResource>();
+            let is_sprinting = input_res.sprint && self.is_walking;
+            drop(input_res);
+
             self.character_manager.update(
                 &self.render_ctx.device,
                 &self.render_ctx.queue,

@@ -121,7 +121,11 @@ impl AppState {
     }
 
     pub(crate) fn handle_dev_key(&mut self, code: KeyCode) -> bool {
-        if self.ui_screen == UiScreen::Editor && self.input.ctrl && code == KeyCode::KeyS {
+        let ctrl = self
+            .ecs_world
+            .read_resource::<crate::ecs::resources::InputResource>()
+            .ctrl;
+        if self.ui_screen == UiScreen::Editor && ctrl && code == KeyCode::KeyS {
             self.save_big_world_to_file();
             true
         } else {
