@@ -6,6 +6,7 @@ struct PathTracerParams {
     camera_position: vec3<f32>,
     frame_index: u32,
     inv_view_proj: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
     camera_up: vec3<f32>,
     accumulated_frames: u32,
     camera_right: vec3<f32>,
@@ -416,31 +417,37 @@ fn trace_scene(ray: Ray, max_dist: f32) -> HitInfo {
     return char_hit;
 }
 
-// Trace shadow ray against full scene
+// Trace shadow ray against full scene (characters + voxels via DDA)
 fn trace_shadow_scene(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
+    // Check character shadows via BVH
     let ray = Ray(origin + direction * 0.01, direction);
-    let hit = trace_scene(ray, 100.0);
-    if hit.hit {
+    let char_hit = trace_bvh(ray, 64.0);
+    if char_hit.hit {
         return 0.0;
     }
-    return 1.0;
+    // Check voxel shadows via DDA through voxel volume
+    return trace_shadow_ray(origin, direction);
 }
 
-// Check if position is inside the voxel volume
-fn in_bounds(pos: vec3<i32>) -> bool {
+// Check if world voxel position is inside the volume
+fn in_volume(pos: vec3<i32>) -> bool {
     let size = vec3<i32>(textureDimensions(t_voxels));
-    return all(pos >= vec3<i32>(0)) && all(pos < size);
+    let origin = vec3<i32>(params.volume_min / params.voxel_size);
+    let rel = pos - origin;
+    return all(rel >= vec3<i32>(0)) && all(rel < size);
 }
 
-// Get voxel at position
+// Get voxel at world voxel position (toroidal addressing)
 fn get_voxel(pos: vec3<i32>) -> u32 {
-    if !in_bounds(pos) {
+    if !in_volume(pos) {
         return 0u;
     }
-    return textureLoad(t_voxels, pos, 0).r;
+    let size = vec3<i32>(textureDimensions(t_voxels));
+    let tex = ((pos % size) + size) % size;
+    return textureLoad(t_voxels, tex, 0).r;
 }
 
-// DDA ray-voxel intersection
+// DDA ray-voxel intersection (world voxel coordinates, toroidal addressing)
 fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
     var result: HitInfo;
     result.hit = false;
@@ -452,11 +459,11 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
     let inv_dir = 1.0 / ray.direction;
     let sign_dir = sign(ray.direction);
 
-    // Convert world position to local voxel space (accounting for volume_min offset)
-    let local_origin = ray.origin - params.volume_min;
+    // Work in world voxel coordinates (toroidal get_voxel handles the wrap)
+    let world_origin = ray.origin / params.voxel_size;
 
-    // Starting voxel position
-    var pos = vec3<i32>(floor(local_origin / params.voxel_size));
+    // Starting voxel position (world voxel coords)
+    var pos = vec3<i32>(floor(world_origin));
 
     // Step direction
     let step = vec3<i32>(sign_dir);
@@ -466,7 +473,7 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
 
     // Initial t_max (distance to first boundary in each dimension)
     var t_max: vec3<f32>;
-    let frac = fract(local_origin / params.voxel_size);
+    let frac = fract(world_origin);
 
     if ray.direction.x > 0.0 {
         t_max.x = (1.0 - frac.x) * params.voxel_size * abs(inv_dir.x);
@@ -498,8 +505,8 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
         return result;
     }
 
-    // DDA traversal (reduced iterations for performance)
-    for (var i = 0; i < 128; i++) {
+    // DDA traversal
+    for (var i = 0; i < 512; i++) {
         // Find which dimension to step in
         if t_max.x < t_max.y && t_max.x < t_max.z {
             t = t_max.x;
@@ -522,7 +529,7 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
             break;
         }
 
-        if !in_bounds(pos) {
+        if !in_volume(pos) {
             break;
         }
 
@@ -540,11 +547,10 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
     return result;
 }
 
-// Trace shadow ray to sun (voxels only for performance)
+// Shadow ray using DDA through the 3D voxel volume texture
 fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
     let ray = Ray(origin + direction * 0.01, direction);
-    // Only trace voxels for shadows (faster than full scene)
-    let hit = trace_ray_dda(ray, 32.0);
+    let hit = trace_ray_dda(ray, 64.0);
     if hit.hit {
         return 0.0;
     }
@@ -609,7 +615,7 @@ fn path_trace(start_pos: vec3<f32>, start_normal: vec3<f32>, start_albedo: vec3<
     let sun_dir = normalize(params.sun_direction);
     let n_dot_l = max(dot(normal, sun_dir), 0.0);
     if n_dot_l > 0.0 {
-        let shadow = trace_shadow_ray(pos + normal * 0.01, sun_dir);
+        let shadow = trace_shadow_scene(pos + normal * 0.01, sun_dir);
         let direct = params.sun_color * params.sun_intensity * n_dot_l * shadow;
         radiance += throughput * albedo * direct;
     }
@@ -701,7 +707,7 @@ fn path_trace(start_pos: vec3<f32>, start_normal: vec3<f32>, start_albedo: vec3<
         // Direct lighting at bounce
         let bounce_n_dot_l = max(dot(normal, sun_dir), 0.0);
         if bounce_n_dot_l > 0.0 {
-            let shadow = trace_shadow_ray(pos + normal * 0.01, sun_dir);
+            let shadow = trace_shadow_scene(pos + normal * 0.01, sun_dir);
             let direct = params.sun_color * params.sun_intensity * bounce_n_dot_l * shadow;
             radiance += throughput * albedo * direct * 0.5;
         }

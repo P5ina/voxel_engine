@@ -185,16 +185,46 @@ pub struct GameSettings {
     pub lighting_mode: LightingMode,
     pub performance_preset: PerformancePreset,
     pub show_debug: bool,
+    pub max_bounces: u32,
+    pub render_scale: f32,
+    pub vsync: bool,
 }
 
 impl Default for GameSettings {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             fov: 70.0,
             sensitivity: 0.003,
             lighting_mode: LightingMode::Simple,
             performance_preset: PerformancePreset::Balanced,
             show_debug: false,
+            max_bounces: 2,
+            render_scale: 1.0,
+            vsync: true,
+        };
+        s.apply_preset();
+        s
+    }
+}
+
+impl GameSettings {
+    pub fn apply_preset(&mut self) {
+        match self.performance_preset {
+            PerformancePreset::Potato => {
+                self.max_bounces = 1;
+                self.render_scale = 0.5;
+                self.lighting_mode = LightingMode::Simple;
+            }
+            PerformancePreset::Balanced => {
+                self.max_bounces = 2;
+                self.render_scale = 0.75;
+                self.lighting_mode = LightingMode::PathTracing;
+            }
+            PerformancePreset::High => {
+                self.max_bounces = 4;
+                self.render_scale = 1.0;
+                self.lighting_mode = LightingMode::PathTracing;
+            }
         }
     }
 }

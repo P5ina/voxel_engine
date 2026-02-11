@@ -54,7 +54,7 @@ impl RenderContext {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -78,6 +78,18 @@ impl RenderContext {
         if width > 0 && height > 0 {
             self.config.width = width;
             self.config.height = height;
+            self.configure();
+        }
+    }
+
+    pub fn set_present_mode(&mut self, vsync: bool) {
+        let mode = if vsync {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
             self.configure();
         }
     }

@@ -336,7 +336,9 @@ impl AppState {
                     if let Some(rest) = rest.strip_suffix(".region") {
                         let parts: Vec<&str> = rest.splitn(2, '_').collect();
                         if parts.len() == 2 {
-                            if let (Ok(rx), Ok(rz)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                            if let (Ok(rx), Ok(rz)) =
+                                (parts[0].parse::<i32>(), parts[1].parse::<i32>())
+                            {
                                 region_files.push((RegionCoord::new(rx, rz), entry.path()));
                             }
                         }

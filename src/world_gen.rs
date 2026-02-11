@@ -266,12 +266,16 @@ impl AppState {
         // Sort by distance from spawn (closer first)
         mesh_tasks.sort_by(|a, b| {
             let dist_a = {
-                let MeshKey::Chunk(pos) = a else { unreachable!() };
+                let MeshKey::Chunk(pos) = a else {
+                    unreachable!()
+                };
                 let c = pos.center_world_pos();
                 Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
             };
             let dist_b = {
-                let MeshKey::Chunk(pos) = b else { unreachable!() };
+                let MeshKey::Chunk(pos) = b else {
+                    unreachable!()
+                };
                 let c = pos.center_world_pos();
                 Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
             };

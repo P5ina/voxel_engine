@@ -8,6 +8,13 @@ use wgpu::util::DeviceExt;
 use crate::camera::Camera;
 use crate::ui::LightingMode;
 use crate::voxel::{CHUNK_SIZE, VOXEL_SCALE};
+use crate::world::{ChunkManager, ChunkPosition};
+
+/// Size of the 3D voxel volume texture (in voxels per axis).
+/// Covers VOLUME_SIZE * VOXEL_SCALE meters per axis, centered on camera.
+const VOLUME_SIZE: usize = 256;
+/// Number of chunks that fit along one axis of the volume (256/32 = 8).
+const CHUNKS_PER_VOL_AXIS: i32 = (VOLUME_SIZE / CHUNK_SIZE) as i32;
 
 pub use gbuffer::GBuffer;
 pub use materials::Palette;
@@ -29,6 +36,7 @@ pub struct PathTracerParams {
     pub camera_position: [f32; 3],
     pub frame_index: u32,
     pub inv_view_proj: [[f32; 4]; 4],
+    pub view_proj: [[f32; 4]; 4],
     pub camera_up: [f32; 3],
     pub accumulated_frames: u32,
     pub camera_right: [f32; 3],
@@ -51,6 +59,7 @@ impl Default for PathTracerParams {
             camera_position: [0.0; 3],
             frame_index: 0,
             inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
             camera_up: [0.0, 1.0, 0.0],
             accumulated_frames: 0,
             camera_right: [1.0, 0.0, 0.0],
@@ -156,9 +165,11 @@ pub struct PathTracer {
     pub voxel_texture: wgpu::Texture,
     pub voxel_view: wgpu::TextureView,
 
-    // World bounds for multi-chunk support
+    // World bounds for the voxel volume (updated by update_voxel_volume)
     pub world_size: (usize, usize, usize),
     pub world_origin: (i32, i32, i32),
+    /// Chunk-coordinate min of the current volume (toroidal, for incremental updates)
+    volume_chunk_min: (i32, i32, i32),
 
     // G-buffer pass
     pub gbuffer_pipeline: wgpu::RenderPipeline,
@@ -247,13 +258,13 @@ impl PathTracer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Create voxel 3D texture (matches chunk size)
+        // Create voxel 3D texture for DDA ray tracing (shadow rays + path tracing bounces)
         let voxel_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Voxel Texture"),
+            label: Some("Voxel Volume Texture"),
             size: wgpu::Extent3d {
-                width: CHUNK_SIZE as u32,
-                height: CHUNK_SIZE as u32,
-                depth_or_array_layers: CHUNK_SIZE as u32,
+                width: VOLUME_SIZE as u32,
+                height: VOLUME_SIZE as u32,
+                depth_or_array_layers: VOLUME_SIZE as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -420,8 +431,9 @@ impl PathTracer {
             render_scale,
             internal_width,
             internal_height,
-            world_size: (CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE),
+            world_size: (VOLUME_SIZE, VOLUME_SIZE, VOLUME_SIZE),
             world_origin: (0, 0, 0),
+            volume_chunk_min: (i32::MIN, i32::MIN, i32::MIN),
         }
     }
 
@@ -1219,6 +1231,7 @@ impl PathTracer {
         self.resize(device, width, height);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_params(
         &mut self,
         queue: &wgpu::Queue,
@@ -1227,6 +1240,7 @@ impl PathTracer {
         sun_intensity: f32,
         sun_color: [f32; 3],
         is_moving: bool,
+        max_bounces: u32,
     ) {
         // Calculate view-projection matrix (must match G-buffer render)
         let view_proj = camera.view_projection_matrix();
@@ -1252,10 +1266,11 @@ impl PathTracer {
             camera_position: camera_position.to_array(),
             frame_index: self.frame_index,
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            view_proj: view_proj.to_cols_array_2d(),
             camera_up: up.to_array(),
             accumulated_frames: self.accumulated_frames,
             camera_right: right.to_array(),
-            max_bounces: 4,
+            max_bounces,
             camera_forward: camera_forward.to_array(),
             voxel_size: VOXEL_SCALE,
             volume_min: [
@@ -1280,6 +1295,175 @@ impl PathTracer {
 
         self.frame_index = self.frame_index.wrapping_add(1);
         self.accumulated_frames += 1;
+    }
+
+    /// Upload a single chunk's voxel data to its toroidal position in the volume texture.
+    /// Since VOLUME_SIZE=256 and CHUNK_SIZE=32, each chunk maps to a clean 32³ sub-region
+    /// at texture offset (chunk_coord % 8) * 32 — no wrapping across texture edges.
+    #[allow(clippy::needless_range_loop)]
+    fn upload_chunk_to_volume(
+        &self,
+        queue: &wgpu::Queue,
+        world: &ChunkManager,
+        chunk_pos: ChunkPosition,
+    ) {
+        let cpv = CHUNKS_PER_VOL_AXIS;
+        let cs = CHUNK_SIZE as u32;
+
+        // Toroidal texture offset for this chunk
+        let tx = chunk_pos.x.rem_euclid(cpv) as u32 * cs;
+        let ty = chunk_pos.y.rem_euclid(cpv) as u32 * cs;
+        let tz = chunk_pos.z.rem_euclid(cpv) as u32 * cs;
+
+        // Build 32³ buffer (zeros = air if chunk not loaded)
+        let mut buf = [0u8; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE];
+        if let Some(chunk) = world.get_chunk(chunk_pos) {
+            let data = chunk.data();
+            for x in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    for z in 0..CHUNK_SIZE {
+                        buf[x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE] = data[x][y][z];
+                    }
+                }
+            }
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.voxel_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: tx,
+                    y: ty,
+                    z: tz,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &buf,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(cs),
+                rows_per_image: Some(cs),
+            },
+            wgpu::Extent3d {
+                width: cs,
+                height: cs,
+                depth_or_array_layers: cs,
+            },
+        );
+    }
+
+    /// Update the 3D voxel volume texture using toroidal addressing.
+    /// When the camera moves to a new chunk, only the newly-visible chunks are uploaded
+    /// (typically 1 slab = ~64 chunks instead of 512 for a full rebuild).
+    pub fn update_voxel_volume(
+        &mut self,
+        queue: &wgpu::Queue,
+        world: &ChunkManager,
+        camera_pos: glam::Vec3,
+    ) {
+        let cs = CHUNK_SIZE as i32;
+        let cpv = CHUNKS_PER_VOL_AXIS;
+        let half = cpv / 2;
+
+        // Camera chunk position (div_euclid for correct negative handling)
+        let cam_vx = (camera_pos.x / VOXEL_SCALE).floor() as i32;
+        let cam_vy = (camera_pos.y / VOXEL_SCALE).floor() as i32;
+        let cam_vz = (camera_pos.z / VOXEL_SCALE).floor() as i32;
+        let cam_cx = cam_vx.div_euclid(cs);
+        let cam_cy = cam_vy.div_euclid(cs);
+        let cam_cz = cam_vz.div_euclid(cs);
+
+        let new_min = (cam_cx - half, cam_cy - half, cam_cz - half);
+
+        if new_min == self.volume_chunk_min {
+            return;
+        }
+
+        let old_min = self.volume_chunk_min;
+        let is_first = old_min.0 == i32::MIN;
+        self.volume_chunk_min = new_min;
+
+        let new_max = (new_min.0 + cpv, new_min.1 + cpv, new_min.2 + cpv);
+
+        if is_first
+            || (new_min.0 - old_min.0).abs() >= cpv
+            || (new_min.1 - old_min.1).abs() >= cpv
+            || (new_min.2 - old_min.2).abs() >= cpv
+        {
+            // Full rebuild (first load or camera jumped far)
+            for cx in new_min.0..new_max.0 {
+                for cy in new_min.1..new_max.1 {
+                    for cz in new_min.2..new_max.2 {
+                        self.upload_chunk_to_volume(queue, world, ChunkPosition::new(cx, cy, cz));
+                    }
+                }
+            }
+        } else {
+            // Incremental: only upload chunks that entered the volume
+            let old_max = (old_min.0 + cpv, old_min.1 + cpv, old_min.2 + cpv);
+            for cx in new_min.0..new_max.0 {
+                for cy in new_min.1..new_max.1 {
+                    for cz in new_min.2..new_max.2 {
+                        if cx >= old_min.0
+                            && cx < old_max.0
+                            && cy >= old_min.1
+                            && cy < old_max.1
+                            && cz >= old_min.2
+                            && cz < old_max.2
+                        {
+                            continue; // Already in old volume
+                        }
+                        self.upload_chunk_to_volume(queue, world, ChunkPosition::new(cx, cy, cz));
+                    }
+                }
+            }
+        }
+
+        // Update volume bounds for shader (in voxel coordinates)
+        self.world_origin = (new_min.0 * cs, new_min.1 * cs, new_min.2 * cs);
+        self.world_size = (VOLUME_SIZE, VOLUME_SIZE, VOLUME_SIZE);
+        // Note: no accumulated_frames reset here — camera movement is already
+        // detected by update_params() via matrix_changed, which handles the reset.
+    }
+
+    /// Notify the path tracer that voxels were edited.
+    /// Re-uploads only the affected chunks so shadows update immediately.
+    pub fn notify_voxel_edits(
+        &mut self,
+        queue: &wgpu::Queue,
+        world: &ChunkManager,
+        edits: &[(i32, i32, i32, u8)],
+    ) {
+        let cs = CHUNK_SIZE as i32;
+        let cpv = CHUNKS_PER_VOL_AXIS;
+        let min = self.volume_chunk_min;
+        if min.0 == i32::MIN {
+            return; // Volume not initialized yet
+        }
+        let max = (min.0 + cpv, min.1 + cpv, min.2 + cpv);
+
+        let mut seen = std::collections::HashSet::new();
+        for &(wx, wy, wz, _) in edits {
+            let cx = wx.div_euclid(cs);
+            let cy = wy.div_euclid(cs);
+            let cz = wz.div_euclid(cs);
+
+            if cx >= min.0
+                && cx < max.0
+                && cy >= min.1
+                && cy < max.1
+                && cz >= min.2
+                && cz < max.2
+                && seen.insert((cx, cy, cz))
+            {
+                self.upload_chunk_to_volume(queue, world, ChunkPosition::new(cx, cy, cz));
+            }
+        }
+
+        if !seen.is_empty() {
+            self.accumulated_frames = 0;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -102,11 +102,6 @@ impl AppState {
                 }
             }
 
-            // Path tracer update for dirty chunks happens when results arrive
-            // in update_streaming() step 1
-            if !dispatched.is_empty() {
-                self.path_tracer.reset_accumulation();
-            }
             return;
         }
 
@@ -144,7 +139,6 @@ impl AppState {
     /// Update streaming system for large worlds
     pub(crate) fn update_streaming(&mut self) {
         let (
-            render_scale,
             max_mesh_uploads_per_frame,
             mesh_dispatch_multiplier,
             mesh_dispatch_min,
@@ -154,7 +148,6 @@ impl AppState {
             lod_distances,
         ) = match self.game_settings.performance_preset {
             PerformancePreset::Potato => (
-                0.67,
                 20usize,
                 2usize,
                 8usize,
@@ -164,7 +157,6 @@ impl AppState {
                 [96.0, 384.0, 640.0, 896.0, 1152.0, 1408.0],
             ),
             PerformancePreset::Balanced => (
-                1.0,
                 32usize,
                 3usize,
                 12usize,
@@ -174,7 +166,6 @@ impl AppState {
                 [160.0, 640.0, 960.0, 1280.0, 1600.0, 2048.0],
             ),
             PerformancePreset::High => (
-                1.0,
                 48usize,
                 4usize,
                 16usize,
@@ -189,7 +180,7 @@ impl AppState {
             &self.render_ctx.device,
             self.render_ctx.config.width,
             self.render_ctx.config.height,
-            render_scale,
+            self.game_settings.render_scale,
         );
 
         let player_pos = self.player.position;
@@ -233,7 +224,7 @@ impl AppState {
         }
 
         // 1. Collect completed mesh results from background threads
-        let mut dirty_positions: HashSet<ChunkPosition> = HashSet::new();
+        let mut _dirty_positions: HashSet<ChunkPosition> = HashSet::new();
         let mut uploads_this_frame = 0;
         if let Some(ref rx) = self.streaming_mesh_rx {
             while uploads_this_frame < max_mesh_uploads_per_frame {
@@ -266,7 +257,7 @@ impl AppState {
                     }
                 }
 
-                dirty_positions.insert(result.pos);
+                _dirty_positions.insert(result.pos);
 
                 // Mark mesh as built in streamer
                 if let Some(s) = &mut self.chunk_streamer {
@@ -358,7 +349,7 @@ impl AppState {
         let update = streamer.update(self.player.position);
         let player_chunk = ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
 
-        let has_unload_requests = !update.unload_requests.is_empty();
+        let _has_unload_requests = !update.unload_requests.is_empty();
 
         // 3. Dispatch mesh requests to background threads
         if let Some(ref tx) = self.streaming_mesh_tx {
@@ -586,8 +577,9 @@ impl AppState {
             self.chunk_meshes.remove(&MeshKey::LodNode(key));
         }
 
-        if !dirty_positions.is_empty() || has_unload_requests {
-            self.path_tracer.reset_accumulation();
-        }
+        // Note: we intentionally do NOT reset accumulation here.
+        // Mesh/LOD uploads don't invalidate the voxel volume used for DDA shadows.
+        // The G-buffer updates naturally each frame, and the accumulation blends in
+        // the changes over a few frames — far less jarring than resetting every frame.
     }
 }

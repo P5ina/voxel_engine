@@ -6,6 +6,7 @@ struct PathTracerParams {
     camera_position: vec3<f32>,
     frame_index: u32,
     inv_view_proj: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
     camera_up: vec3<f32>,
     accumulated_frames: u32,
     camera_right: vec3<f32>,
@@ -106,18 +107,22 @@ var char_sampler: sampler;
 // BVH constants
 const BVH_LEAF_FLAG: u32 = 0x80000000u;
 
-// Check if position is inside the voxel volume
-fn in_bounds(pos: vec3<i32>) -> bool {
+// Check if world voxel position is inside the volume
+fn in_volume(pos: vec3<i32>) -> bool {
     let size = vec3<i32>(textureDimensions(t_voxels));
-    return all(pos >= vec3<i32>(0)) && all(pos < size);
+    let origin = vec3<i32>(params.volume_min / params.voxel_size);
+    let rel = pos - origin;
+    return all(rel >= vec3<i32>(0)) && all(rel < size);
 }
 
-// Get voxel at position
+// Get voxel at world voxel position (toroidal addressing)
 fn get_voxel(pos: vec3<i32>) -> u32 {
-    if !in_bounds(pos) {
+    if !in_volume(pos) {
         return 0u;
     }
-    return textureLoad(t_voxels, pos, 0).r;
+    let size = vec3<i32>(textureDimensions(t_voxels));
+    let tex = ((pos % size) + size) % size;
+    return textureLoad(t_voxels, tex, 0).r;
 }
 
 // Ray-AABB intersection for BVH
@@ -327,27 +332,24 @@ fn trace_bvh_shadow(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> b
     return false;
 }
 
-// Convert world position to voxel texture coordinates
+// Convert world position to world voxel coordinates
 fn world_to_voxel(world_pos: vec3<f32>) -> vec3<i32> {
-    let local_pos = world_pos - params.volume_min;
-    return vec3<i32>(floor(local_pos / params.voxel_size));
+    return vec3<i32>(floor(world_pos / params.voxel_size));
 }
 
-// Simple shadow ray using DDA for voxels only (skip BVH for performance)
+// Shadow ray using DDA through the 3D voxel volume texture (toroidal addressing)
 fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> f32 {
-
-    // Then check voxels with DDA
     let inv_dir = 1.0 / direction;
     let sign_dir = sign(direction);
 
-    // Convert world position to voxel coordinates (accounting for volume_min offset)
-    let local_origin = origin - params.volume_min;
-    var pos = vec3<i32>(floor(local_origin / params.voxel_size));
+    // Work in world voxel coordinates (toroidal get_voxel handles the wrap)
+    let world_origin = origin / params.voxel_size;
+    var pos = vec3<i32>(floor(world_origin));
     let step = vec3<i32>(sign_dir);
     let t_delta = abs(inv_dir) * params.voxel_size;
 
     var t_max_axis: vec3<f32>;
-    let frac = fract(local_origin / params.voxel_size);
+    let frac = fract(world_origin);
 
     if direction.x > 0.0 {
         t_max_axis.x = (1.0 - frac.x) * params.voxel_size * abs(inv_dir.x);
@@ -367,7 +369,7 @@ fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> f
 
     var t = 0.0;
 
-    for (var i = 0; i < 64; i++) {
+    for (var i = 0; i < 256; i++) {
         if t_max_axis.x < t_max_axis.y && t_max_axis.x < t_max_axis.z {
             t = t_max_axis.x;
             t_max_axis.x += t_delta.x;
@@ -386,7 +388,7 @@ fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> f
             return 1.0;
         }
 
-        if !in_bounds(pos) {
+        if !in_volume(pos) {
             return 1.0;
         }
 
@@ -472,7 +474,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if n_dot_l > 0.0 {
         // Shadow ray
         let shadow_origin = world_pos + world_normal * 0.02;
-        let shadow = trace_shadow_ray(shadow_origin, sun_dir, 32.0);
+        let shadow = trace_shadow_ray(shadow_origin, sun_dir, 64.0);
         direct = params.sun_color * params.sun_intensity * n_dot_l * shadow;
     }
 

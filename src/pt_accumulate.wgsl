@@ -5,6 +5,7 @@ struct PathTracerParams {
     camera_position: vec3<f32>,
     frame_index: u32,
     inv_view_proj: mat4x4<f32>,
+    view_proj: mat4x4<f32>,
     camera_up: vec3<f32>,
     accumulated_frames: u32,
     camera_right: vec3<f32>,

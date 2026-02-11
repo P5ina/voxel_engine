@@ -188,6 +188,11 @@ impl AppState {
                     self.mark_regions_dirty_for_edits(&batch);
                     self.world.set_voxels_batch(&batch);
                     self.update_octree_for_edits(&batch);
+                    self.path_tracer.notify_voxel_edits(
+                        &self.render_ctx.queue,
+                        &self.world,
+                        &batch,
+                    );
                 }
             }
             MouseButton::Right => {
@@ -219,6 +224,11 @@ impl AppState {
                     self.mark_regions_dirty_for_edits(&batch);
                     self.world.set_voxels_batch(&batch);
                     self.update_octree_for_edits(&batch);
+                    self.path_tracer.notify_voxel_edits(
+                        &self.render_ctx.queue,
+                        &self.world,
+                        &batch,
+                    );
                 }
             }
             _ => {}

@@ -491,6 +491,7 @@ pub fn settings(ctx: &egui::Context, settings: &mut GameSettings) -> Option<UiMe
 
                         ui.add_space(10.0);
 
+                        let old_preset = settings.performance_preset;
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Performance").color(Color32::WHITE));
                             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -515,6 +516,9 @@ pub fn settings(ctx: &egui::Context, settings: &mut GameSettings) -> Option<UiMe
                                     });
                             });
                         });
+                        if settings.performance_preset != old_preset {
+                            settings.apply_preset();
+                        }
 
                         ui.add_space(10.0);
 
@@ -535,6 +539,36 @@ pub fn settings(ctx: &egui::Context, settings: &mut GameSettings) -> Option<UiMe
                                             "Path Tracing",
                                         );
                                     });
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Render Scale").color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut settings.render_scale, 0.5..=1.0)
+                                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                                );
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Bounces").color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.add(egui::Slider::new(&mut settings.max_bounces, 1..=4));
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("VSync").color(Color32::WHITE));
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                ui.checkbox(&mut settings.vsync, "");
                             });
                         });
                     });

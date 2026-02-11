@@ -570,6 +570,8 @@ impl AppState {
             self.handle_ui_message(msg);
         }
 
+        self.render_ctx.set_present_mode(self.game_settings.vsync);
+
         let output = self.render_ctx.surface.get_current_texture()?;
         let view = output
             .texture
@@ -591,6 +593,12 @@ impl AppState {
             self.camera_resources
                 .update(&self.render_ctx.queue, &self.camera);
 
+            self.path_tracer.update_voxel_volume(
+                &self.render_ctx.queue,
+                &self.world,
+                self.camera.position,
+            );
+
             self.path_tracer.update_params(
                 &self.render_ctx.queue,
                 &self.camera,
@@ -598,6 +606,7 @@ impl AppState {
                 self.lighting.sun_intensity,
                 self.lighting.sun_color,
                 self.is_walking,
+                self.game_settings.max_bounces,
             );
 
             let show_debug = self.game_settings.show_debug;
