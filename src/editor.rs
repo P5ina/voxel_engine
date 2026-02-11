@@ -2,6 +2,8 @@
 
 #[cfg(feature = "dev-tools")]
 use glam::Vec3;
+#[cfg(feature = "dev-tools")]
+use specs::WorldExt;
 
 use crate::ui::DebugInfo;
 use crate::world::ChunkPosition;
@@ -105,17 +107,19 @@ impl AppState {
 
     #[cfg(feature = "dev-tools")]
     pub(crate) fn update_editor(&mut self) {
-        let now = std::time::Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
-        self.last_frame = now;
+        // Run ECS systems (timing + lighting)
+        self.ecs_dispatcher.dispatch(&self.ecs_world);
 
-        // FPS calculation
-        self.frame_time_accum += dt;
-        self.frame_count += 1;
-        if self.frame_time_accum >= 0.5 {
-            self.fps = self.frame_count as f32 / self.frame_time_accum;
-            self.frame_time_accum = 0.0;
-            self.frame_count = 0;
+        let game_time = self.ecs_world.read_resource::<crate::ecs::resources::GameTime>();
+        let dt = game_time.dt;
+        drop(game_time);
+
+        // Sync ECS Lighting → render LightingParams
+        {
+            let ecs_lighting = self.ecs_world.read_resource::<crate::ecs::resources::Lighting>();
+            self.lighting.sun_direction = ecs_lighting.sun_direction.to_array();
+            self.lighting.sun_intensity = ecs_lighting.sun_intensity;
+            self.lighting.sun_color = ecs_lighting.sun_color.to_array();
         }
 
         // Free camera movement
@@ -156,7 +160,6 @@ impl AppState {
         self.camera.fov = self.game_settings.fov.to_radians();
         self.camera_resources
             .update(&self.render_ctx.queue, &self.camera);
-        self.lighting.update_time(0.1);
 
         if self.use_streaming {
             self.update_streaming();

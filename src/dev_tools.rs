@@ -1,3 +1,5 @@
+#[cfg(feature = "dev-tools")]
+use specs::WorldExt;
 use winit::keyboard::KeyCode;
 
 use crate::AppState;
@@ -21,7 +23,10 @@ impl AppState {
         let msg = match self.ui_screen {
             UiScreen::DevTools => ui::dev_tools(&self.egui.ctx),
             UiScreen::WorldSelect => ui::world_select(&self.egui.ctx, &mut self.world_select_state),
-            UiScreen::Editor => ui::editor_hud(&self.egui.ctx, &mut self.editor_state, self.fps),
+            UiScreen::Editor => {
+                let fps = self.ecs_world.read_resource::<crate::ecs::resources::GameTime>().fps;
+                ui::editor_hud(&self.egui.ctx, &mut self.editor_state, fps)
+            }
             UiScreen::EditorPause => ui::editor_pause(&self.egui.ctx),
             UiScreen::Loading => {
                 ui::loading_screen(&self.egui.ctx, &self.loading_state);

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use glam::Vec3;
+use specs::WorldExt;
 use winit::window::Window;
 
 mod bvh;
@@ -25,6 +26,11 @@ mod save_load;
 mod streaming_system;
 mod terrain_gen;
 mod world_gen;
+
+// ECS module — component/resource/system definitions, incrementally migrated
+mod ecs;
+#[allow(unused)]
+mod app_ecs;
 
 pub use app::{App, run};
 
@@ -165,11 +171,9 @@ pub struct AppState {
     pub(crate) big_world_gen_receiver: Option<mpsc::Receiver<BigWorldGenMessage>>,
     pub(crate) save_world_receiver: Option<mpsc::Receiver<SaveWorldResult>>,
 
-    // Timing
-    pub(crate) last_frame: std::time::Instant,
-    pub(crate) fps: f32,
-    pub(crate) frame_time_accum: f32,
-    pub(crate) frame_count: u32,
+    // ECS
+    pub(crate) ecs_world: specs::World,
+    pub(crate) ecs_dispatcher: specs::Dispatcher<'static, 'static>,
 }
 
 impl AppState {
@@ -330,10 +334,14 @@ impl AppState {
             big_world_lod_tasks: None,
             big_world_gen_receiver: None,
             save_world_receiver: None,
-            last_frame: std::time::Instant::now(),
-            fps: 0.0,
-            frame_time_accum: 0.0,
-            frame_count: 0,
+            ecs_world: {
+                let mut w = specs::World::new();
+                ecs::setup_world(&mut w);
+                w.insert(ecs::resources::GameTime::default());
+                w.insert(ecs::resources::Lighting::default());
+                w
+            },
+            ecs_dispatcher: ecs::build_phase1_dispatcher(),
         })
     }
 
@@ -389,17 +397,19 @@ impl AppState {
     }
 
     fn update(&mut self) {
-        let now = std::time::Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
-        self.last_frame = now;
+        // Run ECS systems (timing + lighting)
+        self.ecs_dispatcher.dispatch(&self.ecs_world);
 
-        // FPS calculation (update every 0.5 seconds)
-        self.frame_time_accum += dt;
-        self.frame_count += 1;
-        if self.frame_time_accum >= 0.5 {
-            self.fps = self.frame_count as f32 / self.frame_time_accum;
-            self.frame_time_accum = 0.0;
-            self.frame_count = 0;
+        let game_time = self.ecs_world.read_resource::<ecs::resources::GameTime>();
+        let dt = game_time.dt;
+        drop(game_time);
+
+        // Sync ECS Lighting → render LightingParams
+        {
+            let ecs_lighting = self.ecs_world.read_resource::<ecs::resources::Lighting>();
+            self.lighting.sun_direction = ecs_lighting.sun_direction.to_array();
+            self.lighting.sun_intensity = ecs_lighting.sun_intensity;
+            self.lighting.sun_color = ecs_lighting.sun_color.to_array();
         }
 
         // Movement input
@@ -477,8 +487,6 @@ impl AppState {
 
         self.camera.fov = self.game_settings.fov.to_radians();
 
-        self.lighting.update_time(0.1);
-
         // Build camera rotation for first-person view (yaw + pitch)
         let yaw_quat = glam::Quat::from_rotation_y(-self.camera.yaw - std::f32::consts::FRAC_PI_2);
         let pitch_quat = glam::Quat::from_rotation_x(self.camera.pitch);
@@ -524,7 +532,8 @@ impl AppState {
         if self.ui_screen == UiScreen::InGame {
             self.update();
         } else if !self.update_dev_screen() {
-            self.last_frame = std::time::Instant::now();
+            self.ecs_world.write_resource::<ecs::resources::GameTime>().last_frame =
+                std::time::Instant::now();
         }
         self.window.request_redraw();
 
@@ -551,7 +560,8 @@ impl AppState {
                     } else {
                         None
                     };
-                    ui::hud(&self.egui.ctx, self.fps, debug.as_ref());
+                    let fps = self.ecs_world.read_resource::<ecs::resources::GameTime>().fps;
+                    ui::hud(&self.egui.ctx, fps, debug.as_ref());
                     None
                 }
                 _ => None,
