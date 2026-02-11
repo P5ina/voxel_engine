@@ -1,7 +1,7 @@
 #![allow(clippy::needless_range_loop)]
 
-use super::Voxel;
 use super::chunk::{AIR, CHUNK_SIZE, VOXEL_SCALE};
+use super::Voxel;
 use crate::renderer::Vertex;
 use crate::world::lod::VoxelData;
 use crate::world::position::LodNodeKey;
@@ -334,7 +334,32 @@ fn emit_greedy_quad(
     }
 }
 
+/// Compute the 4 AO corner values for a single voxel face, returned as [u8; 4]
+/// where each value is quantized to 0..3 (matching calc_ao output * 3).
+fn compute_voxel_ao(world: &ChunkManager, face: &Face, wx: i32, wy: i32, wz: i32) -> [u8; 4] {
+    let mut ao = [0u8; 4];
+    for i in 0..4 {
+        let val = get_vertex_ao_world(world, wx, wy, wz, &face.ao_neighbors[i]);
+        // Quantize: val is 0.0, 1/3, 2/3, or 1.0 → map to 0, 1, 2, 3
+        ao[i] = (val * 3.0 + 0.5) as u8;
+    }
+    ao
+}
+
+/// Pack material + AO signature into a u64 for greedy merge comparison.
+/// Two voxels can be merged only if they have the same material AND same AO.
+fn pack_mask_ao(mat: u8, ao: [u8; 4]) -> u64 {
+    // Layout: [material: 8 bits][ao[0]: 2 bits][ao[1]: 2 bits][ao[2]: 2 bits][ao[3]: 2 bits]
+    (mat as u64) << 8
+        | (ao[0] as u64) << 6
+        | (ao[1] as u64) << 4
+        | (ao[2] as u64) << 2
+        | (ao[3] as u64)
+}
+
 /// Generate mesh for a single chunk using greedy meshing with AO.
+/// AO is computed per-voxel and only voxels with matching AO signatures are merged,
+/// preserving correct ambient occlusion across the entire quad.
 pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Vec<Vertex> {
     let mut vertices = Vec::new();
 
@@ -350,7 +375,8 @@ pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Ve
         // For each slice along the normal axis
         for slice in 0..cs {
             // Build mask: which cells have an exposed face in this direction?
-            let mut mask = [[0u8; CHUNK_SIZE]; CHUNK_SIZE]; // [v][u], 0 = no face
+            // Each entry packs material + AO signature so greedy merge respects AO boundaries.
+            let mut mask = [[0u64; CHUNK_SIZE]; CHUNK_SIZE]; // [v][u], 0 = no face
 
             for v in 0..cs {
                 for u in 0..cs {
@@ -372,24 +398,29 @@ pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Ve
                     let wz = origin_z + nz;
 
                     if !world.is_solid(wx, wy, wz) {
-                        mask[v][u] = voxel;
+                        // Compute the voxel's world coords for AO lookup
+                        let vwx = origin_x + x as i32;
+                        let vwy = origin_y + y as i32;
+                        let vwz = origin_z + z as i32;
+                        let ao = compute_voxel_ao(world, &dir.face, vwx, vwy, vwz);
+                        mask[v][u] = pack_mask_ao(voxel, ao);
                     }
                 }
             }
 
-            // Greedy merge the mask
+            // Greedy merge the mask (material + AO must match)
             let mut visited = [[false; CHUNK_SIZE]; CHUNK_SIZE];
 
             for v0 in 0..cs {
                 for u0 in 0..cs {
-                    let mat = mask[v0][u0];
-                    if mat == 0 || visited[v0][u0] {
+                    let key = mask[v0][u0];
+                    if key == 0 || visited[v0][u0] {
                         continue;
                     }
 
-                    // Expand right (u direction)
+                    // Expand right (u direction) — only merge if packed key matches
                     let mut w = 1;
-                    while u0 + w < cs && mask[v0][u0 + w] == mat && !visited[v0][u0 + w] {
+                    while u0 + w < cs && mask[v0][u0 + w] == key && !visited[v0][u0 + w] {
                         w += 1;
                     }
 
@@ -397,7 +428,7 @@ pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Ve
                     let mut h = 1;
                     'outer: while v0 + h < cs {
                         for u in u0..u0 + w {
-                            if mask[v0 + h][u] != mat || visited[v0 + h][u] {
+                            if mask[v0 + h][u] != key || visited[v0 + h][u] {
                                 break 'outer;
                             }
                         }
@@ -410,6 +441,9 @@ pub fn generate_chunk_mesh(world: &ChunkManager, chunk_pos: ChunkPosition) -> Ve
                             visited[v][u] = true;
                         }
                     }
+
+                    // Extract material from packed key
+                    let mat = (key >> 8) as u8;
 
                     // Emit quad
                     emit_greedy_quad(

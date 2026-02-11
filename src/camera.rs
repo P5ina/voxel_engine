@@ -145,6 +145,51 @@ impl Camera {
     }
 }
 
+/// Build frustum planes from explicit camera parameters (no bob/shake).
+/// Used to compute the player's frustum independently of the free camera.
+pub fn frustum_planes_from(
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    fov: f32,
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> [Vec4; 6] {
+    let yaw_quat = Quat::from_rotation_y(-yaw - std::f32::consts::FRAC_PI_2);
+    let pitch_quat = Quat::from_rotation_x(pitch);
+    let rotation = yaw_quat * pitch_quat;
+    let forward = rotation * Vec3::NEG_Z;
+    let up = rotation * Vec3::Y;
+    let target = position + forward;
+    let view = Mat4::look_at_rh(position, target, up);
+    let proj = Mat4::perspective_rh(fov, aspect, near, far);
+    let vp = proj * view;
+
+    let r0 = vp.row(0);
+    let r1 = vp.row(1);
+    let r2 = vp.row(2);
+    let r3 = vp.row(3);
+
+    let mut planes = [
+        r3 + r0, // left
+        r3 - r0, // right
+        r3 + r1, // bottom
+        r3 - r1, // top
+        r3 + r2, // near
+        r3 - r2, // far
+    ];
+
+    for p in &mut planes {
+        let len = Vec3::new(p.x, p.y, p.z).length();
+        if len > 0.0 {
+            *p /= len;
+        }
+    }
+
+    planes
+}
+
 /// Test if an AABB is at least partially inside the frustum.
 /// Returns true if visible, false if fully outside.
 pub fn aabb_in_frustum(min: Vec3, max: Vec3, planes: &[Vec4; 6]) -> bool {

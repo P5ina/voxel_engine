@@ -5,10 +5,34 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
+use glam::Vec3;
+use glam::Vec4;
+
 use crate::camera::Camera;
+use crate::renderer::Vertex;
 use crate::ui::LightingMode;
 use crate::voxel::{CHUNK_SIZE, VOXEL_SCALE};
 use crate::world::{ChunkManager, ChunkPosition};
+
+/// Number of shadow map cascades
+const CSM_CASCADE_COUNT: usize = 4;
+/// Shadow map resolution per cascade layer
+const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Per-cascade uniform for shadow render pass
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+struct ShadowPassUniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+/// CSM data passed to lighting compute shaders
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+pub struct CsmUniforms {
+    pub view_proj: [[[f32; 4]; 4]; CSM_CASCADE_COUNT],
+    pub cascade_splits: [f32; 4],
+}
 
 /// Size of the 3D voxel volume texture (in voxels per axis).
 /// Covers VOLUME_SIZE * VOXEL_SCALE meters per axis, centered on camera.
@@ -165,6 +189,18 @@ pub struct PathTracer {
     pub voxel_texture: wgpu::Texture,
     pub voxel_view: wgpu::TextureView,
 
+    // Cascaded Shadow Maps (CSM)
+    pub shadow_texture: wgpu::Texture,
+    pub shadow_views: [wgpu::TextureView; CSM_CASCADE_COUNT],
+    pub shadow_array_view: wgpu::TextureView,
+    pub shadow_sampler: wgpu::Sampler,
+    pub shadow_pipeline: wgpu::RenderPipeline,
+    pub shadow_bind_group_layout: wgpu::BindGroupLayout,
+    pub shadow_uniform_buffers: [wgpu::Buffer; CSM_CASCADE_COUNT],
+    pub shadow_bind_groups: [wgpu::BindGroup; CSM_CASCADE_COUNT],
+    pub csm_uniform_buffer: wgpu::Buffer,
+    pub csm_uniforms: CsmUniforms,
+
     // World bounds for the voxel volume (updated by update_voxel_volume)
     pub world_size: (usize, usize, usize),
     pub world_origin: (i32, i32, i32),
@@ -276,6 +312,49 @@ impl PathTracer {
 
         let voxel_view = voxel_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Create shadow map texture (2D array with 4 layers for CSM)
+        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Shadow Map Texture"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: CSM_CASCADE_COUNT as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        // Per-layer views for rendering into each cascade
+        let shadow_views: [wgpu::TextureView; CSM_CASCADE_COUNT] = std::array::from_fn(|i| {
+            shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(&format!("Shadow View Layer {}", i)),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: i as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+
+        // Full array view for shader sampling
+        let shadow_array_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Shadow Array View"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        // Comparison sampler for shadow mapping
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Shadow Comparison Sampler"),
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         // Create tonemap sampler (non-filtering for Rgba32Float)
         let tonemap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Tonemap Sampler"),
@@ -305,6 +384,40 @@ impl PathTracer {
 
         let (accumulate_bind_group_layout, accumulate_pipeline) =
             Self::create_accumulate_pipeline(device);
+
+        let (shadow_bind_group_layout, shadow_pipeline) = Self::create_shadow_pipeline(device);
+
+        // Create shadow uniform buffers and bind groups
+        let shadow_uniform_buffers: [wgpu::Buffer; CSM_CASCADE_COUNT] = std::array::from_fn(|i| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("Shadow Uniform Buffer {}", i)),
+                contents: bytemuck::cast_slice(&[ShadowPassUniforms {
+                    view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                }]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+
+        let shadow_bind_groups: [wgpu::BindGroup; CSM_CASCADE_COUNT] = std::array::from_fn(|i| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Shadow Bind Group {}", i)),
+                layout: &shadow_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: shadow_uniform_buffers[i].as_entire_binding(),
+                }],
+            })
+        });
+
+        let csm_uniforms = CsmUniforms {
+            view_proj: [Mat4::IDENTITY.to_cols_array_2d(); CSM_CASCADE_COUNT],
+            cascade_splits: [16.0, 64.0, 256.0, 1024.0],
+        };
+        let csm_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CSM Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[csm_uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         let (denoise_bind_group_layout, _denoise_pipeline) = Self::create_denoise_pipeline(device);
 
@@ -343,6 +456,9 @@ impl PathTracer {
             &materials_buffer,
             &voxel_view,
             &accumulation.current_view,
+            &shadow_array_view,
+            &shadow_sampler,
+            &csm_uniform_buffer,
         );
 
         // Direct lighting uses same bind group layout as path tracing
@@ -354,6 +470,9 @@ impl PathTracer {
             &materials_buffer,
             &voxel_view,
             &accumulation.current_view,
+            &shadow_array_view,
+            &shadow_sampler,
+            &csm_uniform_buffer,
         );
 
         let accumulate_bind_group = Self::create_accumulate_bind_group(
@@ -400,6 +519,16 @@ impl PathTracer {
             materials_buffer,
             voxel_texture,
             voxel_view,
+            shadow_texture,
+            shadow_views,
+            shadow_array_view,
+            shadow_sampler,
+            shadow_pipeline,
+            shadow_bind_group_layout,
+            shadow_uniform_buffers,
+            shadow_bind_groups,
+            csm_uniform_buffer,
+            csm_uniforms,
             gbuffer_pipeline,
             pathtrace_pipeline,
             pathtrace_bind_group_layout,
@@ -604,6 +733,35 @@ impl PathTracer {
                     },
                     count: None,
                 },
+                // Shadow map (depth 2D array)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Depth,
+                    },
+                    count: None,
+                },
+                // Shadow comparison sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                // CSM uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -648,6 +806,69 @@ impl PathTracer {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         })
+    }
+
+    fn create_shadow_pipeline(
+        device: &wgpu::Device,
+    ) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shadow Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("../pt_shadow.wgsl"));
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Shadow Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: None, // Depth-only
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back), // Back-face culling (voxel meshes are single-sided)
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 1,
+                    slope_scale: 1.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        (bind_group_layout, pipeline)
     }
 
     fn create_accumulate_pipeline(
@@ -1014,6 +1235,7 @@ impl PathTracer {
         (bind_group_layout, pipeline)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_pathtrace_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -1022,6 +1244,9 @@ impl PathTracer {
         materials_buffer: &wgpu::Buffer,
         voxel_view: &wgpu::TextureView,
         output_view: &wgpu::TextureView,
+        shadow_array_view: &wgpu::TextureView,
+        shadow_sampler: &wgpu::Sampler,
+        csm_uniform_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PathTrace Bind Group"),
@@ -1054,6 +1279,18 @@ impl PathTracer {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(shadow_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: csm_uniform_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -1149,6 +1386,9 @@ impl PathTracer {
             &self.materials_buffer,
             &self.voxel_view,
             &self.accumulation.current_view,
+            &self.shadow_array_view,
+            &self.shadow_sampler,
+            &self.csm_uniform_buffer,
         );
 
         self.direct_bind_group = Self::create_pathtrace_bind_group(
@@ -1159,6 +1399,9 @@ impl PathTracer {
             &self.materials_buffer,
             &self.voxel_view,
             &self.accumulation.current_view,
+            &self.shadow_array_view,
+            &self.shadow_sampler,
+            &self.csm_uniform_buffer,
         );
 
         self.accumulate_bind_group = Self::create_accumulate_bind_group(
@@ -1467,18 +1710,43 @@ impl PathTracer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn render<'a>(
+    pub fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         output_view: &wgpu::TextureView,
         camera_bind_group: &wgpu::BindGroup,
         texture_bind_group: &wgpu::BindGroup,
         character_bind_group: &wgpu::BindGroup,
-        meshes: impl Iterator<Item = (&'a wgpu::Buffer, u32, u32)>,
+        meshes: &[(&wgpu::Buffer, u32, u32)],
         lighting_mode: LightingMode,
     ) {
         let iw = self.internal_width;
         let ih = self.internal_height;
+
+        // Pass 0: Shadow map passes (4 cascades)
+        for cascade in 0..CSM_CASCADE_COUNT {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Shadow Pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_views[cascade],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            render_pass.set_pipeline(&self.shadow_pipeline);
+            render_pass.set_bind_group(0, &self.shadow_bind_groups[cascade], &[]);
+
+            for &(vertex_buffer, num_vertices, _lod_level) in meshes {
+                render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                render_pass.draw(0..num_vertices, 0..1);
+            }
+        }
 
         // Pass 1: G-buffer (at internal resolution)
         {
@@ -1543,7 +1811,7 @@ impl PathTracer {
             render_pass.set_bind_group(0, camera_bind_group, &[]);
             render_pass.set_bind_group(1, texture_bind_group, &[]);
 
-            for (vertex_buffer, num_vertices, lod_level) in meshes {
+            for &(vertex_buffer, num_vertices, lod_level) in meshes {
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..num_vertices, lod_level..lod_level + 1);
             }
@@ -1621,6 +1889,136 @@ impl PathTracer {
             render_pass.set_bind_group(0, bind_group, &[]);
             render_pass.draw(0..3, 0..1); // Full-screen triangle
         }
+    }
+
+    /// Compute cascade shadow map view-projection matrices and write to GPU.
+    pub fn update_shadow_cascades(
+        &mut self,
+        queue: &wgpu::Queue,
+        camera: &Camera,
+        sun_direction: [f32; 3],
+    ) {
+        let sun_dir = Vec3::from(sun_direction).normalize();
+        if sun_dir.length_squared() < 0.001 {
+            return;
+        }
+
+        let view = camera.view_matrix();
+        let proj = camera.projection_matrix();
+        let inv_vp = (proj * view).inverse();
+
+        let cascade_splits: [f32; 5] = [camera.near, 16.0, 64.0, 256.0, camera.far.min(1024.0)];
+
+        for i in 0..CSM_CASCADE_COUNT {
+            let near_split = cascade_splits[i];
+            let far_split = cascade_splits[i + 1];
+
+            // Compute 8 frustum corners of the sub-frustum in NDC, then to world
+            let near_ndc = Self::depth_to_ndc(near_split, camera.near, camera.far);
+            let far_ndc = Self::depth_to_ndc(far_split, camera.near, camera.far);
+
+            let corners = [
+                inv_vp * Vec4::new(-1.0, -1.0, near_ndc, 1.0),
+                inv_vp * Vec4::new(1.0, -1.0, near_ndc, 1.0),
+                inv_vp * Vec4::new(-1.0, 1.0, near_ndc, 1.0),
+                inv_vp * Vec4::new(1.0, 1.0, near_ndc, 1.0),
+                inv_vp * Vec4::new(-1.0, -1.0, far_ndc, 1.0),
+                inv_vp * Vec4::new(1.0, -1.0, far_ndc, 1.0),
+                inv_vp * Vec4::new(-1.0, 1.0, far_ndc, 1.0),
+                inv_vp * Vec4::new(1.0, 1.0, far_ndc, 1.0),
+            ];
+
+            let world_corners: [Vec3; 8] =
+                std::array::from_fn(|j| corners[j].truncate() / corners[j].w);
+
+            // Compute bounding sphere center and radius
+            let center = world_corners.iter().copied().sum::<Vec3>() / 8.0;
+            let radius = world_corners
+                .iter()
+                .map(|c| (*c - center).length())
+                .fold(0.0f32, f32::max);
+
+            // Sun view matrix — camera on the sun side, looking toward the scene.
+            // This ensures objects closer to the sun write smaller depth values,
+            // which is required for correct shadow comparison (LessEqual).
+            let up = if sun_dir.y.abs() > 0.99 {
+                Vec3::Z
+            } else {
+                Vec3::Y
+            };
+            let light_view = Mat4::look_at_rh(center + sun_dir * radius, center, up);
+
+            // Project corners into light view, compute AABB
+            let mut min_x = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut min_y = f32::MAX;
+            let mut max_y = f32::MIN;
+            let mut min_z = f32::MAX;
+            let mut max_z = f32::MIN;
+
+            for corner in &world_corners {
+                let lv = light_view * Vec4::new(corner.x, corner.y, corner.z, 1.0);
+                min_x = min_x.min(lv.x);
+                max_x = max_x.max(lv.x);
+                min_y = min_y.min(lv.y);
+                max_y = max_y.max(lv.y);
+                min_z = min_z.min(lv.z);
+                max_z = max_z.max(lv.z);
+            }
+
+            // Extend Z range to catch shadow receivers beyond the frustum slice.
+            // Camera is on the sun side, -Z points into the scene. Objects farther
+            // from the sun have more negative Z (min_z). Extend min_z to include
+            // receivers that are deeper into the scene.
+            let z_extent = max_z - min_z;
+            min_z -= z_extent;
+
+            // Texel-snap to prevent shadow swimming
+            let texel_size = (max_x - min_x) / SHADOW_MAP_SIZE as f32;
+            min_x = (min_x / texel_size).floor() * texel_size;
+            max_x = (max_x / texel_size).ceil() * texel_size;
+            min_y = (min_y / texel_size).floor() * texel_size;
+            max_y = (max_y / texel_size).ceil() * texel_size;
+
+            // orthographic_rh(l, r, b, t, near, far) with near/far as positive
+            // distances. In RH view space, objects in front have negative Z.
+            // -max_z = near (closest to camera/sun), -min_z = far (deepest into scene).
+            let light_proj = Mat4::orthographic_rh(min_x, max_x, min_y, max_y, -max_z, -min_z);
+            let light_vp = light_proj * light_view;
+
+            self.csm_uniforms.view_proj[i] = light_vp.to_cols_array_2d();
+
+            // Write per-cascade shadow pass uniform
+            let shadow_uniform = ShadowPassUniforms {
+                view_proj: light_vp.to_cols_array_2d(),
+            };
+            queue.write_buffer(
+                &self.shadow_uniform_buffers[i],
+                0,
+                bytemuck::cast_slice(&[shadow_uniform]),
+            );
+        }
+
+        // Store cascade splits (view-space distances for shader cascade selection)
+        self.csm_uniforms.cascade_splits = [
+            cascade_splits[1],
+            cascade_splits[2],
+            cascade_splits[3],
+            cascade_splits[4],
+        ];
+
+        queue.write_buffer(
+            &self.csm_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.csm_uniforms]),
+        );
+    }
+
+    /// Convert a linear depth to NDC z for a perspective projection (reverse Z not used here).
+    fn depth_to_ndc(depth: f32, near: f32, far: f32) -> f32 {
+        // wgpu uses [0, 1] depth range with right-handed perspective:
+        // ndc_z = far * (depth - near) / (depth * (far - near))
+        far * (depth - near) / (depth * (far - near))
     }
 
     pub fn reset_accumulation(&mut self) {

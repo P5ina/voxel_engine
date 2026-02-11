@@ -139,6 +139,11 @@ impl ChunkStreamer {
         }
     }
 
+    /// LOD0 maximum distance from config
+    pub fn lod0_distance(&self) -> f32 {
+        self.config.lod.distances[0]
+    }
+
     /// Update streaming based on player position
     /// Returns requests for mesh generation and chunk unloading
     pub fn update(&mut self, player_pos: Vec3) -> StreamingUpdate {

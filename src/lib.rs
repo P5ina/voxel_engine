@@ -21,11 +21,9 @@ mod dev_tools;
 mod editor;
 mod input;
 mod map_browser;
-#[cfg(feature = "dev-tools")]
 mod save_load;
 mod streaming_system;
 mod terrain_gen;
-#[cfg(feature = "dev-tools")]
 mod world_gen;
 
 pub use app::{App, run};
@@ -35,14 +33,14 @@ use model::load_glb;
 use pathtracer::PathTracer;
 use player::Player;
 use renderer::{CameraResources, LightingParams, MeshResources, PaletteResources, RenderContext};
-use ui::{EditorState, EguiRenderer, GameSettings, MapSelectState, UiMessage, UiScreen};
+use ui::LoadingState;
 #[cfg(feature = "dev-tools")]
-use ui::{LoadingState, WorldSelectState};
+use ui::WorldSelectState;
+use ui::{EditorState, EguiRenderer, GameSettings, MapSelectState, UiMessage, UiScreen};
 use voxel::{Chunk, VOXEL_SCALE, generate_chunk_mesh};
 use world::{ChunkManager, ChunkPosition, ChunkStreamer, LodNodeKey, RegionManager, VoxelOctree};
 
 /// Result sent back from background save thread
-#[cfg(feature = "dev-tools")]
 pub(crate) type SaveWorldResult = (Option<VoxelOctree>, Result<(), world::BigWorldError>);
 
 /// Unified mesh key for both chunk meshes and LOD node meshes.
@@ -53,7 +51,6 @@ pub(crate) enum MeshKey {
 }
 
 /// Messages from background world generation thread
-#[cfg(feature = "dev-tools")]
 pub(crate) enum BigWorldGenMessage {
     /// Progress update: (message, loaded, total)
     Progress(String, usize, usize),
@@ -62,7 +59,6 @@ pub(crate) enum BigWorldGenMessage {
 }
 
 /// Result from background world generation thread
-#[cfg(feature = "dev-tools")]
 pub(crate) struct BigWorldGenResult {
     pub(crate) world: ChunkManager,
     pub(crate) octree: VoxelOctree,
@@ -120,6 +116,9 @@ pub struct AppState {
     pub(crate) mouse_grabbed: bool,
     pub(crate) is_walking: bool,
     pub(crate) free_cam: bool,
+    /// Player yaw/pitch frozen when entering free cam (for frustum culling visualization)
+    pub(crate) player_yaw: f32,
+    pub(crate) player_pitch: f32,
 
     // UI
     pub(crate) egui: EguiRenderer,
@@ -161,13 +160,9 @@ pub struct AppState {
     pub(crate) chunks_ready: bool,
 
     // Loading screen
-    #[cfg(feature = "dev-tools")]
     pub(crate) loading_state: LoadingState,
-    #[cfg(feature = "dev-tools")]
     pub(crate) big_world_lod_tasks: Option<Vec<MeshKey>>,
-    #[cfg(feature = "dev-tools")]
     pub(crate) big_world_gen_receiver: Option<mpsc::Receiver<BigWorldGenMessage>>,
-    #[cfg(feature = "dev-tools")]
     pub(crate) save_world_receiver: Option<mpsc::Receiver<SaveWorldResult>>,
 
     // Timing
@@ -306,6 +301,8 @@ impl AppState {
             mouse_grabbed: false,
             is_walking: false,
             free_cam: false,
+            player_yaw: 0.0,
+            player_pitch: 0.0,
             egui,
             ui_screen: UiScreen::default(),
             game_settings: GameSettings::default(),
@@ -329,13 +326,9 @@ impl AppState {
             lod_mesh_rx: None,
             lod_mesh_tx: None,
             chunks_ready: true, // default world is always fully loaded
-            #[cfg(feature = "dev-tools")]
             loading_state: LoadingState::default(),
-            #[cfg(feature = "dev-tools")]
             big_world_lod_tasks: None,
-            #[cfg(feature = "dev-tools")]
             big_world_gen_receiver: None,
-            #[cfg(feature = "dev-tools")]
             save_world_receiver: None,
             last_frame: std::time::Instant::now(),
             fps: 0.0,
@@ -561,7 +554,6 @@ impl AppState {
                     ui::hud(&self.egui.ctx, self.fps, debug.as_ref());
                     None
                 }
-                #[cfg(feature = "dev-tools")]
                 _ => None,
             }
         };
@@ -610,53 +602,76 @@ impl AppState {
             );
 
             let show_debug = self.game_settings.show_debug;
-            let frustum_planes = self.camera.frustum_planes();
+            // In free cam, cull from the player's frozen perspective so you can
+            // see frustum culling at work from the outside.
+            let frustum_planes = if self.free_cam {
+                camera::frustum_planes_from(
+                    self.player.eye_position(),
+                    self.player_yaw,
+                    self.player_pitch,
+                    self.camera.fov,
+                    self.camera.aspect,
+                    self.camera.near,
+                    self.camera.far,
+                )
+            } else {
+                self.camera.frustum_planes()
+            };
             let chunk_world_size = voxel::CHUNK_SIZE as f32 * VOXEL_SCALE;
             let camera_pos = self.camera.position;
-            let enable_terrain_occlusion = self.use_streaming
+            let do_frustum_cull = true;
+            let enable_terrain_occlusion = !self.free_cam
+                && self.use_streaming
                 && matches!(
                     self.game_settings.performance_preset,
                     ui::PerformancePreset::Potato
                 );
-            let meshes = self.chunk_meshes.iter().filter_map(move |(key, m)| {
-                let (min, max) = match key {
-                    MeshKey::Chunk(pos) => {
-                        let min = glam::Vec3::new(
-                            pos.x as f32 * chunk_world_size,
-                            pos.y as f32 * chunk_world_size,
-                            pos.z as f32 * chunk_world_size,
-                        );
-                        (min, min + glam::Vec3::splat(chunk_world_size))
+            let meshes: Vec<(&wgpu::Buffer, u32, u32)> =
+                self.chunk_meshes.iter().filter_map(move |(key, m)| {
+                    let (min, max) = match key {
+                        MeshKey::Chunk(pos) => {
+                            let min = glam::Vec3::new(
+                                pos.x as f32 * chunk_world_size,
+                                pos.y as f32 * chunk_world_size,
+                                pos.z as f32 * chunk_world_size,
+                            );
+                            (min, min + glam::Vec3::splat(chunk_world_size))
+                        }
+                        MeshKey::LodNode(key) => {
+                            let side = (1 << key.lod_level) as f32 * chunk_world_size;
+                            let min = glam::Vec3::new(
+                                key.x as f32 * side,
+                                key.y as f32 * side,
+                                key.z as f32 * side,
+                            );
+                            (min, min + glam::Vec3::splat(side))
+                        }
+                    };
+                    if do_frustum_cull && !camera::aabb_in_frustum(min, max, &frustum_planes) {
+                        return None;
                     }
-                    MeshKey::LodNode(key) => {
-                        let side = (1 << key.lod_level) as f32 * chunk_world_size;
-                        let min = glam::Vec3::new(
-                            key.x as f32 * side,
-                            key.y as f32 * side,
-                            key.z as f32 * side,
-                        );
-                        (min, min + glam::Vec3::splat(side))
+                    if enable_terrain_occlusion
+                        && matches!(key, MeshKey::Chunk(_))
+                        && Self::occluded_by_terrain_heightfield(camera_pos, min, max)
+                    {
+                        return None;
                     }
-                };
-                if !camera::aabb_in_frustum(min, max, &frustum_planes) {
-                    return None;
-                }
-                if enable_terrain_occlusion
-                    && matches!(key, MeshKey::Chunk(_))
-                    && Self::occluded_by_terrain_heightfield(camera_pos, min, max)
-                {
-                    return None;
-                }
-                let lod = if show_debug {
-                    match key {
-                        MeshKey::Chunk(_) => 0u32,
-                        MeshKey::LodNode(k) => k.lod_level as u32,
-                    }
-                } else {
-                    0u32
-                };
-                Some((&m.vertex_buffer, m.num_vertices, lod))
-            });
+                    let lod = if show_debug {
+                        match key {
+                            MeshKey::Chunk(_) => 0u32,
+                            MeshKey::LodNode(k) => k.lod_level as u32,
+                        }
+                    } else {
+                        0u32
+                    };
+                    Some((&m.vertex_buffer, m.num_vertices, lod))
+                }).collect();
+
+            self.path_tracer.update_shadow_cascades(
+                &self.render_ctx.queue,
+                &self.camera,
+                self.lighting.sun_direction,
+            );
 
             self.path_tracer.render(
                 &mut encoder,
@@ -664,7 +679,7 @@ impl AppState {
                 &self.camera_resources.bind_group,
                 &self.palette_resources.bind_group,
                 self.character_manager.bind_group(),
-                meshes,
+                &meshes,
                 self.game_settings.lighting_mode,
             );
         } else {

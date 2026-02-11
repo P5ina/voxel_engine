@@ -17,12 +17,10 @@ pub enum UiScreen {
     Editor,
     #[cfg(feature = "dev-tools")]
     EditorPause,
-    #[cfg(feature = "dev-tools")]
     Loading,
 }
 
 /// Info about a saved world file
-#[cfg(feature = "dev-tools")]
 #[derive(Clone)]
 pub struct WorldInfo {
     pub name: String,
@@ -41,7 +39,6 @@ pub struct WorldSelectState {
 }
 
 /// Loading screen state
-#[cfg(feature = "dev-tools")]
 #[derive(Clone)]
 pub struct LoadingState {
     pub message: String,
@@ -50,7 +47,6 @@ pub struct LoadingState {
     pub chunks_total: usize,
 }
 
-#[cfg(feature = "dev-tools")]
 impl Default for LoadingState {
     fn default() -> Self {
         Self {
@@ -62,7 +58,6 @@ impl Default for LoadingState {
     }
 }
 
-#[cfg(feature = "dev-tools")]
 impl LoadingState {
     pub fn new(message: &str, total: usize) -> Self {
         Self {
@@ -195,11 +190,12 @@ impl Default for GameSettings {
         let mut s = Self {
             fov: 70.0,
             sensitivity: 0.003,
-            lighting_mode: LightingMode::Simple,
+            // These match PerformancePreset::Balanced (kept in sync by apply_preset below)
+            lighting_mode: LightingMode::PathTracing,
             performance_preset: PerformancePreset::Balanced,
             show_debug: false,
             max_bounces: 2,
-            render_scale: 1.0,
+            render_scale: 0.75,
             vsync: true,
         };
         s.apply_preset();

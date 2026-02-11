@@ -1,6 +1,5 @@
 use egui::{Align, Align2, Area, Color32, FontId, RichText, Vec2};
 
-#[cfg(feature = "dev-tools")]
 use super::LoadingState;
 use super::MapSelectState;
 #[cfg(feature = "dev-tools")]
@@ -988,7 +987,6 @@ pub fn editor_pause(ctx: &egui::Context) -> Option<UiMessage> {
     msg
 }
 
-#[cfg(feature = "dev-tools")]
 pub fn loading_screen(ctx: &egui::Context, state: &LoadingState) {
     // Dark background
     egui::Area::new(egui::Id::new("loading_bg"))

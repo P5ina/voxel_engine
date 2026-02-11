@@ -101,13 +101,17 @@ impl AppState {
                 KeyCode::F5 => {
                     self.free_cam = !self.free_cam;
                     if self.free_cam {
-                        // Enter free cam: camera starts at current player eye position
+                        // Enter free cam: freeze player orientation for frustum culling vis
+                        self.player_yaw = self.camera.yaw;
+                        self.player_pitch = self.camera.pitch;
                         log::info!(
-                            "[FreeCam] Enabled — LOD loads around player, camera flies free"
+                            "[FreeCam] Enabled — frustum culls from player perspective"
                         );
                     } else {
                         // Exit free cam: snap camera back to player
                         self.camera.position = self.player.eye_position();
+                        self.camera.yaw = self.player_yaw;
+                        self.camera.pitch = self.player_pitch;
                         log::info!("[FreeCam] Disabled — camera follows player");
                     }
                 }

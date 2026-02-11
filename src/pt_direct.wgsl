@@ -66,6 +66,12 @@ struct CharHitInfo {
     texture_id: u32,
 };
 
+// CSM uniforms
+struct CsmUniforms {
+    view_proj: array<mat4x4<f32>, 4>,
+    cascade_splits: vec4<f32>,
+};
+
 // Group 0: Voxel tracing resources
 @group(0) @binding(0)
 var<uniform> params: PathTracerParams;
@@ -88,6 +94,15 @@ var t_albedo: texture_2d<f32>;
 @group(0) @binding(6)
 var output: texture_storage_2d<rgba32float, write>;
 
+@group(0) @binding(7)
+var t_shadow: texture_depth_2d_array;
+
+@group(0) @binding(8)
+var shadow_sampler: sampler_comparison;
+
+@group(0) @binding(9)
+var<uniform> csm: CsmUniforms;
+
 // Group 1: Character tracing resources
 @group(1) @binding(0)
 var<storage, read> bvh_nodes: array<BvhNode>;
@@ -106,24 +121,6 @@ var char_sampler: sampler;
 
 // BVH constants
 const BVH_LEAF_FLAG: u32 = 0x80000000u;
-
-// Check if world voxel position is inside the volume
-fn in_volume(pos: vec3<i32>) -> bool {
-    let size = vec3<i32>(textureDimensions(t_voxels));
-    let origin = vec3<i32>(params.volume_min / params.voxel_size);
-    let rel = pos - origin;
-    return all(rel >= vec3<i32>(0)) && all(rel < size);
-}
-
-// Get voxel at world voxel position (toroidal addressing)
-fn get_voxel(pos: vec3<i32>) -> u32 {
-    if !in_volume(pos) {
-        return 0u;
-    }
-    let size = vec3<i32>(textureDimensions(t_voxels));
-    let tex = ((pos % size) + size) % size;
-    return textureLoad(t_voxels, tex, 0).r;
-}
 
 // Ray-AABB intersection for BVH
 fn ray_aabb_intersect(origin: vec3<f32>, direction: vec3<f32>, bounds_min: vec3<f32>, bounds_max: vec3<f32>, t_max: f32) -> f32 {
@@ -332,72 +329,65 @@ fn trace_bvh_shadow(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> b
     return false;
 }
 
-// Convert world position to world voxel coordinates
-fn world_to_voxel(world_pos: vec3<f32>) -> vec3<i32> {
-    return vec3<i32>(floor(world_pos / params.voxel_size));
-}
+// Sample cascaded shadow map with PCF
+fn sample_csm_shadow(world_pos: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
+    // Determine cascade by comparing view-space depth
+    let view_pos = params.view_proj * vec4<f32>(world_pos, 1.0);
+    let depth = view_pos.w;
 
-// Shadow ray using DDA through the 3D voxel volume texture (toroidal addressing)
-fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>, max_dist: f32) -> f32 {
-    let inv_dir = 1.0 / direction;
-    let sign_dir = sign(direction);
-
-    // Work in world voxel coordinates (toroidal get_voxel handles the wrap)
-    let world_origin = origin / params.voxel_size;
-    var pos = vec3<i32>(floor(world_origin));
-    let step = vec3<i32>(sign_dir);
-    let t_delta = abs(inv_dir) * params.voxel_size;
-
-    var t_max_axis: vec3<f32>;
-    let frac = fract(world_origin);
-
-    if direction.x > 0.0 {
-        t_max_axis.x = (1.0 - frac.x) * params.voxel_size * abs(inv_dir.x);
-    } else {
-        t_max_axis.x = frac.x * params.voxel_size * abs(inv_dir.x);
+    var cascade = 0;
+    if depth > csm.cascade_splits.x {
+        cascade = 1;
     }
-    if direction.y > 0.0 {
-        t_max_axis.y = (1.0 - frac.y) * params.voxel_size * abs(inv_dir.y);
-    } else {
-        t_max_axis.y = frac.y * params.voxel_size * abs(inv_dir.y);
+    if depth > csm.cascade_splits.y {
+        cascade = 2;
     }
-    if direction.z > 0.0 {
-        t_max_axis.z = (1.0 - frac.z) * params.voxel_size * abs(inv_dir.z);
-    } else {
-        t_max_axis.z = frac.z * params.voxel_size * abs(inv_dir.z);
+    if depth > csm.cascade_splits.z {
+        cascade = 3;
     }
 
-    var t = 0.0;
+    // Small normal offset to avoid self-shadowing on surfaces facing the light.
+    // Scaled per cascade since distant cascades have larger texels.
+    let cascade_normal_bias = array<f32, 4>(0.05, 0.15, 0.4, 1.0);
+    let biased_pos = world_pos + normal * cascade_normal_bias[cascade];
 
-    for (var i = 0; i < 256; i++) {
-        if t_max_axis.x < t_max_axis.y && t_max_axis.x < t_max_axis.z {
-            t = t_max_axis.x;
-            t_max_axis.x += t_delta.x;
-            pos.x += step.x;
-        } else if t_max_axis.y < t_max_axis.z {
-            t = t_max_axis.y;
-            t_max_axis.y += t_delta.y;
-            pos.y += step.y;
-        } else {
-            t = t_max_axis.z;
-            t_max_axis.z += t_delta.z;
-            pos.z += step.z;
-        }
+    // Project into light space
+    let light_pos = csm.view_proj[cascade] * vec4<f32>(biased_pos, 1.0);
+    let proj_coords = light_pos.xyz / light_pos.w;
 
-        if t > max_dist {
-            return 1.0;
-        }
+    // Convert from NDC [-1,1] to UV [0,1]
+    let shadow_uv = proj_coords.xy * vec2<f32>(0.5, -0.5) + 0.5;
 
-        if !in_volume(pos) {
-            return 1.0;
-        }
-
-        if get_voxel(pos) != 0u {
-            return 0.0;
-        }
+    // Out-of-bounds check (UV and depth)
+    if shadow_uv.x < 0.0 || shadow_uv.x > 1.0 || shadow_uv.y < 0.0 || shadow_uv.y > 1.0
+        || proj_coords.z < 0.0 || proj_coords.z > 1.0 {
+        return 1.0;
     }
 
-    return 1.0;
+    // Small depth bias to prevent shadow acne, scaled per cascade
+    let cascade_bias_scale = array<f32, 4>(1.0, 2.0, 4.0, 8.0);
+    let base_bias = max(0.005 * (1.0 - n_dot_l), 0.001);
+    let bias = base_bias * cascade_bias_scale[cascade];
+    let compare_depth = proj_coords.z - bias;
+
+    // 3x3 PCF
+    let texel_size = 1.0 / f32(textureDimensions(t_shadow).x);
+    var shadow = 0.0;
+    for (var x = -1; x <= 1; x++) {
+        for (var y = -1; y <= 1; y++) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel_size;
+            shadow += textureSampleCompareLevel(
+                t_shadow,
+                shadow_sampler,
+                shadow_uv + offset,
+                cascade,
+                compare_depth
+            );
+        }
+    }
+    shadow /= 9.0;
+
+    return shadow;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -472,9 +462,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var direct = vec3<f32>(0.0);
     if n_dot_l > 0.0 {
-        // Shadow ray
+        // Shadow via CSM (with normal bias inside) + BVH character check
         let shadow_origin = world_pos + world_normal * 0.02;
-        let shadow = trace_shadow_ray(shadow_origin, sun_dir, 64.0);
+        var shadow = sample_csm_shadow(world_pos, world_normal, n_dot_l);
+        if trace_bvh_shadow(shadow_origin, sun_dir, 64.0) {
+            shadow = 0.0;
+        }
         direct = params.sun_color * params.sun_intensity * n_dot_l * shadow;
     }
 

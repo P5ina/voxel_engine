@@ -224,7 +224,6 @@ impl AppState {
         }
 
         // 1. Collect completed mesh results from background threads
-        let mut _dirty_positions: HashSet<ChunkPosition> = HashSet::new();
         let mut uploads_this_frame = 0;
         if let Some(ref rx) = self.streaming_mesh_rx {
             while uploads_this_frame < max_mesh_uploads_per_frame {
@@ -256,8 +255,6 @@ impl AppState {
                         );
                     }
                 }
-
-                _dirty_positions.insert(result.pos);
 
                 // Mark mesh as built in streamer
                 if let Some(s) = &mut self.chunk_streamer {
@@ -349,7 +346,7 @@ impl AppState {
         let update = streamer.update(self.player.position);
         let player_chunk = ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
 
-        let _has_unload_requests = !update.unload_requests.is_empty();
+
 
         // 3. Dispatch mesh requests to background threads
         if let Some(ref tx) = self.streaming_mesh_tx {
@@ -444,12 +441,11 @@ impl AppState {
             }
         }
 
-        // 4. Process unload requests — only remove mesh if chunk data is gone
-        //    (preloaded worlds keep chunk data in memory, so meshes stay too)
+        // 4. Process unload requests — always remove mesh so distant LOD0 doesn't
+        //    overlap with LOD nodes. Chunk data stays in memory for re-meshing
+        //    when the player returns.
         for pos in update.unload_requests {
-            if self.world.get_chunk(pos).is_none() {
-                self.chunk_meshes.remove(&MeshKey::Chunk(pos));
-            }
+            self.chunk_meshes.remove(&MeshKey::Chunk(pos));
             self.streaming_inflight.remove(&pos);
         }
 
@@ -518,28 +514,6 @@ impl AppState {
             for key in lod_mesh_requests {
                 if lod_dispatched_this_frame >= max_lod_dispatches {
                     break;
-                }
-
-                // Skip LOD node if all constituent LOD0 chunks already have meshes
-                // (preloaded world — LOD0 covers everything, no LOD nodes needed)
-                let chunks_per_node = 1i32 << key.lod_level;
-                let base_x = key.x * chunks_per_node;
-                let base_y = key.y * chunks_per_node;
-                let base_z = key.z * chunks_per_node;
-                let all_covered = (0..chunks_per_node).all(|dx| {
-                    (0..chunks_per_node).all(|dy| {
-                        (0..chunks_per_node).all(|dz| {
-                            let pos = ChunkPosition::new(base_x + dx, base_y + dy, base_z + dz);
-                            self.chunk_meshes.contains_key(&MeshKey::Chunk(pos))
-                                || self.world.get_chunk(pos).is_none()
-                        })
-                    })
-                });
-                if all_covered {
-                    if let Some(s) = &mut self.chunk_streamer {
-                        s.mark_lod_mesh_built(&key);
-                    }
-                    continue;
                 }
 
                 let data = if let Some(ref octree) = self.octree {

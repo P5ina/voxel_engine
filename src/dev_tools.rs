@@ -136,10 +136,18 @@ impl AppState {
 #[cfg(not(feature = "dev-tools"))]
 impl AppState {
     pub(crate) fn update_dev_screen(&mut self) -> bool {
+        if self.ui_screen == UiScreen::Loading {
+            self.update_loading();
+            return true;
+        }
         false
     }
 
     pub(crate) fn build_dev_ui(&mut self) -> Option<Option<UiMessage>> {
+        if self.ui_screen == UiScreen::Loading {
+            ui::loading_screen(&self.egui.ctx, &self.loading_state);
+            return Some(None);
+        }
         None
     }
 
@@ -172,5 +180,4 @@ impl AppState {
     }
 }
 
-#[cfg(feature = "dev-tools")]
 use crate::ui;

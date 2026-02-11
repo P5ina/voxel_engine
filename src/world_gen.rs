@@ -254,6 +254,8 @@ impl AppState {
         _octree: &VoxelOctree,
         spawn_pos: Vec3,
     ) -> (Vec<MeshKey>, usize) {
+        use crate::world::LodNodeKey;
+
         let all_positions: Vec<_> = world.chunk_positions().collect();
         let mut mesh_tasks: Vec<MeshKey> = Vec::with_capacity(all_positions.len());
 
@@ -263,32 +265,62 @@ impl AppState {
 
         let lod0_count = mesh_tasks.len();
 
-        // Sort by distance from spawn (closer first)
+        // Sort LOD0 by distance from spawn (closer first)
         mesh_tasks.sort_by(|a, b| {
-            let dist_a = {
-                let MeshKey::Chunk(pos) = a else {
+            let dist = |key: &MeshKey| {
+                let MeshKey::Chunk(pos) = key else {
                     unreachable!()
                 };
                 let c = pos.center_world_pos();
                 Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
             };
-            let dist_b = {
-                let MeshKey::Chunk(pos) = b else {
-                    unreachable!()
-                };
-                let c = pos.center_world_pos();
-                Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length()
-            };
-            dist_a
-                .partial_cmp(&dist_b)
+            dist(a)
+                .partial_cmp(&dist(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Generate LOD node mesh tasks for levels 1..6
+        let world_x = Self::WORLD_SIZE_CHUNKS;
+        let world_y = Self::WORLD_HEIGHT_CHUNKS;
+        let world_z = Self::WORLD_SIZE_CHUNKS;
+        let mut lod_tasks: Vec<MeshKey> = Vec::new();
+
+        for lod in 1..6u8 {
+            let chunks_per_node = 1i32 << lod;
+            let nx = (world_x + chunks_per_node - 1) / chunks_per_node;
+            let ny = (world_y + chunks_per_node - 1) / chunks_per_node;
+            let nz = (world_z + chunks_per_node - 1) / chunks_per_node;
+            for x in 0..nx {
+                for y in 0..ny {
+                    for z in 0..nz {
+                        lod_tasks.push(MeshKey::LodNode(LodNodeKey::new(x, y, z, lod)));
+                    }
+                }
+            }
+        }
+
+        // Sort LOD tasks: lower levels first, then by distance
+        lod_tasks.sort_by(|a, b| {
+            let key = |m: &MeshKey| {
+                let MeshKey::LodNode(k) = m else {
+                    unreachable!()
+                };
+                let c = k.center_world_pos();
+                let dist =
+                    Vec3::new(c.0 - spawn_pos.x, c.1 - spawn_pos.y, c.2 - spawn_pos.z).length();
+                (k.lod_level, dist as i64)
+            };
+            key(a).cmp(&key(b))
+        });
+
         log::info!(
-            "[BigWorld] {} mesh tasks (all LOD0 chunks)",
-            mesh_tasks.len(),
+            "[BigWorld] {} mesh tasks ({} LOD0 chunks + {} LOD nodes)",
+            lod0_count + lod_tasks.len(),
+            lod0_count,
+            lod_tasks.len(),
         );
 
+        mesh_tasks.extend(lod_tasks);
         (mesh_tasks, lod0_count)
     }
 
@@ -510,14 +542,37 @@ impl AppState {
         let mut streamer = ChunkStreamer::new(config);
         streamer.set_player_position(self.player.position);
 
-        // Preload streamer with all currently loaded meshes
+        // Cull LOD0 meshes outside the LOD0 streaming distance so we don't
+        // start the game with 100K+ mesh entries to iterate every frame.
+        let lod0_distance = streamer.lod0_distance();
+        let chunk_world_size = voxel::CHUNK_SIZE as f32 * voxel::VOXEL_SCALE;
+        let player_pos = self.player.position;
         let mut loaded_chunks = Vec::new();
         let mut loaded_lod_nodes = Vec::new();
+        let mut to_remove: Vec<MeshKey> = Vec::new();
+
         for key in self.chunk_meshes.keys() {
             match key {
-                MeshKey::Chunk(pos) => loaded_chunks.push(*pos),
+                MeshKey::Chunk(pos) => {
+                    // XZ distance from chunk center to player
+                    let cx = (pos.x as f32 + 0.5) * chunk_world_size;
+                    let cz = (pos.z as f32 + 0.5) * chunk_world_size;
+                    let dx = cx - player_pos.x;
+                    let dz = cz - player_pos.z;
+                    let dist = (dx * dx + dz * dz).sqrt();
+                    if dist <= lod0_distance {
+                        loaded_chunks.push(*pos);
+                    } else {
+                        to_remove.push(*key);
+                    }
+                }
                 MeshKey::LodNode(key) => loaded_lod_nodes.push(*key),
             }
+        }
+
+        let removed_count = to_remove.len();
+        for key in to_remove {
+            self.chunk_meshes.remove(&key);
         }
 
         streamer.preload_chunks(loaded_chunks);
@@ -537,7 +592,7 @@ impl AppState {
         self.chunks_ready = false; // freeze player until nearby chunks are meshed
 
         log::info!(
-            "[BigWorld] Streaming enabled! {} chunk meshes, {} LOD meshes",
+            "[BigWorld] Streaming enabled! {} chunk meshes, {} LOD meshes ({} distant LOD0 culled)",
             self.chunk_meshes
                 .keys()
                 .filter(|k| matches!(k, MeshKey::Chunk(_)))
@@ -546,6 +601,7 @@ impl AppState {
                 .keys()
                 .filter(|k| matches!(k, MeshKey::LodNode(_)))
                 .count(),
+            removed_count,
         );
 
         // Set up region manager if world directory exists

@@ -101,6 +101,20 @@ var t_albedo: texture_2d<f32>;
 @group(0) @binding(6)
 var output: texture_storage_2d<rgba32float, write>;
 
+@group(0) @binding(7)
+var t_shadow: texture_depth_2d_array;
+
+@group(0) @binding(8)
+var shadow_sampler: sampler_comparison;
+
+struct CsmUniforms {
+    view_proj: array<mat4x4<f32>, 4>,
+    cascade_splits: vec4<f32>,
+};
+
+@group(0) @binding(9)
+var<uniform> csm: CsmUniforms;
+
 // Group 1: Character tracing resources
 @group(1) @binding(0)
 var<storage, read> bvh_nodes: array<BvhNode>;
@@ -417,16 +431,16 @@ fn trace_scene(ray: Ray, max_dist: f32) -> HitInfo {
     return char_hit;
 }
 
-// Trace shadow ray against full scene (characters + voxels via DDA)
-fn trace_shadow_scene(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
+// Trace shadow ray against full scene (characters via BVH + voxels via CSM)
+fn trace_shadow_scene(origin: vec3<f32>, normal: vec3<f32>, direction: vec3<f32>, n_dot_l: f32) -> f32 {
     // Check character shadows via BVH
     let ray = Ray(origin + direction * 0.01, direction);
     let char_hit = trace_bvh(ray, 64.0);
     if char_hit.hit {
         return 0.0;
     }
-    // Check voxel shadows via DDA through voxel volume
-    return trace_shadow_ray(origin, direction);
+    // Check voxel shadows via cascaded shadow map (normal bias applied inside)
+    return sample_csm_shadow(origin, normal, n_dot_l);
 }
 
 // Check if world voxel position is inside the volume
@@ -547,14 +561,65 @@ fn trace_ray_dda(ray: Ray, max_dist: f32) -> HitInfo {
     return result;
 }
 
-// Shadow ray using DDA through the 3D voxel volume texture
-fn trace_shadow_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
-    let ray = Ray(origin + direction * 0.01, direction);
-    let hit = trace_ray_dda(ray, 64.0);
-    if hit.hit {
-        return 0.0;
+// Sample cascaded shadow map with PCF
+fn sample_csm_shadow(world_pos: vec3<f32>, normal: vec3<f32>, n_dot_l: f32) -> f32 {
+    // Determine cascade by comparing view-space depth
+    let view_pos = params.view_proj * vec4<f32>(world_pos, 1.0);
+    let depth = view_pos.w;
+
+    var cascade = 0;
+    if depth > csm.cascade_splits.x {
+        cascade = 1;
     }
-    return 1.0;
+    if depth > csm.cascade_splits.y {
+        cascade = 2;
+    }
+    if depth > csm.cascade_splits.z {
+        cascade = 3;
+    }
+
+    // Small normal offset to avoid self-shadowing on surfaces facing the light.
+    // Scaled per cascade since distant cascades have larger texels.
+    let cascade_normal_bias = array<f32, 4>(0.05, 0.15, 0.4, 1.0);
+    let biased_pos = world_pos + normal * cascade_normal_bias[cascade];
+
+    // Project into light space
+    let light_pos = csm.view_proj[cascade] * vec4<f32>(biased_pos, 1.0);
+    let proj_coords = light_pos.xyz / light_pos.w;
+
+    // Convert from NDC [-1,1] to UV [0,1]
+    let shadow_uv = proj_coords.xy * vec2<f32>(0.5, -0.5) + 0.5;
+
+    // Out-of-bounds check (UV and depth)
+    if shadow_uv.x < 0.0 || shadow_uv.x > 1.0 || shadow_uv.y < 0.0 || shadow_uv.y > 1.0
+        || proj_coords.z < 0.0 || proj_coords.z > 1.0 {
+        return 1.0;
+    }
+
+    // Small depth bias to prevent shadow acne, scaled per cascade
+    let cascade_bias_scale = array<f32, 4>(1.0, 2.0, 4.0, 8.0);
+    let base_bias = max(0.005 * (1.0 - n_dot_l), 0.001);
+    let bias = base_bias * cascade_bias_scale[cascade];
+    let compare_depth = proj_coords.z - bias;
+
+    // 3x3 PCF
+    let texel_size = 1.0 / f32(textureDimensions(t_shadow).x);
+    var shadow = 0.0;
+    for (var x = -1; x <= 1; x++) {
+        for (var y = -1; y <= 1; y++) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel_size;
+            shadow += textureSampleCompareLevel(
+                t_shadow,
+                shadow_sampler,
+                shadow_uv + offset,
+                cascade,
+                compare_depth
+            );
+        }
+    }
+    shadow /= 9.0;
+
+    return shadow;
 }
 
 // Evaluate PBR BRDF (simplified, more vibrant)
@@ -615,7 +680,7 @@ fn path_trace(start_pos: vec3<f32>, start_normal: vec3<f32>, start_albedo: vec3<
     let sun_dir = normalize(params.sun_direction);
     let n_dot_l = max(dot(normal, sun_dir), 0.0);
     if n_dot_l > 0.0 {
-        let shadow = trace_shadow_scene(pos + normal * 0.01, sun_dir);
+        let shadow = trace_shadow_scene(pos + normal * 0.01, normal, sun_dir, n_dot_l);
         let direct = params.sun_color * params.sun_intensity * n_dot_l * shadow;
         radiance += throughput * albedo * direct;
     }
@@ -707,7 +772,7 @@ fn path_trace(start_pos: vec3<f32>, start_normal: vec3<f32>, start_albedo: vec3<
         // Direct lighting at bounce
         let bounce_n_dot_l = max(dot(normal, sun_dir), 0.0);
         if bounce_n_dot_l > 0.0 {
-            let shadow = trace_shadow_scene(pos + normal * 0.01, sun_dir);
+            let shadow = trace_shadow_scene(pos + normal * 0.01, normal, sun_dir, bounce_n_dot_l);
             let direct = params.sun_color * params.sun_intensity * bounce_n_dot_l * shadow;
             radiance += throughput * albedo * direct * 0.5;
         }
