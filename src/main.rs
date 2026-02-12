@@ -789,7 +789,15 @@ impl AppState {
                     self.game_settings.performance_preset,
                     ui::PerformancePreset::Potato
                 );
-            let meshes: Vec<(&wgpu::Buffer, u32, u32)> =
+            // All meshes for shadow passes (no frustum cull — shadow casters
+            // outside the camera view must still write into the shadow map).
+            let shadow_meshes: Vec<(&wgpu::Buffer, u32, u32)> =
+                self.chunk_meshes.values()
+                    .map(|m| (&m.vertex_buffer, m.num_vertices, 0u32))
+                    .collect();
+
+            // Frustum-culled meshes for the G-buffer pass.
+            let gbuffer_meshes: Vec<(&wgpu::Buffer, u32, u32)> =
                 self.chunk_meshes.iter().filter_map(move |(key, m)| {
                     let (min, max) = match key {
                         MeshKey::Chunk(pos) => {
@@ -842,7 +850,8 @@ impl AppState {
                 &self.camera_resources.bind_group,
                 &self.palette_resources.bind_group,
                 self.character_manager.bind_group(),
-                &meshes,
+                &shadow_meshes,
+                &gbuffer_meshes,
                 self.game_settings.lighting_mode,
             );
         } else {

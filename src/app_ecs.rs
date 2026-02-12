@@ -476,6 +476,7 @@ impl EcsApp {
                             &render_res.palette.bind_group,
                             render_res.character_manager.bind_group(),
                             &mesh_refs,
+                            &mesh_refs,
                             lighting_mode,
                         );
                     } else {

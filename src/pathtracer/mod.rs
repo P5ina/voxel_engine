@@ -1717,7 +1717,8 @@ impl PathTracer {
         camera_bind_group: &wgpu::BindGroup,
         texture_bind_group: &wgpu::BindGroup,
         character_bind_group: &wgpu::BindGroup,
-        meshes: &[(&wgpu::Buffer, u32, u32)],
+        shadow_meshes: &[(&wgpu::Buffer, u32, u32)],
+        gbuffer_meshes: &[(&wgpu::Buffer, u32, u32)],
         lighting_mode: LightingMode,
     ) {
         let iw = self.internal_width;
@@ -1742,7 +1743,7 @@ impl PathTracer {
             render_pass.set_pipeline(&self.shadow_pipeline);
             render_pass.set_bind_group(0, &self.shadow_bind_groups[cascade], &[]);
 
-            for &(vertex_buffer, num_vertices, _lod_level) in meshes {
+            for &(vertex_buffer, num_vertices, _lod_level) in shadow_meshes {
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..num_vertices, 0..1);
             }
@@ -1811,7 +1812,7 @@ impl PathTracer {
             render_pass.set_bind_group(0, camera_bind_group, &[]);
             render_pass.set_bind_group(1, texture_bind_group, &[]);
 
-            for &(vertex_buffer, num_vertices, lod_level) in meshes {
+            for &(vertex_buffer, num_vertices, lod_level) in gbuffer_meshes {
                 render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 render_pass.draw(0..num_vertices, lod_level..lod_level + 1);
             }
@@ -1966,12 +1967,18 @@ impl PathTracer {
                 max_z = max_z.max(lv.z);
             }
 
-            // Extend Z range to catch shadow receivers beyond the frustum slice.
-            // Camera is on the sun side, -Z points into the scene. Objects farther
-            // from the sun have more negative Z (min_z). Extend min_z to include
-            // receivers that are deeper into the scene.
+            // Extend Z range in both directions:
+            //
+            // 1) Away from sun (min_z): catch shadow receivers beyond the slice.
             let z_extent = max_z - min_z;
             min_z -= z_extent;
+            //
+            // 2) Toward the sun (max_z): include shadow casters above the camera
+            //    frustum. Without this, underground areas (caves) appear fully lit
+            //    because the terrain surface above falls outside the cascade's near
+            //    plane and never writes into the shadow map.
+            //    512m = full world height (32 chunks × 16m).
+            max_z += 512.0;
 
             // Texel-snap to prevent shadow swimming
             let texel_size = (max_x - min_x) / SHADOW_MAP_SIZE as f32;
