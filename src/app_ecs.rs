@@ -1,5 +1,5 @@
 //! ECS Application Handler - bridges winit with Specs ECS
-//! 
+//!
 //! Note: RenderResources is stored outside of the ECS World to avoid borrow checker issues
 
 use std::sync::Arc;
@@ -14,15 +14,19 @@ use winit::{
 
 use specs::{Dispatcher, World, WorldExt};
 
-use crate::ecs::{self, build_dispatcher, setup_world};
-use crate::ecs::entities::create_local_player;
+use crate::character::CharacterManager;
 use crate::ecs::components::EditorMode;
+use crate::ecs::entities::create_local_player;
 use crate::ecs::resources::{GameSettings, GameTime, InputResource, MeshStorage, WorldResource};
 use crate::ecs::systems::mesh::{MeshBuildResult, PendingMeshBuilds};
-use crate::renderer::{CameraResources, LightingParams, MeshResources, PaletteResources, RenderContext};
+use crate::ecs::{self, build_dispatcher, setup_world};
 use crate::pathtracer::PathTracer;
-use crate::character::CharacterManager;
-use crate::ui::{EguiRenderer, UiScreen, UiMessage, MapSelectState, main_menu, map_select, settings};
+use crate::renderer::{
+    CameraResources, LightingParams, MeshResources, PaletteResources, RenderContext,
+};
+use crate::ui::{
+    EguiRenderer, MapSelectState, UiMessage, UiScreen, main_menu, map_select, settings,
+};
 
 /// Render resources stored outside ECS to avoid borrow issues
 pub struct AppRenderResources {
@@ -46,13 +50,13 @@ pub struct EcsApp {
 impl EcsApp {
     pub fn new() -> Self {
         let mut world = World::new();
-        
+
         // Register all components
         setup_world(&mut world);
-        
+
         // Build system dispatcher
         let dispatcher = build_dispatcher();
-        
+
         Self {
             world,
             dispatcher,
@@ -68,17 +72,20 @@ impl EcsApp {
 
         // Create render resources
         let mut render_ctx = RenderContext::new(window.clone()).await?;
-        
+
         // Configure surface for presentation
         render_ctx.configure();
-        
-        let camera_resources = CameraResources::new(&render_ctx.device, &crate::camera::Camera::new(glam::Vec3::ZERO, 1.0));
+
+        let camera_resources = CameraResources::new(
+            &render_ctx.device,
+            &crate::camera::Camera::new(glam::Vec3::ZERO, 1.0),
+        );
         let palette_resources = PaletteResources::new(&render_ctx.device);
         let lighting = LightingParams::new();
-        
+
         // Character manager
         let character_manager = CharacterManager::new(&render_ctx.device);
-        
+
         // Path tracer
         let path_tracer = PathTracer::new(
             &render_ctx.device,
@@ -90,7 +97,7 @@ impl EcsApp {
             &palette_resources.bind_group_layout,
             character_manager.bind_group_layout(),
         );
-        
+
         // Egui renderer for UI
         let egui = EguiRenderer::new(&render_ctx.device, render_ctx.format(), &window);
 
@@ -115,20 +122,21 @@ impl EcsApp {
         self.world.insert(UiScreen::MainMenu); // Start with main menu
         self.world.insert(MapSelectState::default());
         self.world.insert(EditorMode::default());
-        
+
         // Create world with initial chunks
         let mut world_res = WorldResource::new();
         world_res.chunk_manager = create_initial_world();
-        
+
         // Mark all chunks as dirty for initial mesh generation
         // Collect positions first to avoid borrow issues
         let chunk_positions: Vec<_> = world_res.chunk_manager.chunk_positions().collect();
         for pos in chunk_positions {
             world_res.mark_dirty(pos);
         }
-        
+
         self.world.insert(world_res);
-        self.world.insert(ecs::resources::MeshGenerationResource::default());
+        self.world
+            .insert(ecs::resources::MeshGenerationResource::default());
         self.world.insert(ecs::resources::WindowDimensions {
             width: size.width,
             height: size.height,
@@ -146,14 +154,18 @@ impl EcsApp {
 
     /// Handle window resize
     fn resize(&mut self, width: u32, height: u32) {
-        let mut dims = self.world.write_resource::<ecs::resources::WindowDimensions>();
+        let mut dims = self
+            .world
+            .write_resource::<ecs::resources::WindowDimensions>();
         dims.width = width;
         dims.height = height;
 
         if width > 0 && height > 0 {
             if let Some(render_res) = &mut self.render_res {
                 render_res.ctx.resize(width, height);
-                render_res.path_tracer.resize(&render_res.ctx.device, width, height);
+                render_res
+                    .path_tracer
+                    .resize(&render_res.ctx.device, width, height);
             }
         }
     }
@@ -169,14 +181,14 @@ impl EcsApp {
                 }
             }
         }
-        
+
         let mut input = self.world.write_resource::<InputResource>();
 
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 use winit::keyboard::KeyCode;
                 let is_pressed = event.state.is_pressed();
-                
+
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
                         KeyCode::KeyW => input.forward = is_pressed,
@@ -243,15 +255,17 @@ impl EcsApp {
         let lookup = self.world.read_resource::<ecs::resources::EntityLookup>();
         let positions = self.world.read_storage::<ecs::components::Position>();
         let cameras = self.world.read_storage::<ecs::components::Camera>();
-        let dims = self.world.read_resource::<ecs::resources::WindowDimensions>();
-        
+        let dims = self
+            .world
+            .read_resource::<ecs::resources::WindowDimensions>();
+
         let cam_entity = lookup.active_camera?;
         let camera_pos = positions.get(cam_entity)?.0;
         let cam = cameras.get(cam_entity)?;
-        
+
         // Note: camera::Camera has private bob/shake fields, so we just use defaults
         let render_camera = crate::camera::Camera::new(camera_pos, dims.aspect_ratio());
-        
+
         Some((render_camera, camera_pos))
     }
 
@@ -265,13 +279,14 @@ impl EcsApp {
     fn check_is_walking(&self) -> bool {
         let lookup = self.world.read_resource::<ecs::resources::EntityLookup>();
         let walking_states = self.world.read_storage::<ecs::components::WalkingState>();
-        
-        lookup.local_player
+
+        lookup
+            .local_player
             .and_then(|e| walking_states.get(e))
             .map(|w| w.is_walking)
             .unwrap_or(false)
     }
-    
+
     /// Handle UI messages from button clicks
     fn handle_ui_message(&mut self, msg: UiMessage) {
         match msg {
@@ -313,7 +328,7 @@ impl EcsApp {
                 } else {
                     *screen = UiScreen::InGame;
                 }
-                
+
                 // Grab mouse for gameplay
                 if let Some(window) = &self.window {
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
@@ -346,16 +361,16 @@ impl EcsApp {
             Some(res) => res,
             None => return,
         };
-        
+
         // Take pending builds from ECS
         let pending_builds: Vec<MeshBuildResult> = {
             let mut pending = self.world.write_resource::<PendingMeshBuilds>();
             std::mem::take(&mut pending.builds)
         };
-        
+
         // Process each pending build
         let mut mesh_storage = self.world.write_resource::<MeshStorage>();
-        
+
         for build in pending_builds {
             if build.vertices.is_empty() {
                 // Remove empty mesh
@@ -364,7 +379,11 @@ impl EcsApp {
                 // Create GPU mesh
                 let mesh = MeshResources::new(&render_res.ctx.device, &build.vertices);
                 mesh_storage.insert(build.key, mesh);
-                log::debug!("[ECS] Created GPU mesh for {:?} with {} vertices", build.key, build.vertices.len());
+                log::debug!(
+                    "[ECS] Created GPU mesh for {:?} with {} vertices",
+                    build.key,
+                    build.vertices.len()
+                );
             }
         }
     }
@@ -403,7 +422,9 @@ impl EcsApp {
 
             match render_res.ctx.surface.get_current_texture() {
                 Ok(output) => {
-                    let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let view = output
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
 
                     // Update voxel volume
                     {
@@ -423,12 +444,11 @@ impl EcsApp {
                         .map(|(_, m)| (&m.vertex_buffer, m.num_vertices, 0u32))
                         .collect();
 
-                    let mut encoder = render_res
-                        .ctx
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    let mut encoder = render_res.ctx.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
                             label: Some("Render Encoder"),
-                        });
+                        },
+                    );
 
                     if let Some((camera, _)) = camera_data {
                         render_res.camera.update(&render_res.ctx.queue, &camera);
@@ -481,8 +501,7 @@ impl EcsApp {
                         ui_msg = match ui_screen {
                             UiScreen::MainMenu => main_menu(&render_res.egui.ctx),
                             UiScreen::Settings => {
-                                let mut game_settings =
-                                    self.world.write_resource::<GameSettings>();
+                                let mut game_settings = self.world.write_resource::<GameSettings>();
                                 settings(&render_res.egui.ctx, &mut *game_settings)
                             }
                             UiScreen::MapSelect => {
@@ -510,7 +529,10 @@ impl EcsApp {
                         );
                     }
 
-                    render_res.ctx.queue.submit(std::iter::once(encoder.finish()));
+                    render_res
+                        .ctx
+                        .queue
+                        .submit(std::iter::once(encoder.finish()));
                     output.present();
                 }
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -545,12 +567,13 @@ impl Default for EcsApp {
 
 impl ApplicationHandler for EcsApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_attributes = Window::default_attributes().with_title("THE DROP - Voxel Engine (ECS)");
+        let window_attributes =
+            Window::default_attributes().with_title("THE DROP - Voxel Engine (ECS)");
         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-        
+
         pollster::block_on(self.init_resources(window.clone())).unwrap();
         self.window = Some(window);
-        
+
         log::info!("[ECS] Application resumed and initialized");
     }
 
@@ -596,10 +619,10 @@ impl ApplicationHandler for EcsApp {
 fn create_initial_world() -> crate::world::ChunkManager {
     use crate::voxel::{Chunk, VOXEL_SCALE};
     use crate::world::{ChunkManager, ChunkPosition};
-    
+
     // Create world with 8x8 chunks platform (256x256 voxels)
     let mut world = ChunkManager::with_metadata("Default World", [8.0, 1.25, 8.0]);
-    
+
     // Create flat ground
     for cx in 0..8 {
         for cz in 0..8 {
@@ -608,9 +631,9 @@ fn create_initial_world() -> crate::world::ChunkManager {
             world.insert_chunk(ChunkPosition::new(cx, 0, cz), chunk);
         }
     }
-    
+
     log::info!("[ECS] Created initial world with {} chunks", 8 * 8);
-    
+
     world
 }
 

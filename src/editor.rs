@@ -11,10 +11,11 @@ use crate::{AppState, MeshKey};
 
 impl AppState {
     pub(crate) fn build_debug_info(&self) -> DebugInfo {
+        let player_pos = self.player_position();
         let player_chunk = ChunkPosition::from_world_pos(
-            self.player.position.x,
-            self.player.position.y,
-            self.player.position.z,
+            player_pos.x,
+            player_pos.y,
+            player_pos.z,
         );
 
         let mut chunk_meshes = 0usize;
@@ -51,9 +52,9 @@ impl AppState {
                         let pos = ChunkPosition::new(cx, surface_chunk_y + dy, cz);
                         let center = pos.center_world_pos();
                         let dist = glam::Vec3::new(
-                            center.0 - self.player.position.x,
-                            center.1 - self.player.position.y,
-                            center.2 - self.player.position.z,
+                            center.0 - player_pos.x,
+                            center.1 - player_pos.y,
+                            center.2 - player_pos.z,
                         )
                         .length();
                         if dist > lod0_distance {
@@ -76,9 +77,9 @@ impl AppState {
         }
 
         DebugInfo {
-            player_pos: self.player.position.to_array(),
+            player_pos: player_pos.to_array(),
             player_chunk: [player_chunk.x, player_chunk.y, player_chunk.z],
-            camera_pos: if self.free_cam {
+            camera_pos: if self.is_free_cam() {
                 Some(self.camera.position.to_array())
             } else {
                 None
@@ -179,8 +180,10 @@ impl AppState {
             move_dir = move_dir.normalize() * speed;
             self.camera.position += move_dir;
             // Keep player position synced for spawn point
-            self.player.position =
-                self.camera.position - Vec3::new(0.0, self.player.height - 0.2, 0.0);
+            let height = self.player_height();
+            self.set_player_position(
+                self.camera.position - Vec3::new(0.0, height - 0.2, 0.0),
+            );
         }
 
         self.camera.fov = self.game_settings.fov.to_radians();

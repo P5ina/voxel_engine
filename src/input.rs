@@ -115,11 +115,10 @@ impl AppState {
                     self.game_settings.show_debug = !self.game_settings.show_debug;
                 }
                 KeyCode::F5 => {
-                    self.free_cam = !self.free_cam;
-                    if self.free_cam {
-                        // Enter free cam: freeze player orientation for frustum culling vis
-                        self.player_yaw = self.camera.yaw;
-                        self.player_pitch = self.camera.pitch;
+                    let entering_free_cam = !self.is_free_cam();
+                    if entering_free_cam {
+                        // Enter free cam: player Camera component retains current yaw/pitch
+                        // (frozen for frustum culling vis)
 
                         // Create free cam entity at current camera position
                         crate::ecs::FreeCameraBuilder::new()
@@ -138,6 +137,9 @@ impl AppState {
                         let local_player = lookup.local_player;
                         drop(lookup);
 
+                        // Read frozen yaw/pitch from player's ECS Camera component
+                        let (frozen_yaw, frozen_pitch) = self.player_camera_yaw_pitch();
+
                         // Delete the free cam entity (if it's not the player)
                         if let Some(cam) = cam_entity {
                             if Some(cam) != local_player {
@@ -152,20 +154,10 @@ impl AppState {
                         lookup.active_camera = local_player;
                         drop(lookup);
 
-                        // Restore camera from frozen player orientation
-                        self.camera.position = self.player.eye_position();
-                        self.camera.yaw = self.player_yaw;
-                        self.camera.pitch = self.player_pitch;
-
-                        // Sync back to ECS camera
-                        if let Some(player) = local_player {
-                            let mut cameras =
-                                self.ecs_world.write_storage::<crate::ecs::components::Camera>();
-                            if let Some(ecs_cam) = cameras.get_mut(player) {
-                                ecs_cam.yaw = self.player_yaw;
-                                ecs_cam.pitch = self.player_pitch;
-                            }
-                        }
+                        // Restore render camera from frozen player orientation
+                        self.camera.position = self.player_eye_position();
+                        self.camera.yaw = frozen_yaw;
+                        self.camera.pitch = frozen_pitch;
 
                         log::info!("[FreeCam] Disabled — camera follows player");
                     }

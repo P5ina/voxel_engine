@@ -37,7 +37,6 @@ pub use app::{App, run};
 use camera::Camera;
 use model::load_glb;
 use pathtracer::PathTracer;
-use player::Player;
 use renderer::{CameraResources, LightingParams, MeshResources, PaletteResources, RenderContext};
 use ui::LoadingState;
 #[cfg(feature = "dev-tools")]
@@ -101,16 +100,10 @@ pub struct AppState {
 
     // Game state
     pub(crate) camera: Camera,
-    pub(crate) player: Player,
     pub(crate) world: ChunkManager,
 
     // Input
     pub(crate) mouse_grabbed: bool,
-    pub(crate) is_walking: bool,
-    pub(crate) free_cam: bool,
-    /// Player yaw/pitch frozen when entering free cam (for frustum culling visualization)
-    pub(crate) player_yaw: f32,
-    pub(crate) player_pitch: f32,
 
     // UI
     pub(crate) egui: EguiRenderer,
@@ -169,10 +162,11 @@ impl AppState {
         // Initialize render context
         let render_ctx = RenderContext::new(window.clone()).await?;
 
-        // Player and camera setup
-        let player = Player::new(Vec3::new(64.0, 12.0, 64.0));
+        // Camera setup (player position comes from ECS)
+        let spawn_pos = Vec3::new(64.0, 12.0, 64.0);
+        let eye_pos = player::eye_position_free(spawn_pos, 1.8);
         let aspect = size.width as f32 / size.height.max(1) as f32;
-        let camera = Camera::new(player.eye_position(), aspect);
+        let camera = Camera::new(eye_pos, aspect);
 
         // Create resources
         let camera_resources = CameraResources::new(&render_ctx.device, &camera);
@@ -285,13 +279,8 @@ impl AppState {
             path_tracer,
             character_manager,
             camera,
-            player,
             world,
             mouse_grabbed: false,
-            is_walking: false,
-            free_cam: false,
-            player_yaw: 0.0,
-            player_pitch: 0.0,
             egui,
             ui_screen: UiScreen::default(),
             game_settings: GameSettings::default(),
@@ -349,6 +338,106 @@ impl AppState {
             dims.width = width;
             dims.height = height;
         }
+    }
+
+    // ── ECS Player helpers ──────────────────────────────────────────────
+
+    /// Read the local player's world position from ECS.
+    pub(crate) fn player_position(&self) -> Vec3 {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let positions = self.ecs_world.read_storage::<ecs::components::Position>();
+            if let Some(pos) = positions.get(entity) {
+                return pos.0;
+            }
+        }
+        Vec3::ZERO
+    }
+
+    /// Read the local player's eye position (position + eye offset) from ECS.
+    pub(crate) fn player_eye_position(&self) -> Vec3 {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let positions = self.ecs_world.read_storage::<ecs::components::Position>();
+            let players = self.ecs_world.read_storage::<ecs::components::Player>();
+            if let (Some(pos), Some(p)) = (positions.get(entity), players.get(entity)) {
+                return player::eye_position_free(pos.0, p.height);
+            }
+        }
+        Vec3::ZERO
+    }
+
+    /// Read the local player's height from ECS.
+    #[cfg_attr(not(feature = "dev-tools"), allow(dead_code))]
+    pub(crate) fn player_height(&self) -> f32 {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let players = self.ecs_world.read_storage::<ecs::components::Player>();
+            if let Some(p) = players.get(entity) {
+                return p.height;
+            }
+        }
+        1.8
+    }
+
+    /// Read the local player's Camera yaw/pitch from ECS.
+    /// During free cam, these are the frozen values from when free cam was entered.
+    pub(crate) fn player_camera_yaw_pitch(&self) -> (f32, f32) {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let cameras = self.ecs_world.read_storage::<ecs::components::Camera>();
+            if let Some(cam) = cameras.get(entity) {
+                return (cam.yaw, cam.pitch);
+            }
+        }
+        (0.0, 0.0)
+    }
+
+    /// Write the local player's world position into ECS.
+    pub(crate) fn set_player_position(&self, new_pos: Vec3) {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let mut positions = self.ecs_world.write_storage::<ecs::components::Position>();
+            if let Some(pos) = positions.get_mut(entity) {
+                pos.0 = new_pos;
+            }
+        }
+    }
+
+    /// Write the local player's velocity into ECS.
+    pub(crate) fn set_player_velocity(&self, new_vel: Vec3) {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let mut velocities = self.ecs_world.write_storage::<ecs::components::Velocity>();
+            if let Some(vel) = velocities.get_mut(entity) {
+                vel.0 = new_vel;
+            }
+        }
+    }
+
+    /// Check if the game is in free camera mode (active camera differs from local player).
+    pub(crate) fn is_free_cam(&self) -> bool {
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        lookup.active_camera != lookup.local_player
+    }
+
+    /// Check if the local player is currently walking.
+    pub(crate) fn is_walking(&self) -> bool {
+        // Not walking in free cam mode or when frozen
+        if self.is_free_cam() {
+            return false;
+        }
+        if !self.chunks_ready && self.use_streaming {
+            return false;
+        }
+        let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+        if let Some(entity) = lookup.local_player {
+            let walking = self.ecs_world.read_storage::<ecs::components::WalkingState>();
+            if let Some(w) = walking.get(entity) {
+                return w.is_walking;
+            }
+        }
+        false
     }
 
     /// Maximum number of chunks to rebuild per frame for smooth loading
@@ -412,6 +501,8 @@ impl AppState {
             self.lighting.sun_color = ecs_lighting.sun_color.to_array();
         }
 
+        let is_free_cam = self.is_free_cam();
+
         // Sync ECS Camera → render camera (yaw/pitch from mouse input)
         {
             let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
@@ -423,7 +514,7 @@ impl AppState {
                 }
 
                 // For free cam, position comes from ECS Position component
-                if self.free_cam {
+                if is_free_cam {
                     let positions = self.ecs_world.read_storage::<ecs::components::Position>();
                     if let Some(pos) = positions.get(cam_entity) {
                         self.camera.position = pos.0;
@@ -437,16 +528,14 @@ impl AppState {
             .write_resource::<ecs::resources::InputResource>()
             .reset_mouse();
 
-        // Player movement (still on AppState until Phase 3)
-        if self.free_cam {
-            // Free cam movement handled by FreeCameraMovementSystem
-            self.is_walking = false;
+        // Player physics (Phase 3: reads ECS components, calls free functions, writes back)
+        if is_free_cam {
+            // Free cam movement handled by FreeCameraMovementSystem — nothing to do
         } else if !self.chunks_ready && self.use_streaming {
             // Freeze player until nearby chunks are loaded (prevents fall-through)
-            self.camera.position = self.player.eye_position();
-            self.is_walking = false;
+            self.camera.position = self.player_eye_position();
         } else {
-            // Normal mode: player movement with physics
+            // Read input
             let input_res = self
                 .ecs_world
                 .read_resource::<ecs::resources::InputResource>();
@@ -459,22 +548,56 @@ impl AppState {
             let is_sprinting = input_res.sprint;
             drop(input_res);
 
+            // Copy player state out of ECS (releases storage borrows)
+            let player_entity = {
+                let lookup = self.ecs_world.read_resource::<ecs::resources::EntityLookup>();
+                lookup.local_player
+            };
+            let Some(player_entity) = player_entity else {
+                // No local player entity — skip physics
+                self.camera.fov = self.game_settings.fov.to_radians();
+                return;
+            };
+            let (mut position, mut velocity, mut on_ground, width, height) = {
+                let positions = self.ecs_world.read_storage::<ecs::components::Position>();
+                let velocities = self.ecs_world.read_storage::<ecs::components::Velocity>();
+                let players = self.ecs_world.read_storage::<ecs::components::Player>();
+                let pos = positions.get(player_entity).unwrap();
+                let vel = velocities.get(player_entity).unwrap();
+                let p = players.get(player_entity).unwrap();
+                (pos.0, vel.0, p.on_ground, p.width, p.height)
+            };
+
+            // Apply movement, jump, physics using free functions + self.world
             const WALK_SPEED: f32 = 45.0;
             const SPRINT_SPEED: f32 = 90.0;
             let move_speed = if is_sprinting { SPRINT_SPEED } else { WALK_SPEED };
 
             let forward = self.camera.forward().with_y(0.0).normalize_or_zero();
             let right = self.camera.right();
-            self.player
-                .apply_movement(forward, right, move_input, move_speed * dt);
+            player::apply_movement_free(&mut velocity, forward, right, move_input, move_speed * dt);
 
             if wants_jump {
-                self.player.jump();
+                player::jump_free(&mut velocity, &mut on_ground);
             }
 
-            self.player.update(&self.world, dt);
-            self.camera.position = self.player.eye_position();
-            self.is_walking = move_input.length_squared() > 0.0;
+            player::physics_update_free(
+                &mut position, &mut velocity, &mut on_ground,
+                width, height, &self.world, dt,
+            );
+
+            // Write results back to ECS
+            {
+                let mut positions = self.ecs_world.write_storage::<ecs::components::Position>();
+                let mut velocities = self.ecs_world.write_storage::<ecs::components::Velocity>();
+                let mut players = self.ecs_world.write_storage::<ecs::components::Player>();
+                positions.get_mut(player_entity).unwrap().0 = position;
+                velocities.get_mut(player_entity).unwrap().0 = velocity;
+                players.get_mut(player_entity).unwrap().on_ground = on_ground;
+            }
+
+            // Update render camera from player eye position
+            self.camera.position = player::eye_position_free(position, height);
         }
 
         self.camera.fov = self.game_settings.fov.to_radians();
@@ -485,18 +608,19 @@ impl AppState {
         let camera_rotation = yaw_quat * pitch_quat;
 
         // Update character manager (builds BVH for path tracing) — skip in free cam
-        if !self.free_cam {
+        let walking = self.is_walking();
+        if !is_free_cam {
             let input_res = self
                 .ecs_world
                 .read_resource::<ecs::resources::InputResource>();
-            let is_sprinting = input_res.sprint && self.is_walking;
+            let is_sprinting = input_res.sprint && walking;
             drop(input_res);
 
             self.character_manager.update(
                 &self.render_ctx.device,
                 &self.render_ctx.queue,
                 dt,
-                self.is_walking,
+                walking,
                 is_sprinting,
                 self.camera.position,
                 camera_rotation,
@@ -598,24 +722,28 @@ impl AppState {
                 self.camera.position,
             );
 
+            let is_free_cam = self.is_free_cam();
+            let walking = self.is_walking();
+
             self.path_tracer.update_params(
                 &self.render_ctx.queue,
                 &self.camera,
                 self.lighting.sun_direction,
                 self.lighting.sun_intensity,
                 self.lighting.sun_color,
-                self.is_walking,
+                walking,
                 self.game_settings.max_bounces,
             );
 
             let show_debug = self.game_settings.show_debug;
             // In free cam, cull from the player's frozen perspective so you can
             // see frustum culling at work from the outside.
-            let frustum_planes = if self.free_cam {
+            let frustum_planes = if is_free_cam {
+                let (frozen_yaw, frozen_pitch) = self.player_camera_yaw_pitch();
                 camera::frustum_planes_from(
-                    self.player.eye_position(),
-                    self.player_yaw,
-                    self.player_pitch,
+                    self.player_eye_position(),
+                    frozen_yaw,
+                    frozen_pitch,
                     self.camera.fov,
                     self.camera.aspect,
                     self.camera.near,
@@ -627,7 +755,7 @@ impl AppState {
             let chunk_world_size = voxel::CHUNK_SIZE as f32 * VOXEL_SCALE;
             let camera_pos = self.camera.position;
             let do_frustum_cull = true;
-            let enable_terrain_occlusion = !self.free_cam
+            let enable_terrain_occlusion = !is_free_cam
                 && self.use_streaming
                 && matches!(
                     self.game_settings.performance_preset,

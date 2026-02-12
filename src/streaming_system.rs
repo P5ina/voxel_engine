@@ -22,10 +22,11 @@ impl AppState {
         }
 
         // Sort pending chunks by distance from player (closer = higher priority)
+        let player_pos = self.player_position();
         let player_chunk = ChunkPosition::from_world_pos(
-            self.player.position.x,
-            self.player.position.y,
-            self.player.position.z,
+            player_pos.x,
+            player_pos.y,
+            player_pos.z,
         );
 
         // Convert to vec, sort by distance, convert back to deque
@@ -183,7 +184,7 @@ impl AppState {
             self.game_settings.render_scale,
         );
 
-        let player_pos = self.player.position;
+        let player_pos = self.player_position();
 
         if let Some(streamer) = &mut self.chunk_streamer {
             streamer.set_runtime_limits(
@@ -343,7 +344,7 @@ impl AppState {
         };
 
         // 2. Get streaming update
-        let update = streamer.update(self.player.position);
+        let update = streamer.update(player_pos);
         let player_chunk = ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
 
 

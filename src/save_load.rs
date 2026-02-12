@@ -149,7 +149,7 @@ impl AppState {
             return;
         };
 
-        let spawn = self.player.position.to_array();
+        let spawn = self.player_position().to_array();
 
         // Region-based save: write dirty regions + world.meta
         if let Some(ref mut region_mgr) = self.region_manager {

@@ -381,9 +381,9 @@ impl AppState {
                         self.world = result.world;
                         self.octree = Some(result.octree);
                         self.big_world_lod_tasks = Some(result.mesh_tasks);
-                        self.player.position = result.spawn_pos;
-                        self.player.velocity = Vec3::ZERO;
-                        self.camera.position = self.player.eye_position();
+                        self.set_player_position(result.spawn_pos);
+                        self.set_player_velocity(Vec3::ZERO);
+                        self.camera.position = self.player_eye_position();
                         self.loading_state = LoadingState::new("Building meshes...", total_tasks);
                         self.big_world_gen_receiver = None;
                         break;
@@ -540,13 +540,13 @@ impl AppState {
 
         self.path_tracer.reset_accumulation();
         let mut streamer = ChunkStreamer::new(config);
-        streamer.set_player_position(self.player.position);
+        streamer.set_player_position(self.player_position());
 
         // Cull LOD0 meshes outside the LOD0 streaming distance so we don't
         // start the game with 100K+ mesh entries to iterate every frame.
         let lod0_distance = streamer.lod0_distance();
         let chunk_world_size = voxel::CHUNK_SIZE as f32 * voxel::VOXEL_SCALE;
-        let player_pos = self.player.position;
+        let player_pos = self.player_position();
         let mut loaded_chunks = Vec::new();
         let mut loaded_lod_nodes = Vec::new();
         let mut to_remove: Vec<MeshKey> = Vec::new();
