@@ -3,7 +3,9 @@
 use std::sync::mpsc;
 
 use glam::Vec3;
+use specs::WorldExt;
 
+use crate::ecs::resources::SaveWorldResult;
 use crate::ui::{LoadingState, UiScreen};
 use crate::world::{self, ChunkManager, load_big_world_fast, prepare_save, write_prepared_save};
 use crate::{AppState, BigWorldGenMessage, BigWorldGenResult};
@@ -138,15 +140,22 @@ impl AppState {
     }
 
     pub(crate) fn save_big_world_to_file(&mut self) {
-        // Don't start a second save while one is already running
-        if self.save_world_receiver.is_some() {
-            log::warn!("[BigWorld] Save already in progress");
-            return;
+        // Check if save already running
+        {
+            let sl = self.ecs_world.read_resource::<crate::ecs::resources::SaveLoadResource>();
+            if sl.receiver.lock().unwrap().is_some() {
+                log::warn!("[BigWorld] Save already in progress");
+                return;
+            }
         }
 
-        let Some(ref octree) = self.octree else {
-            log::error!("[BigWorld] No octree to save");
-            return;
+        let octree_clone = {
+            let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+            let Some(ref octree) = wr.octree else {
+                log::error!("[BigWorld] No octree to save");
+                return;
+            };
+            octree.clone()
         };
 
         let spawn = self.player_position().to_array();
@@ -155,11 +164,11 @@ impl AppState {
         if let Some(ref mut region_mgr) = self.region_manager {
             log::info!("[BigWorld] Saving dirty regions...");
 
-            // Save dirty regions synchronously (they're already compressed per-region)
-            region_mgr.save_dirty_regions(&self.world);
+            {
+                let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+                region_mgr.save_dirty_regions(&wr.chunk_manager);
+            }
 
-            // Clone octree for background meta save
-            let octree_clone = octree.clone();
             let world_dir = region_mgr.world_dir().to_path_buf();
 
             // Show loading screen
@@ -168,8 +177,11 @@ impl AppState {
             self.ui_screen = UiScreen::Loading;
             self.grab_mouse(false);
 
-            let (tx, rx) = mpsc::channel();
-            self.save_world_receiver = Some(rx);
+            let (tx, rx) = mpsc::channel::<SaveWorldResult>();
+            {
+                let sl = self.ecs_world.write_resource::<crate::ecs::resources::SaveLoadResource>();
+                *sl.receiver.lock().unwrap() = Some(rx);
+            }
 
             std::thread::spawn(move || {
                 log::info!("[BigWorld] Background save thread: writing world.meta");
@@ -178,24 +190,33 @@ impl AppState {
             });
         } else {
             // Legacy monolithic save path (for worlds not yet converted)
-            let octree = self.octree.take().unwrap();
+            let octree_for_save = {
+                let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+                wr.octree.take().unwrap()
+            };
 
             log::info!("[BigWorld] Compressing chunks for legacy save...");
-            let prepared = prepare_save(&mut self.world);
+            let prepared = {
+                let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+                prepare_save(&mut wr.chunk_manager)
+            };
 
             self.loading_state = LoadingState::new("Saving world...", 0);
             self.prev_screen = self.ui_screen;
             self.ui_screen = UiScreen::Loading;
             self.grab_mouse(false);
 
-            let (tx, rx) = mpsc::channel();
-            self.save_world_receiver = Some(rx);
+            let (tx, rx) = mpsc::channel::<SaveWorldResult>();
+            {
+                let sl = self.ecs_world.write_resource::<crate::ecs::resources::SaveLoadResource>();
+                *sl.receiver.lock().unwrap() = Some(rx);
+            }
 
             let path = format!("maps/{}.world", self.editor_state.level_name);
             std::thread::spawn(move || {
                 log::info!("[BigWorld] Background save thread started (legacy)");
-                let result = write_prepared_save(&path, prepared, &octree, 8, spawn);
-                let _ = tx.send((Some(octree), result));
+                let result = write_prepared_save(&path, prepared, &octree_for_save, 8, spawn);
+                let _ = tx.send((Some(octree_for_save), result));
             });
         }
     }
@@ -220,9 +241,12 @@ impl AppState {
         // Clear state
         self.pending_chunks.clear();
         self.pending_set.clear();
-        self.octree = None;
-        self.chunk_streamer = None;
-        self.use_streaming = false;
+        {
+            let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+            wr.octree = None;
+            wr.streamer = None;
+            wr.use_streaming = false;
+        }
         self.region_manager = None;
         self.streaming_mesh_rx = None;
         self.streaming_mesh_tx = None;
@@ -230,7 +254,10 @@ impl AppState {
         self.lod_mesh_rx = None;
         self.lod_mesh_tx = None;
         self.chunk_meshes.clear();
-        self.world = ChunkManager::new();
+        {
+            let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+            wr.chunk_manager = ChunkManager::new();
+        }
 
         self.editor_state.level_name = level_name;
 
@@ -241,7 +268,10 @@ impl AppState {
 
         // Spawn background thread for file loading + octree building
         let (tx, rx) = mpsc::channel();
-        self.big_world_gen_receiver = Some(rx);
+        {
+            let gen_res = self.ecs_world.write_resource::<crate::ecs::resources::WorldGenResource>();
+            *gen_res.receiver.lock().unwrap() = Some(rx);
+        }
 
         let path = path.to_string();
         if is_region_dir {

@@ -203,9 +203,12 @@ impl AppState {
         let origin = self.camera.position;
         let direction = self.camera.forward();
 
-        let hit = raycast(origin, direction, MAX_REACH, |x, y, z| {
-            self.world.is_solid(x, y, z)
-        });
+        let hit = {
+            let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+            raycast(origin, direction, MAX_REACH, |x, y, z| {
+                wr.chunk_manager.is_solid(x, y, z)
+            })
+        };
 
         let is_editor = self.editor_active();
         let color_to_place = if is_editor {
@@ -234,19 +237,28 @@ impl AppState {
                     } else {
                         Self::get_punch_positions_2x2(cx, cy, cz)
                     };
-                    let batch: Vec<_> = positions
-                        .into_iter()
-                        .filter(|&(x, y, z)| self.world.is_solid(x, y, z))
-                        .map(|(x, y, z)| (x, y, z, AIR))
-                        .collect();
+                    let batch: Vec<_> = {
+                        let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+                        positions
+                            .into_iter()
+                            .filter(|&(x, y, z)| wr.chunk_manager.is_solid(x, y, z))
+                            .map(|(x, y, z)| (x, y, z, AIR))
+                            .collect()
+                    };
                     self.mark_regions_dirty_for_edits(&batch);
-                    self.world.set_voxels_batch(&batch);
+                    {
+                        let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+                        wr.chunk_manager.set_voxels_batch(&batch);
+                    }
                     self.update_octree_for_edits(&batch);
-                    self.path_tracer.notify_voxel_edits(
-                        &self.render_ctx.queue,
-                        &self.world,
-                        &batch,
-                    );
+                    {
+                        let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+                        self.path_tracer.notify_voxel_edits(
+                            &self.render_ctx.queue,
+                            &wr.chunk_manager,
+                            &batch,
+                        );
+                    }
                 }
             }
             MouseButton::Right => {
@@ -270,19 +282,28 @@ impl AppState {
                         place_y,
                         place_z,
                     );
-                    let batch: Vec<_> = positions
-                        .into_iter()
-                        .filter(|&(x, y, z)| !self.world.is_solid(x, y, z))
-                        .map(|(x, y, z)| (x, y, z, color_to_place))
-                        .collect();
+                    let batch: Vec<_> = {
+                        let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+                        positions
+                            .into_iter()
+                            .filter(|&(x, y, z)| !wr.chunk_manager.is_solid(x, y, z))
+                            .map(|(x, y, z)| (x, y, z, color_to_place))
+                            .collect()
+                    };
                     self.mark_regions_dirty_for_edits(&batch);
-                    self.world.set_voxels_batch(&batch);
+                    {
+                        let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+                        wr.chunk_manager.set_voxels_batch(&batch);
+                    }
                     self.update_octree_for_edits(&batch);
-                    self.path_tracer.notify_voxel_edits(
-                        &self.render_ctx.queue,
-                        &self.world,
-                        &batch,
-                    );
+                    {
+                        let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+                        self.path_tracer.notify_voxel_edits(
+                            &self.render_ctx.queue,
+                            &wr.chunk_manager,
+                            &batch,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -292,19 +313,25 @@ impl AppState {
     /// Update octree LOD data for chunks affected by voxel edits.
     /// This triggers LOD dirty propagation so LOD meshes rebuild.
     pub(crate) fn update_octree_for_edits(&mut self, batch: &[(i32, i32, i32, u8)]) {
-        let Some(ref mut octree) = self.octree else {
+        let mut wr = self.ecs_world.write_resource::<crate::ecs::resources::WorldResource>();
+        if wr.octree.is_none() {
             return;
-        };
+        }
+        // Collect chunk data first to avoid overlapping borrows on wr
         let mut seen = HashSet::new();
+        let mut updates: Vec<(ChunkPosition, crate::world::lod::VoxelData)> = Vec::new();
         for &(wx, wy, wz, _) in batch {
             let (chunk_pos, _, _, _) = ChunkPosition::world_to_local(wx, wy, wz);
             if !seen.insert(chunk_pos) {
                 continue;
             }
-            if let Some(chunk) = self.world.get_chunk(chunk_pos) {
-                let data = crate::world::lod::VoxelData::from_full(*chunk.data());
-                octree.insert_chunk(chunk_pos, data);
+            if let Some(chunk) = wr.chunk_manager.get_chunk(chunk_pos) {
+                updates.push((chunk_pos, crate::world::lod::VoxelData::from_full(*chunk.data())));
             }
+        }
+        let octree = wr.octree.as_mut().unwrap();
+        for (chunk_pos, data) in updates {
+            octree.insert_chunk(chunk_pos, data);
         }
     }
 

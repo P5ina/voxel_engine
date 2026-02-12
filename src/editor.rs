@@ -2,7 +2,6 @@
 
 #[cfg(feature = "dev-tools")]
 use glam::Vec3;
-#[cfg(feature = "dev-tools")]
 use specs::WorldExt;
 
 use crate::ui::DebugInfo;
@@ -11,6 +10,8 @@ use crate::{AppState, MeshKey};
 
 impl AppState {
     pub(crate) fn build_debug_info(&self) -> DebugInfo {
+        let wr = self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>();
+
         let player_pos = self.player_position();
         let player_chunk = ChunkPosition::from_world_pos(
             player_pos.x,
@@ -32,7 +33,7 @@ impl AppState {
         let mut surface_queued = 0usize;
         let mut surface_meshed = 0usize;
 
-        if let Some(streamer) = &self.chunk_streamer {
+        if let Some(streamer) = &wr.streamer {
             let lod0_distance = crate::world::lod::LodConfig::default().distances[0];
             let chunk_world_size = crate::voxel::CHUNK_SIZE as f32 * crate::voxel::VOXEL_SCALE;
             let max_chunk_radius = (lod0_distance / chunk_world_size).ceil() as i32 + 1;
@@ -45,7 +46,7 @@ impl AppState {
                         cx * crate::voxel::CHUNK_SIZE as i32 + crate::voxel::CHUNK_SIZE as i32 / 2;
                     let center_vz =
                         cz * crate::voxel::CHUNK_SIZE as i32 + crate::voxel::CHUNK_SIZE as i32 / 2;
-                    let surface_chunk_y = Self::terrain_height(center_vx, center_vz)
+                    let surface_chunk_y = crate::terrain_gen::terrain_height(center_vx, center_vz)
                         / crate::voxel::CHUNK_SIZE as i32;
 
                     for dy in -1..=1 {
@@ -87,22 +88,22 @@ impl AppState {
             total_meshes: self.chunk_meshes.len(),
             chunk_meshes,
             lod_meshes,
-            streaming_active: self.use_streaming,
-            streaming_loaded: self.chunk_streamer.as_ref().map_or(0, |s| s.loaded_count()),
-            streaming_queue: self.chunk_streamer.as_ref().map_or(0, |s| s.queue_size()),
-            streaming_lod_nodes: self
-                .chunk_streamer
+            streaming_active: wr.use_streaming,
+            streaming_loaded: wr.streamer.as_ref().map_or(0, |s| s.loaded_count()),
+            streaming_queue: wr.streamer.as_ref().map_or(0, |s| s.queue_size()),
+            streaming_lod_nodes: wr
+                .streamer
                 .as_ref()
                 .map_or(0, |s| s.loaded_lod_count()),
             surface_total,
             surface_requested,
             surface_queued,
             surface_meshed,
-            octree_active: self.octree.is_some(),
-            octree_nodes: self.octree.as_ref().map_or(0, |o| o.node_count()),
-            octree_data_blocks: self.octree.as_ref().map_or(0, |o| o.data_count()),
-            octree_depth: self.octree.as_ref().map_or(0, |o| o.depth()),
-            world_chunks: self.world.chunk_count(),
+            octree_active: wr.octree.is_some(),
+            octree_nodes: wr.octree.as_ref().map_or(0, |o| o.node_count()),
+            octree_data_blocks: wr.octree.as_ref().map_or(0, |o| o.data_count()),
+            octree_depth: wr.octree.as_ref().map_or(0, |o| o.depth()),
+            world_chunks: wr.chunk_manager.chunk_count(),
         }
     }
 
@@ -112,8 +113,11 @@ impl AppState {
         *self.ecs_world.write_resource::<crate::ui::GameSettings>() =
             self.game_settings.clone();
 
-        // Run ECS systems (timing, lighting, input, camera)
+        // Run ECS systems (timing, lighting, input, camera, mesh rebuild)
         self.ecs_dispatcher.dispatch(&self.ecs_world);
+
+        // Upload mesh builds from ECS MeshRebuildSystem to GPU
+        self.process_pending_mesh_builds();
 
         let game_time = self.ecs_world.read_resource::<crate::ecs::resources::GameTime>();
         let dt = game_time.dt;
@@ -190,12 +194,17 @@ impl AppState {
         self.camera_resources
             .update(&self.render_ctx.queue, &self.camera);
 
-        if self.use_streaming {
+        if self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>().use_streaming {
             self.update_streaming();
         }
 
-        if !self.world.dirty_chunks().is_empty() || !self.pending_chunks.is_empty() {
-            self.rebuild_dirty_meshes();
+        {
+            let has_dirty = !self.ecs_world.read_resource::<crate::ecs::resources::WorldResource>()
+                .chunk_manager.dirty_chunks().is_empty()
+                || !self.pending_chunks.is_empty();
+            if has_dirty {
+                self.rebuild_dirty_meshes();
+            }
         }
     }
 }

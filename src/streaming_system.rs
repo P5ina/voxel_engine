@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use specs::WorldExt;
+
+use crate::ecs::resources::WorldResource;
 use crate::renderer::MeshResources;
 use crate::ui::PerformancePreset;
 use crate::voxel::{self, AIR, Chunk, generate_chunk_mesh, generate_octree_lod_mesh};
@@ -9,7 +12,10 @@ use crate::{AppState, LodMeshResult, MeshKey, StreamingMeshResult};
 impl AppState {
     pub(crate) fn rebuild_dirty_meshes(&mut self) {
         // Add new dirty chunks to the pending queue
-        let dirty = self.world.take_dirty_chunks();
+        let dirty = {
+            let mut wr = self.ecs_world.write_resource::<WorldResource>();
+            wr.chunk_manager.take_dirty_chunks()
+        };
         for chunk_pos in dirty {
             if !self.pending_set.contains(&chunk_pos) {
                 self.pending_set.insert(chunk_pos);
@@ -58,33 +64,38 @@ impl AppState {
                         break;
                     }
 
-                    if self.world.get_chunk(chunk_pos).is_none() {
-                        self.chunk_meshes.remove(&MeshKey::Chunk(chunk_pos));
-                        continue;
-                    }
+                    // Snapshot chunk + neighbors from WorldResource, then drop the guard
+                    let neighbor_chunks = {
+                        let wr = self.ecs_world.read_resource::<WorldResource>();
+                        if wr.chunk_manager.get_chunk(chunk_pos).is_none() {
+                            drop(wr);
+                            self.chunk_meshes.remove(&MeshKey::Chunk(chunk_pos));
+                            continue;
+                        }
 
-                    // Snapshot chunk + neighbors for background meshing (9 column lookups)
-                    let mut neighbor_chunks: HashMap<ChunkPosition, Chunk> = HashMap::new();
-                    let col = ColumnPos::from_chunk_pos(chunk_pos);
-                    for dx in -1..=1i32 {
-                        for dz in -1..=1i32 {
-                            let nc = ColumnPos::new(col.x + dx, col.z + dz);
-                            if let Some(column) = self.world.get_column(nc) {
-                                for dy in -1..=1i32 {
-                                    let sy = chunk_pos.y + dy;
-                                    if sy < 0 || sy >= voxel::NUM_SECTIONS as i32 {
-                                        continue;
-                                    }
-                                    if let Some(section) = column.get_section(sy as u8) {
-                                        neighbor_chunks.insert(
-                                            ChunkPosition::new(nc.x, sy, nc.z),
-                                            section.clone(),
-                                        );
+                        let mut neighbors: HashMap<ChunkPosition, Chunk> = HashMap::new();
+                        let col = ColumnPos::from_chunk_pos(chunk_pos);
+                        for dx in -1..=1i32 {
+                            for dz in -1..=1i32 {
+                                let nc = ColumnPos::new(col.x + dx, col.z + dz);
+                                if let Some(column) = wr.chunk_manager.get_column(nc) {
+                                    for dy in -1..=1i32 {
+                                        let sy = chunk_pos.y + dy;
+                                        if sy < 0 || sy >= voxel::NUM_SECTIONS as i32 {
+                                            continue;
+                                        }
+                                        if let Some(section) = column.get_section(sy as u8) {
+                                            neighbors.insert(
+                                                ChunkPosition::new(nc.x, sy, nc.z),
+                                                section.clone(),
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
+                        neighbors
+                    };
 
                     self.streaming_inflight.insert(chunk_pos);
                     dispatched.insert(chunk_pos);
@@ -115,18 +126,29 @@ impl AppState {
                 self.pending_set.remove(&chunk_pos);
 
                 let key = MeshKey::Chunk(chunk_pos);
-                if self.world.get_chunk(chunk_pos).is_some() {
-                    let vertices = generate_chunk_mesh(&self.world, chunk_pos);
-                    if vertices.is_empty() {
-                        self.chunk_meshes.remove(&key);
-                    } else if let Some(mesh) = self.chunk_meshes.get_mut(&key) {
-                        mesh.update(&self.render_ctx.device, &self.render_ctx.queue, &vertices);
+                // Check if chunk exists and generate mesh under WorldResource read lock
+                let vertices = {
+                    let wr = self.ecs_world.read_resource::<WorldResource>();
+                    if wr.chunk_manager.get_chunk(chunk_pos).is_some() {
+                        Some(generate_chunk_mesh(&wr.chunk_manager, chunk_pos))
                     } else {
-                        self.chunk_meshes
-                            .insert(key, MeshResources::new(&self.render_ctx.device, &vertices));
+                        None
                     }
-                } else {
-                    self.chunk_meshes.remove(&key);
+                };
+                match vertices {
+                    Some(vertices) => {
+                        if vertices.is_empty() {
+                            self.chunk_meshes.remove(&key);
+                        } else if let Some(mesh) = self.chunk_meshes.get_mut(&key) {
+                            mesh.update(&self.render_ctx.device, &self.render_ctx.queue, &vertices);
+                        } else {
+                            self.chunk_meshes
+                                .insert(key, MeshResources::new(&self.render_ctx.device, &vertices));
+                        }
+                    }
+                    None => {
+                        self.chunk_meshes.remove(&key);
+                    }
                 }
                 processed.insert(chunk_pos);
             }
@@ -186,24 +208,32 @@ impl AppState {
 
         let player_pos = self.player_position();
 
-        if let Some(streamer) = &mut self.chunk_streamer {
-            streamer.set_runtime_limits(
-                max_loads_per_frame,
-                max_mesh_rebuilds_per_frame,
-                lod_distances,
-            );
+        // Set runtime limits on streamer
+        {
+            let mut wr = self.ecs_world.write_resource::<WorldResource>();
+            if let Some(streamer) = &mut wr.streamer {
+                streamer.set_runtime_limits(
+                    max_loads_per_frame,
+                    max_mesh_rebuilds_per_frame,
+                    lod_distances,
+                );
+            }
         }
 
         // 0. Region management: poll completed loads, proactive loading, unloading
         if let Some(ref mut region_mgr) = self.region_manager {
             // 0a. Poll completed region loads — insert chunks into world
-            for result in region_mgr.poll_loads() {
+            let load_results = region_mgr.poll_loads();
+            for result in load_results {
                 if let Some(err) = &result.error {
                     log::error!("[Region] Failed to load {:?}: {}", result.coord, err);
                 }
-                for (pos, chunk) in result.chunks {
-                    if !chunk.is_empty() {
-                        self.world.insert_chunk(pos, chunk);
+                {
+                    let mut wr = self.ecs_world.write_resource::<WorldResource>();
+                    for (pos, chunk) in result.chunks {
+                        if !chunk.is_empty() {
+                            wr.chunk_manager.insert_chunk(pos, chunk);
+                        }
                     }
                 }
                 region_mgr.mark_loaded(result.coord);
@@ -232,10 +262,12 @@ impl AppState {
                 self.streaming_inflight.remove(&result.pos);
 
                 // Only upload mesh if chunk is still tracked by streamer
-                let still_loaded = self
-                    .chunk_streamer
-                    .as_ref()
-                    .is_some_and(|s| s.is_loaded(result.pos));
+                let still_loaded = {
+                    let wr = self.ecs_world.read_resource::<WorldResource>();
+                    wr.streamer
+                        .as_ref()
+                        .is_some_and(|s| s.is_loaded(result.pos))
+                };
                 if !still_loaded {
                     continue; // Chunk was unloaded while in-flight, skip mesh
                 }
@@ -258,8 +290,11 @@ impl AppState {
                 }
 
                 // Mark mesh as built in streamer
-                if let Some(s) = &mut self.chunk_streamer {
-                    s.mark_mesh_built(result.pos);
+                {
+                    let mut wr = self.ecs_world.write_resource::<WorldResource>();
+                    if let Some(s) = &mut wr.streamer {
+                        s.mark_mesh_built(result.pos);
+                    }
                 }
                 uploads_this_frame += 1;
             }
@@ -286,65 +321,73 @@ impl AppState {
                 } else {
                     self.chunk_meshes.remove(&mesh_key);
                 }
-                if let Some(s) = &mut self.chunk_streamer {
-                    s.mark_lod_mesh_built(&result.key);
+                {
+                    let mut wr = self.ecs_world.write_resource::<WorldResource>();
+                    if let Some(s) = &mut wr.streamer {
+                        s.mark_lod_mesh_built(&result.key);
+                    }
                 }
             }
         }
 
         // Check if nearby chunks are ready (3-chunk radius around player)
-        if !self.chunks_ready
-            && let Some(ref streamer) = self.chunk_streamer
         {
-            let player_chunk =
-                ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
-            const READY_RADIUS: i32 = 3;
-            let max_y_chunk = Self::MAX_TERRAIN_VOXEL_HEIGHT / voxel::CHUNK_SIZE as i32;
-            let mut all_ready = true;
-            'outer: for dx in -READY_RADIUS..=READY_RADIUS {
-                for dz in -READY_RADIUS..=READY_RADIUS {
-                    // Only check support layers (player chunk and below).
-                    // Air above the player should not block unfreeze.
-                    for dy in -2..=0i32 {
-                        let pos = ChunkPosition::new(
-                            player_chunk.x + dx,
-                            player_chunk.y + dy,
-                            player_chunk.z + dz,
-                        );
-                        if pos.y < 0 || pos.y > max_y_chunk {
-                            continue;
-                        }
+            let mut wr = self.ecs_world.write_resource::<WorldResource>();
+            if !wr.chunks_ready {
+                if let Some(ref streamer) = wr.streamer {
+                    let player_chunk =
+                        ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
+                    const READY_RADIUS: i32 = 3;
+                    let max_y_chunk = crate::terrain_gen::MAX_TERRAIN_VOXEL_HEIGHT / voxel::CHUNK_SIZE as i32;
+                    let mut all_ready = true;
+                    'outer: for dx in -READY_RADIUS..=READY_RADIUS {
+                        for dz in -READY_RADIUS..=READY_RADIUS {
+                            // Only check support layers (player chunk and below).
+                            // Air above the player should not block unfreeze.
+                            for dy in -2..=0i32 {
+                                let pos = ChunkPosition::new(
+                                    player_chunk.x + dx,
+                                    player_chunk.y + dy,
+                                    player_chunk.z + dz,
+                                );
+                                if pos.y < 0 || pos.y > max_y_chunk {
+                                    continue;
+                                }
 
-                        let center_vx =
-                            pos.x * voxel::CHUNK_SIZE as i32 + voxel::CHUNK_SIZE as i32 / 2;
-                        let center_vz =
-                            pos.z * voxel::CHUNK_SIZE as i32 + voxel::CHUNK_SIZE as i32 / 2;
-                        let surface_chunk_y =
-                            Self::terrain_height(center_vx, center_vz) / voxel::CHUNK_SIZE as i32;
-                        if pos.y > surface_chunk_y + 1 {
-                            continue;
-                        }
+                                let center_vx =
+                                    pos.x * voxel::CHUNK_SIZE as i32 + voxel::CHUNK_SIZE as i32 / 2;
+                                let center_vz =
+                                    pos.z * voxel::CHUNK_SIZE as i32 + voxel::CHUNK_SIZE as i32 / 2;
+                                let surface_chunk_y =
+                                    crate::terrain_gen::terrain_height(center_vx, center_vz) / voxel::CHUNK_SIZE as i32;
+                                if pos.y > surface_chunk_y + 1 {
+                                    continue;
+                                }
 
-                        if !streamer.has_mesh(pos) && self.world.get_chunk(pos).is_none() {
-                            // Not ready if chunk is neither meshed nor known-air
-                            all_ready = false;
-                            break 'outer;
+                                if !streamer.has_mesh(pos) && wr.chunk_manager.get_chunk(pos).is_none() {
+                                    // Not ready if chunk is neither meshed nor known-air
+                                    all_ready = false;
+                                    break 'outer;
+                                }
+                            }
                         }
+                    }
+                    if all_ready {
+                        wr.chunks_ready = true;
+                        log::info!("[Streaming] Nearby chunks ready — player unfrozen");
                     }
                 }
             }
-            if all_ready {
-                self.chunks_ready = true;
-                log::info!("[Streaming] Nearby chunks ready — player unfrozen");
-            }
         }
 
-        let Some(streamer) = &mut self.chunk_streamer else {
-            return;
+        // Get streaming update from streamer (needs &mut streamer)
+        let update = {
+            let mut wr = self.ecs_world.write_resource::<WorldResource>();
+            let Some(streamer) = &mut wr.streamer else {
+                return;
+            };
+            streamer.update(player_pos)
         };
-
-        // 2. Get streaming update
-        let update = streamer.update(player_pos);
         let player_chunk = ChunkPosition::from_world_pos(player_pos.x, player_pos.y, player_pos.z);
 
 
@@ -385,38 +428,48 @@ impl AppState {
                     }
                 }
 
-                let needs_terrain = self.world.get_chunk(pos).is_none();
+                // Snapshot chunk + neighbors from WorldResource, mark air chunks as built
+                let snapshot = {
+                    let mut wr = self.ecs_world.write_resource::<WorldResource>();
+                    let needs_terrain = wr.chunk_manager.get_chunk(pos).is_none();
 
-                // If chunk not in ChunkManager and region is loaded, it's air
-                if needs_terrain {
-                    streamer.mark_mesh_built(pos);
-                    continue;
-                }
-
-                // Snapshot chunk + neighbors for background meshing (9 column lookups)
-                let col_pos = ColumnPos::from_chunk_pos(pos);
-                let chunk = self.world.get_chunk(pos).cloned().unwrap();
-                let mut neighbor_chunks: HashMap<ChunkPosition, Chunk> = HashMap::new();
-                for dx in -1..=1i32 {
-                    for dz in -1..=1i32 {
-                        let nc = ColumnPos::new(col_pos.x + dx, col_pos.z + dz);
-                        if let Some(column) = self.world.get_column(nc) {
-                            for dy in -1..=1i32 {
-                                let sy = pos.y + dy;
-                                if sy < 0 || sy >= voxel::NUM_SECTIONS as i32 {
-                                    continue;
-                                }
-                                let np = ChunkPosition::new(nc.x, sy, nc.z);
-                                if np == pos {
-                                    continue;
-                                }
-                                if let Some(section) = column.get_section(sy as u8) {
-                                    neighbor_chunks.insert(np, section.clone());
+                    // If chunk not in ChunkManager and region is loaded, it's air
+                    if needs_terrain {
+                        if let Some(streamer) = &mut wr.streamer {
+                            streamer.mark_mesh_built(pos);
+                        }
+                        None
+                    } else {
+                        let col_pos = ColumnPos::from_chunk_pos(pos);
+                        let chunk = wr.chunk_manager.get_chunk(pos).cloned().unwrap();
+                        let mut neighbor_chunks: HashMap<ChunkPosition, Chunk> = HashMap::new();
+                        for dx in -1..=1i32 {
+                            for dz in -1..=1i32 {
+                                let nc = ColumnPos::new(col_pos.x + dx, col_pos.z + dz);
+                                if let Some(column) = wr.chunk_manager.get_column(nc) {
+                                    for dy in -1..=1i32 {
+                                        let sy = pos.y + dy;
+                                        if sy < 0 || sy >= voxel::NUM_SECTIONS as i32 {
+                                            continue;
+                                        }
+                                        let np = ChunkPosition::new(nc.x, sy, nc.z);
+                                        if np == pos {
+                                            continue;
+                                        }
+                                        if let Some(section) = column.get_section(sy as u8) {
+                                            neighbor_chunks.insert(np, section.clone());
+                                        }
+                                    }
                                 }
                             }
                         }
+                        Some((chunk, neighbor_chunks))
                     }
-                }
+                };
+
+                let Some((chunk, neighbor_chunks)) = snapshot else {
+                    continue;
+                };
 
                 self.streaming_inflight.insert(pos);
                 let tx = tx.clone();
@@ -451,15 +504,26 @@ impl AppState {
         }
 
         // 5. Process dirty LOD nodes — rebuild octree LOD data, dispatch mesh gen to background.
-        if let Some(ref mut octree) = self.octree {
-            let regenerated = octree.process_dirty_lods();
+        //    Split into two phases: first process_dirty_lods (&mut octree), then read data
+        //    (&octree + &streamer) to avoid conflicting borrows within WorldResource.
+        let regenerated = {
+            let mut wr = self.ecs_world.write_resource::<WorldResource>();
+            if let Some(ref mut octree) = wr.octree {
+                octree.process_dirty_lods()
+            } else {
+                Vec::new()
+            }
+        };
+        if !regenerated.is_empty() {
             let max_dirty_dispatches = rayon::current_num_threads().clamp(4, 16);
             let mut dirty_dispatched = 0usize;
             for key in regenerated {
-                let is_tracked = self
-                    .chunk_streamer
-                    .as_ref()
-                    .is_some_and(|s| s.is_lod_loaded(&key));
+                let is_tracked = {
+                    let wr = self.ecs_world.read_resource::<WorldResource>();
+                    wr.streamer
+                        .as_ref()
+                        .is_some_and(|s| s.is_lod_loaded(&key))
+                };
                 if !is_tracked {
                     continue;
                 }
@@ -472,17 +536,24 @@ impl AppState {
 
                 if let Some(ref tx) = self.lod_mesh_tx {
                     // Clone data and dispatch to background
-                    let data = if let Some(d) = octree.get_node_lod_data(&key) {
-                        Some(d.clone())
-                    } else if let Some(v) = octree.get_node_homogeneous(&key) {
-                        if v != AIR {
-                            Some(world::lod::VoxelData::Homogeneous(v))
+                    let data = {
+                        let wr = self.ecs_world.read_resource::<WorldResource>();
+                        if let Some(ref octree) = wr.octree {
+                            if let Some(d) = octree.get_node_lod_data(&key) {
+                                Some(d.clone())
+                            } else if let Some(v) = octree.get_node_homogeneous(&key) {
+                                if v != AIR {
+                                    Some(world::lod::VoxelData::Homogeneous(v))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                // Procedural LOD fallback
+                                crate::terrain_gen::generate_lod_data_static(&key)
+                            }
                         } else {
-                            None
+                            crate::terrain_gen::generate_lod_data_static(&key)
                         }
-                    } else {
-                        // Procedural LOD fallback
-                        Self::generate_lod_data_static(&key)
                     };
                     if let Some(data) = data {
                         let tx = tx.clone();
@@ -517,22 +588,25 @@ impl AppState {
                     break;
                 }
 
-                let data = if let Some(ref octree) = self.octree {
-                    if let Some(d) = octree.get_node_lod_data(&key) {
-                        Some(d.clone())
-                    } else if let Some(v) = octree.get_node_homogeneous(&key) {
-                        if v != voxel::AIR {
-                            Some(world::lod::VoxelData::Homogeneous(v))
+                let data = {
+                    let wr = self.ecs_world.read_resource::<WorldResource>();
+                    if let Some(ref octree) = wr.octree {
+                        if let Some(d) = octree.get_node_lod_data(&key) {
+                            Some(d.clone())
+                        } else if let Some(v) = octree.get_node_homogeneous(&key) {
+                            if v != voxel::AIR {
+                                Some(world::lod::VoxelData::Homogeneous(v))
+                            } else {
+                                None
+                            }
                         } else {
-                            None
+                            // Procedural LOD fallback: generate from terrain_height
+                            crate::terrain_gen::generate_lod_data_static(&key)
                         }
                     } else {
-                        // Procedural LOD fallback: generate from terrain_height
-                        Self::generate_lod_data_static(&key)
+                        // No octree at all — generate procedurally
+                        crate::terrain_gen::generate_lod_data_static(&key)
                     }
-                } else {
-                    // No octree at all — generate procedurally
-                    Self::generate_lod_data_static(&key)
                 };
 
                 if let Some(data) = data {

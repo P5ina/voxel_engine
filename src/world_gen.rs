@@ -5,10 +5,10 @@ use std::sync::mpsc;
 
 use glam::Vec3;
 use rayon::prelude::*;
+use specs::WorldExt;
 
-use crate::renderer::MeshResources;
 use crate::ui::{LoadingState, UiScreen};
-use crate::voxel::{self, generate_chunk_mesh, generate_octree_lod_mesh};
+use crate::voxel;
 use crate::world::{
     ChunkManager, ChunkPosition, ChunkStreamer, ColumnPos, RegionCoord, RegionManager,
     StreamingConfig, VoxelOctree,
@@ -26,9 +26,14 @@ impl AppState {
         self.pending_set.clear();
 
         // Disable streaming and octree (will be set up after loading)
-        self.octree = None;
-        self.chunk_streamer = None;
-        self.use_streaming = false;
+        {
+            let mut wr =
+                self.ecs_world
+                    .write_resource::<crate::ecs::resources::WorldResource>();
+            wr.octree = None;
+            wr.streamer = None;
+            wr.use_streaming = false;
+        }
         self.region_manager = None;
         self.streaming_mesh_rx = None;
         self.streaming_mesh_tx = None;
@@ -38,7 +43,12 @@ impl AppState {
 
         // Clear existing meshes and world
         self.chunk_meshes.clear();
-        self.world = ChunkManager::new();
+        {
+            let mut wr =
+                self.ecs_world
+                    .write_resource::<crate::ecs::resources::WorldResource>();
+            wr.chunk_manager = ChunkManager::new();
+        }
 
         // Setup loading state and switch to loading screen immediately
         self.loading_state = LoadingState::new("Generating world...", 100);
@@ -47,7 +57,12 @@ impl AppState {
 
         // Spawn background thread for heavy generation work
         let (tx, rx) = mpsc::channel();
-        self.big_world_gen_receiver = Some(rx);
+        {
+            let gen_res = self
+                .ecs_world
+                .write_resource::<crate::ecs::resources::WorldGenResource>();
+            *gen_res.receiver.lock().unwrap() = Some(rx);
+        }
 
         let level_name = self.editor_state.level_name.clone();
         std::thread::spawn(move || {
@@ -69,7 +84,7 @@ impl AppState {
             (world_size_chunks as f32 * voxel::CHUNK_SIZE as f32 * voxel::VOXEL_SCALE) / 2.0;
         let center_voxel_x = (center / voxel::VOXEL_SCALE) as i32;
         let center_voxel_z = (center / voxel::VOXEL_SCALE) as i32;
-        let spawn_terrain_height = Self::terrain_height(center_voxel_x, center_voxel_z);
+        let spawn_terrain_height = crate::terrain_gen::terrain_height(center_voxel_x, center_voxel_z);
         let spawn_y = spawn_terrain_height as f32 * voxel::VOXEL_SCALE + 1.0;
         let spawn_pos = Vec3::new(center, spawn_y, center);
 
@@ -128,7 +143,7 @@ impl AppState {
             // Generate columns and flatten to (ChunkPosition, Chunk) pairs
             let mut region_chunks: Vec<(ChunkPosition, voxel::Chunk)> = Vec::new();
             for col in col_positions {
-                let column = Self::generate_column_data_static(col);
+                let column = crate::terrain_gen::generate_column_data_static(col);
                 for (sy, section) in column.sections_iter() {
                     region_chunks.push((col.to_chunk_pos(sy), section.clone()));
                 }
@@ -281,7 +296,7 @@ impl AppState {
 
         // Generate LOD node mesh tasks for levels 1..6
         let world_x = Self::WORLD_SIZE_CHUNKS;
-        let world_y = Self::WORLD_HEIGHT_CHUNKS;
+        let world_y = crate::terrain_gen::WORLD_HEIGHT_CHUNKS;
         let world_z = Self::WORLD_SIZE_CHUNKS;
         let mut lod_tasks: Vec<MeshKey> = Vec::new();
 
@@ -324,12 +339,17 @@ impl AppState {
         (mesh_tasks, lod0_count)
     }
 
-    /// Update loading screen - process LOD mesh tasks incrementally
+    /// Update loading screen - poll background threads and dispatch ECS mesh generation
     pub(crate) fn update_loading(&mut self) {
-        const TASKS_PER_FRAME: usize = 64;
-
         // Check for background save completion
-        if let Some(ref rx) = self.save_world_receiver {
+        // Take the receiver out of the Mutex to avoid holding ECS guard during processing
+        let save_rx = {
+            let sl = self
+                .ecs_world
+                .read_resource::<crate::ecs::resources::SaveLoadResource>();
+            sl.receiver.lock().unwrap().take()
+        };
+        if let Some(rx) = save_rx {
             match rx.try_recv() {
                 Ok((octree, result)) => {
                     match result {
@@ -337,20 +357,26 @@ impl AppState {
                         Err(e) => log::error!("[BigWorld] Save failed: {}", e),
                     }
                     if let Some(octree) = octree {
-                        self.octree = Some(octree);
+                        self.ecs_world
+                            .write_resource::<crate::ecs::resources::WorldResource>()
+                            .octree = Some(octree);
                     }
-                    self.save_world_receiver = None;
+                    // Don't put receiver back (it's done)
                     self.ui_screen = self.prev_screen;
                     self.grab_mouse(true);
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    // Still saving
+                    // Still saving -- put receiver back
+                    let sl = self
+                        .ecs_world
+                        .read_resource::<crate::ecs::resources::SaveLoadResource>();
+                    *sl.receiver.lock().unwrap() = Some(rx);
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::error!("[BigWorld] Save thread disconnected!");
-                    self.save_world_receiver = None;
+                    // Don't put back
                     self.ui_screen = self.prev_screen;
                     self.grab_mouse(true);
                     return;
@@ -359,7 +385,14 @@ impl AppState {
         }
 
         // Phase 1: Check for messages from background generation thread
-        if let Some(ref rx) = self.big_world_gen_receiver {
+        // Take the receiver out of the Mutex to avoid holding ECS guard during processing
+        let gen_rx = {
+            let gen_res = self
+                .ecs_world
+                .read_resource::<crate::ecs::resources::WorldGenResource>();
+            gen_res.receiver.lock().unwrap().take()
+        };
+        if let Some(rx) = gen_rx {
             // Drain all pending messages this frame
             loop {
                 match rx.try_recv() {
@@ -370,7 +403,7 @@ impl AppState {
                     }
                     Ok(BigWorldGenMessage::Done(boxed_result)) => {
                         let result = *boxed_result;
-                        // Background generation complete — transfer results
+                        // Background generation complete -- transfer results
                         log::info!(
                             "[BigWorld] Background generation received. Loading {} mesh tasks ({} LOD0 + {} LOD)...",
                             result.mesh_tasks.len(),
@@ -378,24 +411,39 @@ impl AppState {
                             result.mesh_tasks.len() - result.lod0_count,
                         );
                         let total_tasks = result.mesh_tasks.len();
-                        self.world = result.world;
-                        self.octree = Some(result.octree);
-                        self.big_world_lod_tasks = Some(result.mesh_tasks);
+                        {
+                            let mut wr = self
+                                .ecs_world
+                                .write_resource::<crate::ecs::resources::WorldResource>();
+                            wr.chunk_manager = result.world;
+                            wr.octree = Some(result.octree);
+                        }
+                        {
+                            let mut gen_res = self
+                                .ecs_world
+                                .write_resource::<crate::ecs::resources::WorldGenResource>();
+                            gen_res.mesh_tasks = result.mesh_tasks;
+                            gen_res.mesh_tasks_total = total_tasks;
+                        }
                         self.set_player_position(result.spawn_pos);
                         self.set_player_velocity(Vec3::ZERO);
                         self.camera.position = self.player_eye_position();
                         self.loading_state = LoadingState::new("Building meshes...", total_tasks);
-                        self.big_world_gen_receiver = None;
+                        // Don't put receiver back -- generation is done
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        // Still generating — keep showing loading screen
+                        // Still generating -- put receiver back
+                        let gen_res = self
+                            .ecs_world
+                            .read_resource::<crate::ecs::resources::WorldGenResource>();
+                        *gen_res.receiver.lock().unwrap() = Some(rx);
                         return;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         // Thread panicked or dropped sender
                         log::error!("[BigWorld] Generation thread disconnected!");
-                        self.big_world_gen_receiver = None;
+                        // Don't put back
                         self.ui_screen = UiScreen::MainMenu;
                         return;
                     }
@@ -403,84 +451,23 @@ impl AppState {
             }
         }
 
-        // Phase 2: Process mesh tasks
-        // Take ownership of the tasks to process
-        let tasks = match self.big_world_lod_tasks.take() {
-            Some(tasks) => tasks,
-            None => {
-                // Already finished — shouldn't happen, but safe fallback
-                self.finish_big_world_loading();
-                return;
-            }
+        // Phase 2: Process mesh tasks via ECS MeshRebuildSystem
+        // Dispatch ECS — MeshRebuildSystem processes mesh_tasks from WorldGenResource
+        self.ecs_dispatcher.dispatch(&self.ecs_world);
+
+        // Upload mesh builds from MeshRebuildSystem to GPU
+        self.process_pending_mesh_builds();
+
+        // Update loading progress from WorldGenResource
+        let (remaining, completed) = {
+            let gen_res = self
+                .ecs_world
+                .read_resource::<crate::ecs::resources::WorldGenResource>();
+            (gen_res.mesh_tasks.len(), gen_res.completed)
         };
+        self.loading_state.update(completed);
 
-        if tasks.is_empty() {
-            self.finish_big_world_loading();
-            return;
-        }
-
-        // Process a batch of tasks this frame
-        let to_process = tasks.len().min(TASKS_PER_FRAME);
-        let (tasks_to_process, remaining): (Vec<_>, Vec<_>) = tasks
-            .into_iter()
-            .enumerate()
-            .partition(|(i, _)| *i < to_process);
-
-        let tasks_to_process: Vec<_> = tasks_to_process.into_iter().map(|(_, t)| t).collect();
-        let remaining: Vec<_> = remaining.into_iter().map(|(_, t)| t).collect();
-
-        // Generate meshes based on task type — build ALL meshes (no caps)
-        for task in &tasks_to_process {
-            match task {
-                MeshKey::Chunk(pos) => {
-                    let vertices = generate_chunk_mesh(&self.world, *pos);
-                    if !vertices.is_empty() {
-                        self.chunk_meshes.insert(
-                            MeshKey::Chunk(*pos),
-                            MeshResources::new(&self.render_ctx.device, &vertices),
-                        );
-                    }
-                }
-                MeshKey::LodNode(key) => {
-                    let vertices = if let Some(ref octree) = self.octree {
-                        if let Some(data) = octree.get_node_lod_data(key) {
-                            generate_octree_lod_mesh(data, key)
-                        } else if let Some(v) = octree.get_node_homogeneous(key) {
-                            if v != voxel::AIR {
-                                let data = crate::world::lod::VoxelData::Homogeneous(v);
-                                generate_octree_lod_mesh(&data, key)
-                            } else {
-                                Vec::new()
-                            }
-                        } else if let Some(data) = Self::generate_lod_data_static(key) {
-                            generate_octree_lod_mesh(&data, key)
-                        } else {
-                            Vec::new()
-                        }
-                    } else if let Some(data) = Self::generate_lod_data_static(key) {
-                        generate_octree_lod_mesh(&data, key)
-                    } else {
-                        Vec::new()
-                    };
-
-                    if !vertices.is_empty() {
-                        self.chunk_meshes.insert(
-                            MeshKey::LodNode(*key),
-                            MeshResources::new(&self.render_ctx.device, &vertices),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Update loading progress
-        let loaded = self.loading_state.chunks_total - remaining.len();
-        self.loading_state.update(loaded);
-
-        // Put remaining tasks back, or finish loading if done
-        if !remaining.is_empty() {
-            self.big_world_lod_tasks = Some(remaining);
-        } else {
+        if remaining == 0 {
             self.finish_big_world_loading();
         }
     }
@@ -491,32 +478,38 @@ impl AppState {
 
         // Create streaming system with world bounds
         let mut config = StreamingConfig::default();
-        if let Some(ref octree) = self.octree {
-            // Use octree bounds for X/Z, constrain Y to terrain range
-            let has_bounds = octree.world_max.x > octree.world_min.x;
-            if has_bounds {
-                config.world_min = glam::IVec3::new(octree.world_min.x, 0, octree.world_min.z);
-                config.world_max = glam::IVec3::new(
-                    octree.world_max.x + 1,    // exclusive
-                    Self::WORLD_HEIGHT_CHUNKS, // Y layers for terrain
-                    octree.world_max.z + 1,
-                );
+        {
+            let wr = self
+                .ecs_world
+                .read_resource::<crate::ecs::resources::WorldResource>();
+            if let Some(ref octree) = wr.octree {
+                // Use octree bounds for X/Z, constrain Y to terrain range
+                let has_bounds = octree.world_max.x > octree.world_min.x;
+                if has_bounds {
+                    config.world_min =
+                        glam::IVec3::new(octree.world_min.x, 0, octree.world_min.z);
+                    config.world_max = glam::IVec3::new(
+                        octree.world_max.x + 1,    // exclusive
+                        crate::terrain_gen::WORLD_HEIGHT_CHUNKS, // Y layers for terrain
+                        octree.world_max.z + 1,
+                    );
+                } else {
+                    // Empty octree (region-first gen) -- use world constants
+                    config.world_min = glam::IVec3::new(0, 0, 0);
+                    config.world_max = glam::IVec3::new(
+                        Self::WORLD_SIZE_CHUNKS,
+                        crate::terrain_gen::WORLD_HEIGHT_CHUNKS,
+                        Self::WORLD_SIZE_CHUNKS,
+                    );
+                }
             } else {
-                // Empty octree (region-first gen) — use world constants
                 config.world_min = glam::IVec3::new(0, 0, 0);
                 config.world_max = glam::IVec3::new(
                     Self::WORLD_SIZE_CHUNKS,
-                    Self::WORLD_HEIGHT_CHUNKS,
+                    crate::terrain_gen::WORLD_HEIGHT_CHUNKS,
                     Self::WORLD_SIZE_CHUNKS,
                 );
             }
-        } else {
-            config.world_min = glam::IVec3::new(0, 0, 0);
-            config.world_max = glam::IVec3::new(
-                Self::WORLD_SIZE_CHUNKS,
-                Self::WORLD_HEIGHT_CHUNKS,
-                Self::WORLD_SIZE_CHUNKS,
-            );
         }
 
         // Clamp to configured playable bounds so stale metadata from older scales
@@ -524,7 +517,7 @@ impl AppState {
         let clamp_min = glam::IVec3::new(0, 0, 0);
         let clamp_max = glam::IVec3::new(
             Self::WORLD_SIZE_CHUNKS,
-            Self::WORLD_HEIGHT_CHUNKS,
+            crate::terrain_gen::WORLD_HEIGHT_CHUNKS,
             Self::WORLD_SIZE_CHUNKS,
         );
         config.world_min = glam::IVec3::new(
@@ -578,8 +571,15 @@ impl AppState {
         streamer.preload_chunks(loaded_chunks);
         streamer.preload_lod_nodes(loaded_lod_nodes);
 
-        self.chunk_streamer = Some(streamer);
-        self.use_streaming = true;
+        // Store streamer and streaming state in ECS WorldResource
+        {
+            let mut wr = self
+                .ecs_world
+                .write_resource::<crate::ecs::resources::WorldResource>();
+            wr.streamer = Some(streamer);
+            wr.use_streaming = true;
+            wr.chunks_ready = false; // freeze player until nearby chunks are meshed
+        }
 
         // Set up background mesh generation channels
         let (tx, rx) = mpsc::channel();
@@ -589,7 +589,6 @@ impl AppState {
         let (lod_tx, lod_rx) = mpsc::channel();
         self.lod_mesh_tx = Some(lod_tx);
         self.lod_mesh_rx = Some(lod_rx);
-        self.chunks_ready = false; // freeze player until nearby chunks are meshed
 
         log::info!(
             "[BigWorld] Streaming enabled! {} chunk meshes, {} LOD meshes ({} distant LOD0 culled)",

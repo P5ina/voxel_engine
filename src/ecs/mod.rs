@@ -34,6 +34,7 @@ pub fn build_active_dispatcher() -> Dispatcher<'static, 'static> {
             "camera",
             &["input", "free_cam"],
         )
+        .with(systems::mesh_rebuild_system(), "mesh_rebuild", &[])
         .build()
 }
 

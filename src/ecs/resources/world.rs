@@ -1,9 +1,32 @@
 //! World and chunk management resources
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::{Mutex, mpsc};
 
-use crate::world::{ChunkManager, ChunkPosition, ChunkStreamer, VoxelOctree};
+use glam::Vec3;
+
+use crate::world::{self, ChunkManager, ChunkPosition, ChunkStreamer, VoxelOctree};
 use crate::MeshKey;
+
+/// Messages from background world generation thread
+pub(crate) enum BigWorldGenMessage {
+    /// Progress update: (message, loaded, total)
+    Progress(String, usize, usize),
+    /// Generation complete
+    Done(Box<BigWorldGenResult>),
+}
+
+/// Result from background world generation thread
+pub(crate) struct BigWorldGenResult {
+    pub(crate) world: ChunkManager,
+    pub(crate) octree: VoxelOctree,
+    pub(crate) mesh_tasks: Vec<MeshKey>,
+    pub(crate) spawn_pos: Vec3,
+    pub(crate) lod0_count: usize,
+}
+
+/// Result sent back from background save thread
+pub(crate) type SaveWorldResult = (Option<VoxelOctree>, Result<(), world::BigWorldError>);
 
 /// World data resource
 /// Contains all voxel world data and streaming state
@@ -113,10 +136,20 @@ pub struct LodMeshResource {
 }
 
 /// Save/Load state resource
-#[derive(Debug, Default)]
 pub struct SaveLoadResource {
     /// Current save/load operation
     pub operation: SaveLoadState,
+    /// Background save thread receiver (Mutex for Sync)
+    pub receiver: Mutex<Option<mpsc::Receiver<SaveWorldResult>>>,
+}
+
+impl Default for SaveLoadResource {
+    fn default() -> Self {
+        Self {
+            operation: SaveLoadState::default(),
+            receiver: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +162,6 @@ pub enum SaveLoadState {
 }
 
 /// World generation progress resource
-#[derive(Debug, Clone, Default)]
 pub struct WorldGenResource {
     /// Progress message
     pub message: String,
@@ -139,4 +171,24 @@ pub struct WorldGenResource {
     pub total: usize,
     /// Whether generation is complete
     pub is_complete: bool,
+    /// Background gen/load thread receiver (Mutex for Sync)
+    pub receiver: Mutex<Option<mpsc::Receiver<BigWorldGenMessage>>>,
+    /// Mesh tasks for ECS MeshRebuildSystem to process
+    pub mesh_tasks: Vec<MeshKey>,
+    /// Total mesh tasks (for progress tracking)
+    pub mesh_tasks_total: usize,
+}
+
+impl Default for WorldGenResource {
+    fn default() -> Self {
+        Self {
+            message: String::new(),
+            completed: 0,
+            total: 0,
+            is_complete: false,
+            receiver: Mutex::new(None),
+            mesh_tasks: Vec::new(),
+            mesh_tasks_total: 0,
+        }
+    }
 }
